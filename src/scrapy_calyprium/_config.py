@@ -4,7 +4,6 @@ Configuration management for scrapy-calyprium.
 Resolves credentials and service URLs from multiple sources:
 1. Explicit arguments to configure()
 2. Environment variables (CALYPRIUM_API_KEY, etc.)
-3. Scrapy settings (VEIL_API_KEY, MIMIC_SERVICE_URL, etc.)
 
 Usage::
 
@@ -14,10 +13,6 @@ Usage::
 
     # Option 2: Environment variables
     export CALYPRIUM_API_KEY=clp_...
-
-    # Option 3: Scrapy settings directly
-    CALYPRIUM_API_KEY = "clp_..."
-    VEIL_USER_ID = "your-user-id"
 """
 
 import os
@@ -41,18 +36,15 @@ class CalypriumConfig:
     # Master API key (accepted by all services)
     api_key: Optional[str] = None
 
-    # Per-service credentials (override api_key)
-    veil_api_key: Optional[str] = None
-    veil_user_id: Optional[str] = None
+    # Service URLs (defaults to calyprium.com SaaS)
     veil_url: Optional[str] = None
+    veil_user_id: Optional[str] = None
     veil_profile: Optional[str] = None
 
     mimic_url: Optional[str] = None
-    mimic_api_key: Optional[str] = None
     mimic_stealth_level: str = "moderate"
 
     spectre_url: Optional[str] = None
-    spectre_api_key: Optional[str] = None
 
     prism_url: Optional[str] = None
 
@@ -74,22 +66,16 @@ class CalypriumConfig:
             self.api_key = os.getenv("CALYPRIUM_API_KEY")
 
         # Veil
-        if not self.veil_api_key:
-            self.veil_api_key = os.getenv("VEIL_API_KEY") or self.api_key
         if not self.veil_user_id:
             self.veil_user_id = os.getenv("VEIL_USER_ID")
         if not self.veil_url:
             self.veil_url = os.getenv("VEIL_GATEWAY_URL", _DEFAULTS["veil_url"])
 
         # Mimic
-        if not self.mimic_api_key:
-            self.mimic_api_key = os.getenv("MIMIC_API_KEY") or self.api_key
         if not self.mimic_url:
             self.mimic_url = os.getenv("MIMIC_SERVICE_URL", _DEFAULTS["mimic_url"])
 
         # Spectre
-        if not self.spectre_api_key:
-            self.spectre_api_key = os.getenv("SPECTRE_API_KEY") or self.api_key
         if not self.spectre_url:
             self.spectre_url = os.getenv("SPECTRE_SERVICE_URL", _DEFAULTS["spectre_url"])
 
@@ -117,8 +103,6 @@ class CalypriumConfig:
         # Veil
         if self.veil_url:
             settings["VEIL_GATEWAY_URL"] = self.veil_url
-        if self.veil_api_key:
-            settings["VEIL_API_KEY"] = self.veil_api_key
         if self.veil_user_id:
             settings["VEIL_USER_ID"] = self.veil_user_id
         if self.veil_profile:
@@ -127,8 +111,6 @@ class CalypriumConfig:
         # Mimic
         if self.mimic_url:
             settings["MIMIC_SERVICE_URL"] = self.mimic_url
-        if self.mimic_api_key:
-            settings["MIMIC_API_KEY"] = self.mimic_api_key
         settings["MIMIC_STEALTH_LEVEL"] = self.mimic_stealth_level
         settings["MIMIC_USE_SPECTRE"] = True
 

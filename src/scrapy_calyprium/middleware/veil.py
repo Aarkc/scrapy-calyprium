@@ -6,7 +6,7 @@ and geo-targeting. Supports datacenter, residential, and rotating proxies.
 
 Settings:
     VEIL_GATEWAY_URL: Proxy gateway URL (default: auto-detected)
-    VEIL_API_KEY: API key for authentication (required, or set CALYPRIUM_API_KEY)
+    CALYPRIUM_API_KEY: API key for authentication (required)
     VEIL_USER_ID: User ID for proxy routing (required)
     VEIL_PROFILE: Optional profile ID for custom routing rules
     VEIL_PROXY_TYPE: Optional proxy type (datacenter, residential, residential_rotating)

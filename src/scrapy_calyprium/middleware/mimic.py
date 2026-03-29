@@ -9,7 +9,7 @@ or when ``MIMIC_ALL_REQUESTS = True``.
 
 Settings:
     MIMIC_SERVICE_URL: Mimic API URL (required)
-    MIMIC_API_KEY: API key for authentication (required, or set CALYPRIUM_API_KEY)
+    CALYPRIUM_API_KEY: API key for authentication (required)
     MIMIC_STEALTH_LEVEL: basic, moderate, or maximum (default: moderate)
     MIMIC_BROWSER_ENGINE: Specific browser engine to use (optional)
     MIMIC_USE_PROXY: Route browser through proxy (default: False)

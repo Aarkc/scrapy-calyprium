@@ -75,20 +75,17 @@ All middleware requires a valid API key. Set it via:
 
 1. `scrapy_calyprium.configure(api_key="clp_...")`
 2. `CALYPRIUM_API_KEY` environment variable
-3. Per-service settings: `VEIL_API_KEY`, `MIMIC_API_KEY`
 
 ## Settings Reference
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `CALYPRIUM_API_KEY` | Master API key for all services | — |
-| `VEIL_GATEWAY_URL` | Proxy gateway URL | auto-detected |
-| `VEIL_API_KEY` | Veil-specific API key | `CALYPRIUM_API_KEY` |
+| `CALYPRIUM_API_KEY` | API key for all services | — |
+| `VEIL_GATEWAY_URL` | Proxy gateway URL | `https://proxy.calyprium.com` |
 | `VEIL_USER_ID` | User ID for proxy routing | — |
 | `VEIL_PROFILE` | Proxy routing profile | — |
 | `VEIL_PROXY_TYPE` | `datacenter`, `residential`, `residential_rotating` | — |
-| `MIMIC_SERVICE_URL` | Mimic browser service URL | auto-detected |
-| `MIMIC_API_KEY` | Mimic-specific API key | `CALYPRIUM_API_KEY` |
+| `MIMIC_SERVICE_URL` | Mimic browser service URL | `https://mimic.calyprium.com` |
 | `MIMIC_STEALTH_LEVEL` | `basic`, `moderate`, `maximum` | `moderate` |
 | `MIMIC_BROWSER_ENGINE` | Specific browser engine | auto |
 | `MIMIC_USE_PROXY` | Route browser through proxy | `False` |
