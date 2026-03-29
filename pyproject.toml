@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrapy-calyprium"
+version = "0.1.0"
+description = "Anti-detection Scrapy middleware — proxy routing and browser rendering for web scraping"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Calyprium", email = "hello@calyprium.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Scrapy",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["scrapy", "anti-detection", "proxy", "browser", "tls-fingerprint", "web-scraping"]
+dependencies = [
+    "scrapy>=2.11.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+storage = ["minio>=7.2.0"]
+all = ["scrapy-calyprium[storage]"]
+dev = ["pytest", "pytest-asyncio", "responses"]
+
+[project.urls]
+Homepage = "https://calyprium.com"
+Documentation = "https://docs.calyprium.com"
+Repository = "https://github.com/Aarkc/scrapy-calyprium"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+scrapy_calyprium = ["py.typed"]
