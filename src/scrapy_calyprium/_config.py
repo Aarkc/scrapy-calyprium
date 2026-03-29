@@ -93,7 +93,12 @@ class CalypriumConfig:
         # browser rendering with httpcloak and Spectre internally.
         settings["DOWNLOADER_MIDDLEWARES"] = {
             "scrapy_calyprium.middleware.veil.VeilProxyMiddleware": 100,
+            "scrapy_calyprium.middleware.spectre.SpectreMiddleware": 150,
             "scrapy_calyprium.middleware.mimic.MimicBrowserMiddleware": 200,
+        }
+
+        settings["ITEM_PIPELINES"] = {
+            "scrapy_calyprium.pipelines.s3_batch.S3BatchPipeline": 100,
         }
 
         # Master API key (used by all middleware)

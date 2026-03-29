@@ -29,6 +29,7 @@ keywords = ["scrapy", "anti-detection", "proxy", "browser", "tls-fingerprint", "
 dependencies = [
     "scrapy>=2.11.0",
     "httpx>=0.27.0",
+    "boto3>=1.34.0",
 ]
 
 [project.optional-dependencies]

@@ -1,9 +1,9 @@
 """
 scrapy-calyprium — Anti-detection Scrapy middleware stack.
 
-Provides proxy routing (Veil) and browser rendering (Mimic) for Scrapy spiders.
-Mimic's auto-routing handles TLS fingerprinting (httpcloak) and device
-fingerprints (Spectre) internally.
+Provides proxy routing (Veil), device fingerprints (Spectre), and browser
+rendering (Mimic) for Scrapy spiders. Includes an S3 batch pipeline for
+durable item storage.
 
 Quick start::
 
@@ -14,14 +14,20 @@ Quick start::
     # Or manual setup:
     DOWNLOADER_MIDDLEWARES = {
         "scrapy_calyprium.VeilProxyMiddleware": 100,
+        "scrapy_calyprium.SpectreMiddleware": 150,
         "scrapy_calyprium.MimicBrowserMiddleware": 200,
+    }
+    ITEM_PIPELINES = {
+        "scrapy_calyprium.S3BatchPipeline": 100,
     }
 """
 
 from scrapy_calyprium._version import __version__
 from scrapy_calyprium._config import CalypriumConfig, configure, get_config
 from scrapy_calyprium.middleware.veil import VeilProxyMiddleware
+from scrapy_calyprium.middleware.spectre import SpectreMiddleware
 from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
+from scrapy_calyprium.pipelines.s3_batch import S3BatchPipeline
 
 __all__ = [
     "__version__",
@@ -29,5 +35,7 @@ __all__ = [
     "get_config",
     "CalypriumConfig",
     "VeilProxyMiddleware",
+    "SpectreMiddleware",
     "MimicBrowserMiddleware",
+    "S3BatchPipeline",
 ]
