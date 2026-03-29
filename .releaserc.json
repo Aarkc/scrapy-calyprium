@@ -1,0 +1,18 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/changelog", {
+      "changelogFile": "CHANGELOG.md"
+    }],
+    ["@semantic-release/exec", {
+      "prepareCmd": "echo ${nextRelease.version} > VERSION && sed -i 's/__version__ = \".*\"/__version__ = \"'${nextRelease.version}'\"/' src/scrapy_calyprium/_version.py && sed -i 's/^version = \".*\"/version = \"'${nextRelease.version}'\"/' pyproject.toml"
+    }],
+    ["@semantic-release/git", {
+      "assets": ["CHANGELOG.md", "VERSION", "src/scrapy_calyprium/_version.py", "pyproject.toml"],
+      "message": "chore(release): ${nextRelease.version} [skip ci]"
+    }],
+    "@semantic-release/github"
+  ]
+}

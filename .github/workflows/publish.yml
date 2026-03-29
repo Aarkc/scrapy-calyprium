@@ -1,39 +1,68 @@
-name: Publish to PyPI
+name: Release & Publish
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      new_release: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install semantic-release
+        run: |
+          npm install -g \
+            semantic-release@^22.0.0 \
+            @semantic-release/git@^10.0.1 \
+            @semantic-release/github@^9.2.0 \
+            @semantic-release/changelog@^6.0.3 \
+            @semantic-release/exec@^6.0.3
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build package
-        run: |
-          pip install build
-          python -m build
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
+      - name: Release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
 
   publish:
-    needs: build
+    needs: release
+    if: needs.release.outputs.new_release == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: dist
-          path: dist/
+          ref: main
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
