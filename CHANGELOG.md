@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.3...v1.1.0) (2026-03-29)
+
+
+### Features
+
+* add SpectreMiddleware and S3BatchPipeline ([e6c8ab4](https://github.com/Aarkc/scrapy-calyprium/commit/e6c8ab4ef8033adad0e9e9afa60ad5dc0814aed7))
+
 ## [1.0.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.2...v1.0.3) (2026-03-29)
 
 
