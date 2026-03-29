@@ -32,8 +32,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-storage = ["minio>=7.2.0"]
-all = ["scrapy-calyprium[storage]"]
 dev = ["pytest", "pytest-asyncio", "responses"]
 
 [project.urls]
