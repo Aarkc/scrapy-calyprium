@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.1.0...v1.2.0) (2026-03-29)
+
+
+### Features
+
+* add auto-routing mode to MimicBrowserMiddleware ([919c16e](https://github.com/Aarkc/scrapy-calyprium/commit/919c16ed666fd25ec40ac11a178052b8e0646646))
+
 # [1.1.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.3...v1.1.0) (2026-03-29)
 
 
