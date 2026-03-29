@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.1...v1.0.2) (2026-03-29)
+
+
+### Bug Fixes
+
+* re-trigger PyPI publish ([0af0e43](https://github.com/Aarkc/scrapy-calyprium/commit/0af0e43eecbcb0fdfae91ae5fda4c91eaa5781fe))
+
 ## [1.0.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.0...v1.0.1) (2026-03-29)
 
 
