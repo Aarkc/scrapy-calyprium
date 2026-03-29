@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.2...v1.0.3) (2026-03-29)
+
+
+### Bug Fixes
+
+* **ci:** use cycjimmy/semantic-release-action for proper step outputs ([a248689](https://github.com/Aarkc/scrapy-calyprium/commit/a2486895211fd8690e3c69eadd588a89c65d5a77))
+
 ## [1.0.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.0.1...v1.0.2) (2026-03-29)
 
 
