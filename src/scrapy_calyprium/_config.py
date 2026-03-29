@@ -96,9 +96,17 @@ class CalypriumConfig:
             "scrapy_calyprium.middleware.mimic.MimicBrowserMiddleware": 200,
         }
 
-        # Master API key (used by all middleware as fallback)
+        # Master API key (used by all middleware)
         if self.api_key:
             settings["CALYPRIUM_API_KEY"] = self.api_key
+
+            # S3-compatible feed storage via Forge gateway
+            # Allows Scrapy's built-in S3FeedStorage to write output
+            # to Calyprium storage using the API key as S3 credentials.
+            settings["AWS_ACCESS_KEY_ID"] = self.api_key
+            settings["AWS_SECRET_ACCESS_KEY"] = self.api_key
+            settings["AWS_ENDPOINT_URL"] = "https://forge.calyprium.com/s3"
+            settings["AWS_REGION_NAME"] = "us-east-1"
 
         # Veil
         if self.veil_url:

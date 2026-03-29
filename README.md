@@ -20,6 +20,7 @@ scrapy_calyprium.configure(api_key="clp_your_key_here")
 This auto-configures:
 - **VeilProxyMiddleware** — routes requests through rotating proxies with TLS fingerprinting
 - **MimicBrowserMiddleware** — renders JavaScript pages with stealth browser instances
+- **S3 feed storage** — write spider output to Calyprium storage using Scrapy's built-in `S3FeedStorage`
 
 ## Usage
 
@@ -47,6 +48,25 @@ DOWNLOADER_MIDDLEWARES = {
 CALYPRIUM_API_KEY = "clp_your_key_here"
 VEIL_USER_ID = "your-user-id"
 ```
+
+### Saving Output to Calyprium Storage
+
+Spider output is saved to Calyprium's S3-compatible storage using Scrapy's built-in feed export:
+
+```python
+# settings.py
+import scrapy_calyprium
+
+scrapy_calyprium.configure(api_key="clp_your_key_here")
+
+FEEDS = {
+    "s3://calyprium/my-spider/%(time)s.jl": {
+        "format": "jsonlines",
+    },
+}
+```
+
+The S3 credentials are auto-configured by `configure()` — no additional setup needed.
 
 ### Browser Rendering
 
