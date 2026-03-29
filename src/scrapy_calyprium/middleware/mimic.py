@@ -200,15 +200,24 @@ class MimicBrowserMiddleware:
     _SKIP_PATTERNS = (".xml", "/robots.txt", "/sitemap")
 
     async def process_request(self, request, spider):
-        """Intercept requests that need browser rendering."""
-        needs_browser = (
-            self.render_all
-            or request.meta.get("playwright", False)
+        """Intercept requests that need stealth rendering.
+
+        Two modes:
+        - **render_all** (MIMIC_ALL_REQUESTS=True): Every request goes through
+          Mimic's /api/fetch with auto-routing. Mimic tries httpcloak first
+          (~200ms) and only escalates to a real browser if blocked. This is the
+          recommended mode for production spiders.
+        - **per-request** (meta['mimic']=True): Only flagged requests go through
+          a browser session. Used when most pages work with plain HTTP but a few
+          need JavaScript rendering.
+        """
+        explicit_browser = (
+            request.meta.get("playwright", False)
             or request.meta.get("mimic", False)
             or request.meta.get("stealth", False)
         )
 
-        if not needs_browser:
+        if not self.render_all and not explicit_browser:
             return None
 
         # Skip sitemap/robots unless explicitly flagged
@@ -217,74 +226,18 @@ class MimicBrowserMiddleware:
             if not request.meta.get("mimic_sitemap"):
                 return None
 
-        if not self.session_id:
-            await self.spider_opened(spider)
-
-        if not self.session_id:
-            logger.warning("MimicMiddleware: No session, falling back")
-            return None
-
-        request.meta["mimic_session_id"] = self.session_id
         request.meta["mimic_browser"] = True
 
         try:
             client = await self._get_client()
-            action_url = f"{self.service_url}/api/session/{self.session_id}/action"
 
-            # Read wait settings from request meta, crawler settings, or defaults
-            wait_until = request.meta.get("mimic_wait_until")
-            wait_after = request.meta.get("mimic_wait_after_load")
-            if not wait_until and self.crawler:
-                wait_until = self.crawler.settings.get("MIMIC_WAIT_UNTIL")
-            if not wait_after and self.crawler:
-                wait_after = self.crawler.settings.getint("MIMIC_WAIT_AFTER_LOAD", 0)
+            # Auto-routing mode: use /api/fetch which tries httpcloak first,
+            # then escalates to browser only when blocked.
+            if self.render_all and not explicit_browser:
+                return await self._fetch_auto(client, request)
 
-            action_payload = {
-                "action": "navigate",
-                "url": request.url,
-                "wait_for": wait_until or "networkidle",
-            }
-            if wait_after and int(wait_after) > 0:
-                action_payload["wait_after_load"] = int(wait_after)
-
-            resp = await client.post(
-                action_url,
-                json=action_payload,
-                headers=self._get_headers(),
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            html = data.get("html") or data.get("content") or data.get("page_source", "")
-            status = data.get("status_code", 200)
-
-            if not html:
-                # Fallback to /api/fetch
-                fetch_resp = await client.post(
-                    f"{self.service_url}/api/fetch",
-                    json={
-                        "url": request.url,
-                        "session_id": self.session_id,
-                        "stealth_level": self.stealth_level,
-                    },
-                    headers=self._get_headers(),
-                    timeout=60.0,
-                )
-                fetch_resp.raise_for_status()
-                fetch_data = fetch_resp.json()
-                html = fetch_data.get("html") or fetch_data.get("content") or ""
-                status = fetch_data.get("status_code", 200)
-
-            self._consecutive_failures = 0
-
-            return HtmlResponse(
-                url=request.url,
-                status=status,
-                body=html.encode("utf-8") if isinstance(html, str) else html,
-                encoding="utf-8",
-                request=request,
-            )
+            # Explicit browser mode: use a session for full JS rendering
+            return await self._fetch_browser(client, request, spider)
 
         except Exception as e:
             logger.error(f"MimicMiddleware: Failed {request.url}: {e}")
@@ -302,6 +255,101 @@ class MimicBrowserMiddleware:
                 await self.spider_opened(spider)
 
             return None
+
+    async def _fetch_auto(self, client, request):
+        """Fetch via /api/fetch with auto-routing (httpcloak → browser)."""
+        fetch_payload = {
+            "url": request.url,
+            "stealth_level": self.stealth_level,
+        }
+
+        resp = await client.post(
+            f"{self.service_url}/api/fetch",
+            json=fetch_payload,
+            headers=self._get_headers(),
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        html = data.get("html") or data.get("content") or ""
+        status = data.get("status_code", 200)
+
+        self._consecutive_failures = 0
+
+        return HtmlResponse(
+            url=request.url,
+            status=status,
+            body=html.encode("utf-8") if isinstance(html, str) else html,
+            encoding="utf-8",
+            request=request,
+        )
+
+    async def _fetch_browser(self, client, request, spider):
+        """Fetch via browser session for full JS rendering."""
+        if not self.session_id:
+            await self.spider_opened(spider)
+
+        if not self.session_id:
+            logger.warning("MimicMiddleware: No session, falling back")
+            return None
+
+        request.meta["mimic_session_id"] = self.session_id
+
+        wait_until = request.meta.get("mimic_wait_until")
+        wait_after = request.meta.get("mimic_wait_after_load")
+        if not wait_until and self.crawler:
+            wait_until = self.crawler.settings.get("MIMIC_WAIT_UNTIL")
+        if not wait_after and self.crawler:
+            wait_after = self.crawler.settings.getint("MIMIC_WAIT_AFTER_LOAD", 0)
+
+        action_payload = {
+            "action": "navigate",
+            "url": request.url,
+            "wait_for": wait_until or "networkidle",
+        }
+        if wait_after and int(wait_after) > 0:
+            action_payload["wait_after_load"] = int(wait_after)
+
+        action_url = f"{self.service_url}/api/session/{self.session_id}/action"
+        resp = await client.post(
+            action_url,
+            json=action_payload,
+            headers=self._get_headers(),
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        html = data.get("html") or data.get("content") or data.get("page_source", "")
+        status = data.get("status_code", 200)
+
+        if not html:
+            # Fallback to /api/fetch
+            fetch_resp = await client.post(
+                f"{self.service_url}/api/fetch",
+                json={
+                    "url": request.url,
+                    "session_id": self.session_id,
+                    "stealth_level": self.stealth_level,
+                },
+                headers=self._get_headers(),
+                timeout=60.0,
+            )
+            fetch_resp.raise_for_status()
+            fetch_data = fetch_resp.json()
+            html = fetch_data.get("html") or fetch_data.get("content") or ""
+            status = fetch_data.get("status_code", 200)
+
+        self._consecutive_failures = 0
+
+        return HtmlResponse(
+            url=request.url,
+            status=status,
+            body=html.encode("utf-8") if isinstance(html, str) else html,
+            encoding="utf-8",
+            request=request,
+        )
 
     async def process_response(self, request, response, spider):
         """Detect blocks and potentially upgrade stealth level."""
