@@ -89,9 +89,9 @@ class PrismSitemapSpider(scrapy.Spider):
         if self._prism_url_override:
             return self._prism_url_override
         try:
-            return self.settings.get("PRISM_URL", "http://calyprium-prism:8008")
+            return self.settings.get("PRISM_URL", "https://prism.calyprium.com")
         except AttributeError:
-            return "http://calyprium-prism:8008"
+            return "https://prism.calyprium.com"
 
     def start_requests(self):
         if not self.url_source:

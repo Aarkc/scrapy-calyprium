@@ -79,7 +79,7 @@ class VeilProxyMiddleware:
 
         middleware = cls(
             gateway_url=crawler.settings.get(
-                "VEIL_GATEWAY_URL", config.veil_url or "http://proxy-gateway:8080"
+                "VEIL_GATEWAY_URL", config.veil_url or "https://proxy.calyprium.com"
             ),
             api_key=api_key,
             user_id=user_id,

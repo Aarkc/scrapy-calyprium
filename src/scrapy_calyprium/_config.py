@@ -4,53 +4,34 @@ Configuration management for scrapy-calyprium.
 Resolves credentials and service URLs from multiple sources:
 1. Explicit arguments to configure()
 2. Environment variables (CALYPRIUM_API_KEY, etc.)
-3. Credentials file (~/.calyprium/credentials)
-4. Scrapy settings (VEIL_API_KEY, MIMIC_SERVICE_URL, etc.)
+3. Scrapy settings (VEIL_API_KEY, MIMIC_SERVICE_URL, etc.)
 
 Usage::
 
     # Option 1: configure() in settings.py (recommended)
     import scrapy_calyprium
-    scrapy_calyprium.configure(api_key="caly_...")
+    scrapy_calyprium.configure(api_key="clp_...")
 
     # Option 2: Environment variables
-    export CALYPRIUM_API_KEY=caly_...
+    export CALYPRIUM_API_KEY=clp_...
 
     # Option 3: Scrapy settings directly
-    VEIL_API_KEY = "..."
-    MIMIC_SERVICE_URL = "https://mimic.calyprium.com"
+    CALYPRIUM_API_KEY = "clp_..."
+    VEIL_USER_ID = "your-user-id"
 """
 
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 
-# Default service URLs for SaaS (standalone) users.
-# Self-hosted users override via env vars or configure().
-_SAAS_DEFAULTS = {
-    "veil_url": "https://veil.calyprium.com",
+# Default service URLs
+_DEFAULTS = {
+    "veil_url": "https://proxy.calyprium.com",
     "mimic_url": "https://mimic.calyprium.com",
     "spectre_url": "https://spectre.calyprium.com",
     "prism_url": "https://prism.calyprium.com",
 }
-
-# Docker-internal defaults for self-hosted / platform deployments.
-_DOCKER_DEFAULTS = {
-    "veil_url": "http://proxy-gateway:8080",
-    "mimic_url": "http://mimic:8005",
-    "spectre_url": "http://spectre:8005",
-    "prism_url": "http://calyprium-prism:8008",
-}
-
-
-def _is_docker() -> bool:
-    """Detect if running inside a Docker container."""
-    return (
-        os.path.exists("/.dockerenv")
-        or os.getenv("KUBERNETES_SERVICE_HOST") is not None
-    )
 
 
 @dataclass
@@ -68,12 +49,10 @@ class CalypriumConfig:
 
     mimic_url: Optional[str] = None
     mimic_api_key: Optional[str] = None
-    mimic_user_id: Optional[str] = None
     mimic_stealth_level: str = "moderate"
 
     spectre_url: Optional[str] = None
     spectre_api_key: Optional[str] = None
-    spectre_user_id: Optional[str] = None
 
     prism_url: Optional[str] = None
 
@@ -90,8 +69,6 @@ class CalypriumConfig:
 
     def resolve(self) -> "CalypriumConfig":
         """Fill in missing values from environment variables and defaults."""
-        defaults = _DOCKER_DEFAULTS if _is_docker() else _SAAS_DEFAULTS
-
         # Master API key
         if not self.api_key:
             self.api_key = os.getenv("CALYPRIUM_API_KEY")
@@ -102,33 +79,23 @@ class CalypriumConfig:
         if not self.veil_user_id:
             self.veil_user_id = os.getenv("VEIL_USER_ID")
         if not self.veil_url:
-            self.veil_url = os.getenv(
-                "VEIL_GATEWAY_URL", defaults["veil_url"]
-            )
+            self.veil_url = os.getenv("VEIL_GATEWAY_URL", _DEFAULTS["veil_url"])
 
         # Mimic
         if not self.mimic_api_key:
             self.mimic_api_key = os.getenv("MIMIC_API_KEY") or self.api_key
-        if not self.mimic_user_id:
-            self.mimic_user_id = os.getenv("MIMIC_USER_ID")
         if not self.mimic_url:
-            self.mimic_url = os.getenv(
-                "MIMIC_SERVICE_URL", defaults["mimic_url"]
-            )
+            self.mimic_url = os.getenv("MIMIC_SERVICE_URL", _DEFAULTS["mimic_url"])
 
         # Spectre
         if not self.spectre_api_key:
             self.spectre_api_key = os.getenv("SPECTRE_API_KEY") or self.api_key
-        if not self.spectre_user_id:
-            self.spectre_user_id = os.getenv("SPECTRE_USER_ID")
         if not self.spectre_url:
-            self.spectre_url = os.getenv(
-                "SPECTRE_SERVICE_URL", defaults["spectre_url"]
-            )
+            self.spectre_url = os.getenv("SPECTRE_SERVICE_URL", _DEFAULTS["spectre_url"])
 
         # Prism
         if not self.prism_url:
-            self.prism_url = os.getenv("PRISM_URL", defaults["prism_url"])
+            self.prism_url = os.getenv("PRISM_URL", _DEFAULTS["prism_url"])
 
         return self
 
@@ -198,7 +165,7 @@ def configure(
         # settings.py
         import scrapy_calyprium
 
-        scrapy_calyprium.configure(api_key="caly_...")
+        scrapy_calyprium.configure(api_key="clp_...")
 
         # Override specific settings after configure():
         CONCURRENT_REQUESTS = 8

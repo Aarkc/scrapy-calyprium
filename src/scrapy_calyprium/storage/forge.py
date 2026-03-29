@@ -1,19 +1,17 @@
 """
 Forge Feed Storage for Scrapy.
 
-S3-compatible feed storage backend that writes spider output to the
-Calyprium Forge platform's object storage. Works with any S3-compatible
-backend (MinIO, AWS S3, Hetzner Object Storage, etc.).
+S3-compatible feed storage backend that writes spider output to
+Calyprium's object storage.
 
 URI format: ``forge://bucket/path/to/file.jl``
 
 Settings are read from environment variables:
-    S3_ENDPOINT: Storage endpoint (e.g., "minio:9000")
+    S3_ENDPOINT: Storage endpoint
     S3_ACCESS_KEY: Access key
     S3_SECRET_KEY: Secret key
-    S3_SECURE: Use HTTPS (default: false)
+    S3_SECURE: Use HTTPS (default: true)
     S3_BUCKET_USER: Default bucket name (default: calyprium)
-    S3_SKIP_BUCKET_CREATION: Skip auto-creating buckets (default: false)
 """
 
 import logging
@@ -45,20 +43,16 @@ class ForgeFeedStorage(BlockingFeedStorage):
         self.path = parsed.path.lstrip("/")
         self.feed_options = feed_options
 
-        # S3 credentials (S3_* takes precedence over MINIO_* for compat)
-        self.endpoint = os.getenv(
-            "S3_ENDPOINT", os.getenv("MINIO_ENDPOINT", "localhost:9000")
-        )
-        self.access_key = os.getenv(
-            "S3_ACCESS_KEY", os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-        )
-        self.secret_key = os.getenv(
-            "S3_SECRET_KEY", os.getenv("MINIO_SECRET_KEY", "minioadmin")
-        )
-        self.secure = (
-            os.getenv("S3_SECURE", os.getenv("MINIO_SECURE", "false")).lower()
-            == "true"
-        )
+        self.endpoint = os.getenv("S3_ENDPOINT")
+        self.access_key = os.getenv("S3_ACCESS_KEY")
+        self.secret_key = os.getenv("S3_SECRET_KEY")
+        self.secure = os.getenv("S3_SECURE", "true").lower() == "true"
+
+        if not self.endpoint or not self.access_key or not self.secret_key:
+            raise ValueError(
+                "ForgeFeedStorage requires S3_ENDPOINT, S3_ACCESS_KEY, "
+                "and S3_SECRET_KEY environment variables."
+            )
 
         from minio import Minio
 
@@ -68,14 +62,6 @@ class ForgeFeedStorage(BlockingFeedStorage):
             secret_key=self.secret_key,
             secure=self.secure,
         )
-
-        if os.getenv("S3_SKIP_BUCKET_CREATION", "false").lower() != "true":
-            try:
-                if not self.client.bucket_exists(self.bucket):
-                    self.client.make_bucket(self.bucket)
-                    logger.info(f"Created bucket: {self.bucket}")
-            except Exception as e:
-                logger.warning(f"Error ensuring bucket {self.bucket}: {e}")
 
     def _store_in_thread(self, file):
         """Store the feed file in object storage."""
