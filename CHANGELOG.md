@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.2.0...v1.3.0) (2026-03-30)
+
+
+### Features
+
+* lazy Prism pagination and _internal request bypass ([6b9b49b](https://github.com/Aarkc/scrapy-calyprium/commit/6b9b49b14ecf5d5b0d1eeaffac75bc83ce7701ac))
+
 # [1.2.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.1.0...v1.2.0) (2026-03-29)
 
 
