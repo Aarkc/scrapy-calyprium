@@ -211,6 +211,9 @@ class MimicBrowserMiddleware:
           a browser session. Used when most pages work with plain HTTP but a few
           need JavaScript rendering.
         """
+        if request.meta.get("_internal"):
+            return None
+
         explicit_browser = (
             request.meta.get("playwright", False)
             or request.meta.get("mimic", False)

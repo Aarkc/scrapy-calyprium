@@ -99,6 +99,9 @@ class VeilProxyMiddleware:
 
     def process_request(self, request, spider):
         """Route request through the Veil proxy gateway."""
+        if request.meta.get("_internal"):
+            return None
+
         request.meta["proxy"] = self.gateway_url
 
         # Build username with optional proxy type parameter

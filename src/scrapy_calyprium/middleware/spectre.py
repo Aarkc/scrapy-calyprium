@@ -218,6 +218,9 @@ class SpectreMiddleware:
 
     def process_request(self, request, spider):
         """Apply device fingerprint headers to the request."""
+        if request.meta.get("_internal"):
+            return None
+
         try:
             fingerprint_data = self._get_fingerprint_for_request(request)
         except Exception as e:

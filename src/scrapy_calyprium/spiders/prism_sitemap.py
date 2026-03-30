@@ -8,6 +8,9 @@ sitemap scanner and stored in object storage, queryable via DuckDB.
 This follows the same pattern as Scrapy's built-in ``SitemapSpider`` but
 skips the sitemap fetch step — the sitemaps have already been indexed.
 
+URLs are fetched lazily in batches via Scrapy's request chain — only one
+batch is loaded at a time to avoid blowing up memory on large sitemaps.
+
 Usage::
 
     from scrapy_calyprium.spiders import PrismSitemapSpider
@@ -29,7 +32,7 @@ Spider arguments (passed via ``-a`` or Scrapyd settings):
 
 import logging
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import scrapy
 
@@ -101,7 +104,18 @@ class PrismSitemapSpider(scrapy.Spider):
         parsed = urlparse(self.url_source)
 
         if parsed.scheme == "prism":
-            yield from self._start_from_prism(parsed)
+            # Lazy pagination: fetch only the first page via Scrapy's
+            # request chain. Each page triggers fetching the next.
+            yield scrapy.Request(
+                self._build_prism_api_url(parsed, offset=0),
+                callback=self._handle_prism_page,
+                meta={
+                    "_internal": True,
+                    "_prism_parsed": parsed,
+                    "_prism_offset": 0,
+                },
+                dont_filter=True,
+            )
         elif parsed.scheme == "file":
             yield from self._start_from_file(parsed.path)
         elif parsed.scheme == "inline":
@@ -112,55 +126,67 @@ class PrismSitemapSpider(scrapy.Spider):
         else:
             yield scrapy.Request(self.url_source, callback=self.parse_item)
 
-    def _start_from_prism(self, parsed):
-        """Paginate through Prism's URL API."""
-        import requests as req
-
+    def _build_prism_api_url(self, parsed, offset: int) -> str:
+        """Build the Prism API URL for a page of URLs."""
         domain = parsed.netloc or parsed.path
         params = parse_qs(parsed.query)
+
+        api_params = {
+            "limit": min(self.batch_size, 100000),
+            "offset": offset,
+            "format": "json",
+        }
         path_prefix = params.get("path_prefix", [None])[0]
+        if path_prefix:
+            api_params["path_prefix"] = path_prefix
         pattern = params.get("pattern", [None])[0]
+        if pattern:
+            api_params["pattern"] = pattern
 
-        offset = 0
-        limit = min(self.batch_size, 100000)
+        return f"{self.prism_url}/api/domains/{domain}/urls?{urlencode(api_params)}"
 
-        while True:
-            api_params = {"limit": limit, "offset": offset, "format": "json"}
-            if path_prefix:
-                api_params["path_prefix"] = path_prefix
-            if pattern:
-                api_params["pattern"] = pattern
+    def _handle_prism_page(self, response):
+        """Process one page of Prism URLs, then chain to the next page."""
+        data = response.json()
+        urls = data.get("urls", [])
+        total = data.get("total", 0)
+        offset = response.meta["_prism_offset"]
+        parsed = response.meta["_prism_parsed"]
 
-            api_url = f"{self.prism_url}/api/domains/{domain}/urls"
-            logger.info(f"Fetching URLs from Prism: offset={offset}, limit={limit}")
+        if not urls:
+            logger.info(f"No more URLs from Prism (total={total})")
+            return
 
-            try:
-                resp = req.get(api_url, params=api_params, timeout=60)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                logger.error(f"Failed to fetch URLs from Prism: {e}")
+        logger.info(
+            f"Prism: got {len(urls):,} URLs "
+            f"(offset={offset:,}, total={total:,})"
+        )
+
+        for url in urls:
+            if self.max_urls and self._urls_yielded >= self.max_urls:
+                logger.info(f"Reached max_urls limit ({self.max_urls:,})")
                 return
+            self._urls_yielded += 1
+            yield scrapy.Request(url, callback=self.parse_item)
 
-            urls = data.get("urls", [])
-            total = data.get("total", 0)
+        # Chain: request next page. This only runs after Scrapy has
+        # scheduled the current batch, keeping memory bounded.
+        next_offset = offset + len(urls)
+        has_more = len(urls) >= min(self.batch_size, 100000)
+        under_limit = not self.max_urls or self._urls_yielded < self.max_urls
 
-            if not urls:
-                logger.info(f"No more URLs from Prism (total={total})")
-                return
-
-            logger.info(f"Got {len(urls)} URLs (offset={offset}, total={total})")
-
-            for url in urls:
-                if self.max_urls and self._urls_yielded >= self.max_urls:
-                    logger.info(f"Reached max_urls limit ({self.max_urls})")
-                    return
-                self._urls_yielded += 1
-                yield scrapy.Request(url, callback=self.parse_item)
-
-            offset += len(urls)
-            if len(urls) < limit:
-                break
+        if has_more and under_limit:
+            yield scrapy.Request(
+                self._build_prism_api_url(parsed, offset=next_offset),
+                callback=self._handle_prism_page,
+                meta={
+                    "_internal": True,
+                    "_prism_parsed": parsed,
+                    "_prism_offset": next_offset,
+                },
+                dont_filter=True,
+                priority=1,
+            )
 
     def _start_from_file(self, path):
         """Read URLs from a text file (one per line)."""
