@@ -5,11 +5,9 @@ Instead of fetching sitemaps at crawl time, this spider reads pre-discovered
 URLs from Prism's URL query API. URLs were collected by Prism's background
 sitemap scanner and stored in object storage, queryable via DuckDB.
 
-This follows the same pattern as Scrapy's built-in ``SitemapSpider`` but
-skips the sitemap fetch step — the sitemaps have already been indexed.
-
-URLs are fetched lazily in batches via Scrapy's request chain — only one
-batch is loaded at a time to avoid blowing up memory on large sitemaps.
+URLs are fetched lazily — the next batch is only requested once the crawler
+has consumed most of the current batch. This keeps memory bounded regardless
+of total URL count (millions of URLs are fine).
 
 Usage::
 
@@ -26,7 +24,7 @@ Usage::
 Spider arguments (passed via ``-a`` or Scrapyd settings):
     url_source: Override URL source (default: ``prism://{prism_domain}``)
     prism_url: Override Prism API base URL
-    batch_size: URLs per API page (default: 50000)
+    batch_size: URLs per API page (default: 5000)
     max_urls: Stop after N URLs (default: 0 = unlimited)
 """
 
@@ -37,6 +35,9 @@ from urllib.parse import urlparse, parse_qs, urlencode
 import scrapy
 
 logger = logging.getLogger(__name__)
+
+# Only fetch the next batch when pending requests drop below this
+_REFILL_THRESHOLD = 1000
 
 
 class PrismSitemapSpider(scrapy.Spider):
@@ -62,7 +63,7 @@ class PrismSitemapSpider(scrapy.Spider):
         self,
         url_source: str = None,
         prism_url: str = None,
-        batch_size: int = 50000,
+        batch_size: int = 5000,
         max_urls: int = 0,
         *args,
         **kwargs,
@@ -72,6 +73,10 @@ class PrismSitemapSpider(scrapy.Spider):
         self.max_urls = int(max_urls)
         self._prism_url_override = prism_url
         self._urls_yielded = 0
+        self._urls_responded = 0
+        self._prism_exhausted = False
+        self._prism_parsed = None  # stored for refill
+        self._prism_next_offset = 0
 
         # Build url_source from class attributes if not provided
         if url_source:
@@ -96,6 +101,10 @@ class PrismSitemapSpider(scrapy.Spider):
         except AttributeError:
             return "https://prism.calyprium.com"
 
+    @property
+    def _pending_count(self) -> int:
+        return self._urls_yielded - self._urls_responded
+
     def start_requests(self):
         if not self.url_source:
             logger.error("No url_source and no prism_domain set")
@@ -104,15 +113,13 @@ class PrismSitemapSpider(scrapy.Spider):
         parsed = urlparse(self.url_source)
 
         if parsed.scheme == "prism":
-            # Lazy pagination: fetch only the first page via Scrapy's
-            # request chain. Each page triggers fetching the next.
+            self._prism_parsed = parsed
+            self._prism_next_offset = 0
             yield scrapy.Request(
                 self._build_prism_api_url(parsed, offset=0),
                 callback=self._handle_prism_page,
                 meta={
                     "_internal": True,
-                    "_prism_parsed": parsed,
-                    "_prism_offset": 0,
                     "download_timeout": 120,
                 },
                 dont_filter=True,
@@ -147,48 +154,64 @@ class PrismSitemapSpider(scrapy.Spider):
         return f"{self.prism_url}/api/domains/{domain}/urls?{urlencode(api_params)}"
 
     def _handle_prism_page(self, response):
-        """Process one page of Prism URLs, then chain to the next page."""
+        """Process one page of Prism URLs."""
         data = response.json()
         urls = data.get("urls", [])
         total = data.get("total", 0)
-        offset = response.meta["_prism_offset"]
-        parsed = response.meta["_prism_parsed"]
 
         if not urls:
             logger.info(f"No more URLs from Prism (total={total})")
+            self._prism_exhausted = True
             return
 
         logger.info(
             f"Prism: got {len(urls):,} URLs "
-            f"(offset={offset:,}, total={total:,})"
+            f"(offset={self._prism_next_offset:,}, total={total:,}, "
+            f"pending={self._pending_count:,})"
         )
 
         for url in urls:
             if self.max_urls and self._urls_yielded >= self.max_urls:
                 logger.info(f"Reached max_urls limit ({self.max_urls:,})")
+                self._prism_exhausted = True
                 return
             self._urls_yielded += 1
-            yield scrapy.Request(url, callback=self.parse_item)
+            yield scrapy.Request(url, callback=self._parse_and_maybe_refill)
 
-        # Chain: request next page. This only runs after Scrapy has
-        # scheduled the current batch, keeping memory bounded.
-        next_offset = offset + len(urls)
-        has_more = len(urls) >= min(self.batch_size, 100000)
-        under_limit = not self.max_urls or self._urls_yielded < self.max_urls
+        self._prism_next_offset += len(urls)
 
-        if has_more and under_limit:
-            yield scrapy.Request(
-                self._build_prism_api_url(parsed, offset=next_offset),
-                callback=self._handle_prism_page,
-                meta={
-                    "_internal": True,
-                    "_prism_parsed": parsed,
-                    "_prism_offset": next_offset,
-                    "download_timeout": 120,
-                },
-                dont_filter=True,
-                priority=-1,  # low priority — process after current batch is mostly consumed
-            )
+        # If this batch was smaller than requested, Prism is exhausted
+        if len(urls) < min(self.batch_size, 100000):
+            self._prism_exhausted = True
+
+    def _parse_and_maybe_refill(self, response):
+        """Wrapper around parse_item that triggers refill when queue is low."""
+        self._urls_responded += 1
+
+        # Yield parse results
+        yield from self.parse_item(response)
+
+        # Check if we should fetch the next batch
+        if not self._prism_exhausted and self._pending_count < _REFILL_THRESHOLD:
+            self._prism_exhausted = True  # prevent multiple refills
+            yield self._make_refill_request()
+
+    def _make_refill_request(self):
+        """Create a request to fetch the next Prism page."""
+        self._prism_exhausted = False  # will be set again by _handle_prism_page
+        logger.info(
+            f"Prism: refilling from offset {self._prism_next_offset:,} "
+            f"(pending={self._pending_count:,})"
+        )
+        return scrapy.Request(
+            self._build_prism_api_url(self._prism_parsed, offset=self._prism_next_offset),
+            callback=self._handle_prism_page,
+            meta={
+                "_internal": True,
+                "download_timeout": 120,
+            },
+            dont_filter=True,
+        )
 
     def _start_from_file(self, path):
         """Read URLs from a text file (one per line)."""
