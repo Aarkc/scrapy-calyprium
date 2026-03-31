@@ -187,7 +187,7 @@ class PrismSitemapSpider(scrapy.Spider):
                     "download_timeout": 120,
                 },
                 dont_filter=True,
-                priority=1,
+                priority=-1,  # low priority — process after current batch is mostly consumed
             )
 
     def _start_from_file(self, path):
