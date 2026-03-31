@@ -113,6 +113,7 @@ class PrismSitemapSpider(scrapy.Spider):
                     "_internal": True,
                     "_prism_parsed": parsed,
                     "_prism_offset": 0,
+                    "download_timeout": 120,
                 },
                 dont_filter=True,
             )
@@ -183,6 +184,7 @@ class PrismSitemapSpider(scrapy.Spider):
                     "_internal": True,
                     "_prism_parsed": parsed,
                     "_prism_offset": next_offset,
+                    "download_timeout": 120,
                 },
                 dont_filter=True,
                 priority=1,
