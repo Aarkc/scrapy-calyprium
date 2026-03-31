@@ -1,3 +1,10 @@
+## [1.3.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.3...v1.3.4) (2026-03-31)
+
+
+### Bug Fixes
+
+* prevent cascading refills with _refill_in_flight flag ([2f23ddb](https://github.com/Aarkc/scrapy-calyprium/commit/2f23ddb03e77dd3ab7beaf8d5a6d2cd9e75d042f))
+
 ## [1.3.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.2...v1.3.3) (2026-03-31)
 
 
