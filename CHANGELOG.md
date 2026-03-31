@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.1...v1.3.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* use low priority for Prism chain requests to reduce queue buildup ([28a67a9](https://github.com/Aarkc/scrapy-calyprium/commit/28a67a9566180b68fef307ef3d84515f5f8fef09))
+
 ## [1.3.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.0...v1.3.1) (2026-03-31)
 
 
