@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.0...v1.3.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* set 120s download_timeout on Prism API chain requests ([531bcba](https://github.com/Aarkc/scrapy-calyprium/commit/531bcba35f8affd0aa23b27f0541bbc488e4cfad))
+
 # [1.3.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.2.0...v1.3.0) (2026-03-30)
 
 
