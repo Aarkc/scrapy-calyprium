@@ -1,3 +1,10 @@
+## [1.3.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.2...v1.3.3) (2026-03-31)
+
+
+### Bug Fixes
+
+* truly lazy Prism pagination via callback-driven refill ([5101512](https://github.com/Aarkc/scrapy-calyprium/commit/510151222d1758897c2e3216f92c5ae47504e331))
+
 ## [1.3.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.1...v1.3.2) (2026-03-31)
 
 
