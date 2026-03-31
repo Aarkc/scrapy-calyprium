@@ -75,6 +75,7 @@ class PrismSitemapSpider(scrapy.Spider):
         self._urls_yielded = 0
         self._urls_responded = 0
         self._prism_exhausted = False
+        self._refill_in_flight = False  # True while a Prism fetch is pending
         self._prism_parsed = None  # stored for refill
         self._prism_next_offset = 0
 
@@ -155,6 +156,8 @@ class PrismSitemapSpider(scrapy.Spider):
 
     def _handle_prism_page(self, response):
         """Process one page of Prism URLs."""
+        self._refill_in_flight = False
+
         data = response.json()
         urls = data.get("urls", [])
         total = data.get("total", 0)
@@ -192,13 +195,16 @@ class PrismSitemapSpider(scrapy.Spider):
         yield from self.parse_item(response)
 
         # Check if we should fetch the next batch
-        if not self._prism_exhausted and self._pending_count < _REFILL_THRESHOLD:
-            self._prism_exhausted = True  # prevent multiple refills
+        if (
+            not self._prism_exhausted
+            and not self._refill_in_flight
+            and self._pending_count < _REFILL_THRESHOLD
+        ):
+            self._refill_in_flight = True
             yield self._make_refill_request()
 
     def _make_refill_request(self):
         """Create a request to fetch the next Prism page."""
-        self._prism_exhausted = False  # will be set again by _handle_prism_page
         logger.info(
             f"Prism: refilling from offset {self._prism_next_offset:,} "
             f"(pending={self._pending_count:,})"
