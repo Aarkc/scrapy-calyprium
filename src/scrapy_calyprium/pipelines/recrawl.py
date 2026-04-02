@@ -71,7 +71,6 @@ class RecrawlTrackingPipeline:
         )
         pipeline._user_id = user_id
         return pipeline
-        )
 
     def open_spider(self, spider):
         if not self.spider_slug:
