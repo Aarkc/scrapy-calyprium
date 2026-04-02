@@ -1,3 +1,10 @@
+## [1.4.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.2...v1.4.3) (2026-04-02)
+
+
+### Bug Fixes
+
+* remove stray paren causing SyntaxError in recrawl pipeline ([87602ad](https://github.com/Aarkc/scrapy-calyprium/commit/87602add26b382fe20a5bbd1133183d1a8913170))
+
 ## [1.4.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.1...v1.4.2) (2026-04-02)
 
 
