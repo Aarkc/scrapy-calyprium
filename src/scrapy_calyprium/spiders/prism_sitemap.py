@@ -142,7 +142,7 @@ class PrismSitemapSpider(scrapy.Spider):
 
         Only loads one batch in start_requests. Subsequent batches are
         fetched on-demand by _recrawl_refill() when the pending queue
-        drops below the threshold — same pattern as prism:// but using
+        drops below the threshold -- same pattern as prism:// but using
         direct HTTP (Forge needs auth headers).
         """
         self._prism_parsed = parsed
