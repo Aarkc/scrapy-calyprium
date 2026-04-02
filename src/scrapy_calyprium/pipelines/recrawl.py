@@ -39,6 +39,7 @@ class RecrawlTrackingPipeline:
         self.api_key = api_key
         self.run_number = run_number
         self.batch_size = batch_size
+        self._user_id = "internal"
         self._buffer: List[Dict] = []
         self._total_reported = 0
 
@@ -54,18 +55,22 @@ class RecrawlTrackingPipeline:
         api_key = crawler.settings.get("CALYPRIUM_API_KEY", "")
         run_number = crawler.settings.getint("SPIDER_RUN_NUMBER", 0)
         batch_size = crawler.settings.getint("RECRAWL_BATCH_SIZE", 100)
+        user_id = crawler.settings.get("RECRAWL_USER_ID", "") or crawler.settings.get("SPIDER_USER_ID", "internal")
 
         if not api_key:
             raise NotConfigured(
                 "RecrawlTrackingPipeline requires CALYPRIUM_API_KEY"
             )
 
-        return cls(
+        pipeline = cls(
             forge_url=forge_url,
             spider_slug=spider_slug,
             api_key=api_key,
             run_number=run_number,
             batch_size=batch_size,
+        )
+        pipeline._user_id = user_id
+        return pipeline
         )
 
     def open_spider(self, spider):
@@ -116,7 +121,7 @@ class RecrawlTrackingPipeline:
                 },
                 headers={
                     "X-Service-Secret": self.api_key,
-                    "X-User-Id": "internal",
+                    "X-User-Id": self._user_id,
                 },
                 timeout=30.0,
             )

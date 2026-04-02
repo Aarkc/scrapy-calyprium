@@ -157,6 +157,11 @@ class PrismSitemapSpider(scrapy.Spider):
             api_key = ""
 
         try:
+            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
+        except AttributeError:
+            user_id = "internal"
+
+        try:
             max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
         except AttributeError:
             max_urls_setting = 0
@@ -180,7 +185,7 @@ class PrismSitemapSpider(scrapy.Spider):
                     params={"limit": effective_limit, "offset": offset},
                     headers={
                         "X-Service-Secret": api_key,
-                        "X-User-Id": "internal",
+                        "X-User-Id": user_id,
                     },
                     timeout=120,
                 )
