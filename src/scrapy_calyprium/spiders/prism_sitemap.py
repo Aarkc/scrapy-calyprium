@@ -138,84 +138,120 @@ class PrismSitemapSpider(scrapy.Spider):
             yield scrapy.Request(self.url_source, callback=self.parse_item)
 
     def _start_from_recrawl(self, parsed):
-        """Fetch stale URLs from Forge's recrawl API via direct HTTP.
+        """Fetch first batch of stale URLs, then refill lazily via callbacks.
 
-        Unlike prism://, recrawl:// calls Forge which requires auth headers.
-        We use requests (synchronous) since start_requests is a generator.
+        Only loads one batch in start_requests. Subsequent batches are
+        fetched on-demand by _recrawl_refill() when the pending queue
+        drops below the threshold — same pattern as prism:// but using
+        direct HTTP (Forge needs auth headers).
         """
+        self._prism_parsed = parsed
+        self._prism_next_offset = 0
+        self._recrawl_exhausted = False
+
+        # Resolve settings once
+        try:
+            self._recrawl_forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
+        except AttributeError:
+            self._recrawl_forge_url = "http://calyprium-backend:8000"
+        try:
+            self._recrawl_api_key = self.settings.get("FORGE_SERVICE_SECRET", "") or self.settings.get("CALYPRIUM_API_KEY", "")
+        except AttributeError:
+            self._recrawl_api_key = ""
+        try:
+            self._recrawl_user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
+        except AttributeError:
+            self._recrawl_user_id = "internal"
+        try:
+            self._recrawl_max_urls = self.settings.getint("RECRAWL_MAX_URLS", 0)
+        except AttributeError:
+            self._recrawl_max_urls = 0
+
+        # Fetch first batch and yield URLs with refill callback
+        urls = self._fetch_recrawl_batch()
+        if not urls:
+            return
+
+        for url in urls:
+            if self._recrawl_max_urls and self._urls_yielded >= self._recrawl_max_urls:
+                self._recrawl_exhausted = True
+                return
+            self._urls_yielded += 1
+            yield scrapy.Request(url, callback=self._parse_and_maybe_refill_recrawl)
+
+    def _fetch_recrawl_batch(self):
+        """Fetch one batch of stale URLs from Forge via sync HTTP."""
         import requests as req
 
-        spider_slug = parsed.netloc or parsed.path
-        try:
-            forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
-        except AttributeError:
-            forge_url = "http://calyprium-backend:8000"
-
-        try:
-            api_key = self.settings.get("FORGE_SERVICE_SECRET", "") or self.settings.get("CALYPRIUM_API_KEY", "")
-        except AttributeError:
-            api_key = ""
-
-        try:
-            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
-        except AttributeError:
-            user_id = "internal"
-
-        try:
-            max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
-        except AttributeError:
-            max_urls_setting = 0
-
-        offset = 0
+        spider_slug = (self._prism_parsed.netloc or self._prism_parsed.path)
         limit = min(self.batch_size, 50000)
 
-        while True:
-            if max_urls_setting and self._urls_yielded >= max_urls_setting:
-                logger.info(f"Recrawl: reached max_urls limit ({max_urls_setting:,})")
-                return
+        if self._recrawl_max_urls:
+            remaining = self._recrawl_max_urls - self._urls_yielded
+            if remaining <= 0:
+                return []
+            limit = min(limit, remaining)
 
-            effective_limit = limit
-            if max_urls_setting:
-                effective_limit = min(limit, max_urls_setting - self._urls_yielded)
+        api_url = f"{self._recrawl_forge_url}/spiders/{spider_slug}/recrawl/stale-urls"
+        try:
+            resp = req.get(
+                api_url,
+                params={"limit": limit, "offset": self._prism_next_offset},
+                headers={
+                    "X-Service-Secret": self._recrawl_api_key,
+                    "X-User-Id": self._recrawl_user_id,
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Recrawl: failed to fetch stale URLs: {e}")
+            self._recrawl_exhausted = True
+            return []
 
-            api_url = f"{forge_url}/spiders/{spider_slug}/recrawl/stale-urls"
-            try:
-                resp = req.get(
-                    api_url,
-                    params={"limit": effective_limit, "offset": offset},
-                    headers={
-                        "X-Service-Secret": api_key,
-                        "X-User-Id": user_id,
-                    },
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                logger.error(f"Recrawl: failed to fetch stale URLs: {e}")
-                return
+        urls = data.get("urls", [])
+        total_stale = data.get("total_stale", 0)
 
-            urls = data.get("urls", [])
-            total_stale = data.get("total_stale", 0)
+        if not urls:
+            logger.info(f"Recrawl: no more stale URLs (total_stale={total_stale})")
+            self._recrawl_exhausted = True
+            return []
+
+        logger.info(
+            f"Recrawl: got {len(urls):,} stale URLs "
+            f"(offset={self._prism_next_offset:,}, total_stale={total_stale:,})"
+        )
+
+        self._prism_next_offset += len(urls)
+        if len(urls) < limit:
+            self._recrawl_exhausted = True
+
+        return urls
+
+    def _parse_and_maybe_refill_recrawl(self, response):
+        """Wrapper around parse_item that triggers recrawl refill when queue is low."""
+        self._urls_responded += 1
+        yield from self.parse_item(response)
+
+        if (
+            not self._recrawl_exhausted
+            and not self._refill_in_flight
+            and self._pending_count < _REFILL_THRESHOLD
+        ):
+            self._refill_in_flight = True
+            urls = self._fetch_recrawl_batch()
+            self._refill_in_flight = False
 
             if not urls:
-                logger.info(f"Recrawl: no more stale URLs (total_stale={total_stale})")
                 return
-
-            logger.info(
-                f"Recrawl: got {len(urls):,} stale URLs "
-                f"(offset={offset:,}, total_stale={total_stale:,})"
-            )
 
             for url in urls:
-                if max_urls_setting and self._urls_yielded >= max_urls_setting:
+                if self._recrawl_max_urls and self._urls_yielded >= self._recrawl_max_urls:
+                    self._recrawl_exhausted = True
                     return
                 self._urls_yielded += 1
-                yield scrapy.Request(url, callback=self.parse_item)
-
-            offset += len(urls)
-            if len(urls) < effective_limit:
-                return
+                yield scrapy.Request(url, callback=self._parse_and_maybe_refill_recrawl)
 
     def _build_recrawl_api_url(self, parsed, offset: int) -> str:
         """Build the Forge stale-urls API URL for a page of stale URLs."""
