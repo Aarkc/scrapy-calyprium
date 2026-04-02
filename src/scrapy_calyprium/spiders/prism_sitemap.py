@@ -114,17 +114,7 @@ class PrismSitemapSpider(scrapy.Spider):
         parsed = urlparse(self.url_source)
 
         if parsed.scheme == "recrawl":
-            self._prism_parsed = parsed
-            self._prism_next_offset = 0
-            yield scrapy.Request(
-                self._build_recrawl_api_url(parsed, offset=0),
-                callback=self._handle_prism_page,
-                meta={
-                    "_internal": True,
-                    "download_timeout": 120,
-                },
-                dont_filter=True,
-            )
+            yield from self._start_from_recrawl(parsed)
         elif parsed.scheme == "prism":
             self._prism_parsed = parsed
             self._prism_next_offset = 0
@@ -146,6 +136,81 @@ class PrismSitemapSpider(scrapy.Spider):
                     yield scrapy.Request(url, callback=self.parse_item)
         else:
             yield scrapy.Request(self.url_source, callback=self.parse_item)
+
+    def _start_from_recrawl(self, parsed):
+        """Fetch stale URLs from Forge's recrawl API via direct HTTP.
+
+        Unlike prism://, recrawl:// calls Forge which requires auth headers.
+        We use requests (synchronous) since start_requests is a generator.
+        """
+        import requests as req
+
+        spider_slug = parsed.netloc or parsed.path
+        try:
+            forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
+        except AttributeError:
+            forge_url = "http://calyprium-backend:8000"
+
+        try:
+            api_key = self.settings.get("CALYPRIUM_API_KEY", "")
+        except AttributeError:
+            api_key = ""
+
+        try:
+            max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
+        except AttributeError:
+            max_urls_setting = 0
+
+        offset = 0
+        limit = min(self.batch_size, 50000)
+
+        while True:
+            if max_urls_setting and self._urls_yielded >= max_urls_setting:
+                logger.info(f"Recrawl: reached max_urls limit ({max_urls_setting:,})")
+                return
+
+            effective_limit = limit
+            if max_urls_setting:
+                effective_limit = min(limit, max_urls_setting - self._urls_yielded)
+
+            api_url = f"{forge_url}/spiders/{spider_slug}/recrawl/stale-urls"
+            try:
+                resp = req.get(
+                    api_url,
+                    params={"limit": effective_limit, "offset": offset},
+                    headers={
+                        "X-Service-Secret": api_key,
+                        "X-User-Id": "internal",
+                    },
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.error(f"Recrawl: failed to fetch stale URLs: {e}")
+                return
+
+            urls = data.get("urls", [])
+            total_stale = data.get("total_stale", 0)
+
+            if not urls:
+                logger.info(f"Recrawl: no more stale URLs (total_stale={total_stale})")
+                return
+
+            logger.info(
+                f"Recrawl: got {len(urls):,} stale URLs "
+                f"(offset={offset:,}, total_stale={total_stale:,})"
+            )
+
+            for url in urls:
+                if max_urls_setting and self._urls_yielded >= max_urls_setting:
+                    return
+                self._urls_yielded += 1
+                yield scrapy.Request(url, callback=self.parse_item)
+
+            offset += len(urls)
+            if len(urls) < effective_limit:
+                return
 
     def _build_recrawl_api_url(self, parsed, offset: int) -> str:
         """Build the Forge stale-urls API URL for a page of stale URLs."""
@@ -242,23 +307,13 @@ class PrismSitemapSpider(scrapy.Spider):
             yield self._make_refill_request()
 
     def _make_refill_request(self):
-        """Create a request to fetch the next page of URLs."""
-        source = "Recrawl" if self._prism_parsed.scheme == "recrawl" else "Prism"
+        """Create a request to fetch the next Prism page."""
         logger.info(
-            f"{source}: refilling from offset {self._prism_next_offset:,} "
+            f"Prism: refilling from offset {self._prism_next_offset:,} "
             f"(pending={self._pending_count:,})"
         )
-        if self._prism_parsed.scheme == "recrawl":
-            url = self._build_recrawl_api_url(self._prism_parsed, offset=self._prism_next_offset)
-        else:
-            url = self._build_prism_api_url(self._prism_parsed, offset=self._prism_next_offset)
-
-        if url is None:
-            self._prism_exhausted = True
-            return None
-
         return scrapy.Request(
-            url,
+            self._build_prism_api_url(self._prism_parsed, offset=self._prism_next_offset),
             callback=self._handle_prism_page,
             meta={
                 "_internal": True,
