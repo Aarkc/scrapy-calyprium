@@ -1,3 +1,10 @@
+## [1.4.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.4...v1.4.5) (2026-04-02)
+
+
+### Bug Fixes
+
+* lazy loading for recrawl:// URL source (fetch one batch at a time) ([d479da7](https://github.com/Aarkc/scrapy-calyprium/commit/d479da7c3434ef0eb67250cc5becba54bae81c70))
+
 ## [1.4.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.3...v1.4.4) (2026-04-02)
 
 
