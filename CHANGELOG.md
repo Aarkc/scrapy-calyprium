@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.4...v1.4.0) (2026-04-02)
+
+
+### Features
+
+* add RecrawlTrackingPipeline and recrawl:// URL source ([afa8b79](https://github.com/Aarkc/scrapy-calyprium/commit/afa8b790df9695cd1539686a855bab6393536cae))
+
 ## [1.3.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.3...v1.3.4) (2026-03-31)
 
 
