@@ -1,3 +1,10 @@
+## [1.4.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.1...v1.4.2) (2026-04-02)
+
+
+### Bug Fixes
+
+* use real user_id for Forge API auth in recrawl spider and pipeline ([2728fc6](https://github.com/Aarkc/scrapy-calyprium/commit/2728fc669a4fe2a0cc51ec1817cdba52b048fe21))
+
 ## [1.4.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.0...v1.4.1) (2026-04-02)
 
 
