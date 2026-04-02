@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.0...v1.4.1) (2026-04-02)
+
+
+### Bug Fixes
+
+* use direct HTTP for recrawl:// URL source (auth + proxy bypass) ([fc06668](https://github.com/Aarkc/scrapy-calyprium/commit/fc0666881b971200c6aa062b8e1c29d96a14939f))
+
 # [1.4.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.3.4...v1.4.0) (2026-04-02)
 
 
