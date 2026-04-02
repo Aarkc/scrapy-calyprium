@@ -152,7 +152,7 @@ class PrismSitemapSpider(scrapy.Spider):
             forge_url = "http://calyprium-backend:8000"
 
         try:
-            api_key = self.settings.get("CALYPRIUM_API_KEY", "")
+            api_key = self.settings.get("FORGE_SERVICE_SECRET", "") or self.settings.get("CALYPRIUM_API_KEY", "")
         except AttributeError:
             api_key = ""
 

@@ -52,7 +52,7 @@ class RecrawlTrackingPipeline:
             "FORGE_API_URL", "http://calyprium-backend:8000"
         )
         spider_slug = crawler.settings.get("RECRAWL_SPIDER_SLUG", "")
-        api_key = crawler.settings.get("CALYPRIUM_API_KEY", "")
+        api_key = crawler.settings.get("FORGE_SERVICE_SECRET", "") or crawler.settings.get("CALYPRIUM_API_KEY", "")
         run_number = crawler.settings.getint("SPIDER_RUN_NUMBER", 0)
         batch_size = crawler.settings.getint("RECRAWL_BATCH_SIZE", 100)
         user_id = crawler.settings.get("RECRAWL_USER_ID", "") or crawler.settings.get("SPIDER_USER_ID", "internal")
