@@ -1,3 +1,10 @@
+## [1.4.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.5...v1.4.6) (2026-04-02)
+
+
+### Bug Fixes
+
+* replace em dash with ASCII to fix UTF-8 encoding error on some platforms ([de33d5f](https://github.com/Aarkc/scrapy-calyprium/commit/de33d5fb5f624bce193f813f37f6960739a53515))
+
 ## [1.4.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.4...v1.4.5) (2026-04-02)
 
 
