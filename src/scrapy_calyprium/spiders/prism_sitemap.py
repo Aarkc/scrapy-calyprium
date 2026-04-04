@@ -303,22 +303,27 @@ class PrismSitemapSpider(scrapy.Spider):
         self._refill_in_flight = False
 
         data = response.json()
-        urls = data.get("urls", [])
+        raw_urls = data.get("urls", [])
         total = data.get("total", 0) or data.get("total_stale", 0)
+        raw_count = len(raw_urls)
 
-        if not urls:
+        if not raw_urls:
             logger.info(f"No more URLs from Prism (total={total})")
             self._prism_exhausted = True
             return
 
-        # Filter out fresh URLs if recrawl tracking is enabled
-        urls = self._filter_fresh_urls(urls)
+        # Filter out fresh URLs if recrawl tracking is enabled.
+        # Track raw_count separately so offset advances correctly.
+        urls = self._filter_fresh_urls(raw_urls)
 
         logger.info(
-            f"Prism: got {len(urls):,} URLs "
+            f"Prism: got {len(urls):,} stale / {raw_count:,} total URLs "
             f"(offset={self._prism_next_offset:,}, total={total:,}, "
             f"pending={self._pending_count:,})"
         )
+
+        # Advance offset by the RAW batch size (not filtered)
+        self._prism_next_offset += raw_count
 
         for url in urls:
             if self.max_urls and self._urls_yielded >= self.max_urls:
@@ -328,11 +333,17 @@ class PrismSitemapSpider(scrapy.Spider):
             self._urls_yielded += 1
             yield scrapy.Request(url, callback=self._parse_and_maybe_refill)
 
-        self._prism_next_offset += len(urls)
-
-        # If this batch was smaller than requested, Prism is exhausted
-        if len(urls) < min(self.batch_size, 100000):
+        # Prism is exhausted only if the RAW batch was smaller than requested
+        if raw_count < min(self.batch_size, 100000):
             self._prism_exhausted = True
+        # If filtering removed all URLs but Prism has more, trigger
+        # immediate refill so we don't stall with an empty queue
+        elif not urls and not self._prism_exhausted:
+            logger.info(
+                f"Batch fully fresh at offset {self._prism_next_offset:,}, "
+                f"fetching next batch"
+            )
+            yield self._make_refill_request()
 
     def _filter_fresh_urls(self, urls):
         """Filter out recently-crawled URLs via Forge's freshness API.
