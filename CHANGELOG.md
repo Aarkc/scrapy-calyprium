@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.6...v1.5.0) (2026-04-04)
+
+
+### Features
+
+* filter fresh URLs from Prism batches when recrawl tracking is enabled ([4f9e6eb](https://github.com/Aarkc/scrapy-calyprium/commit/4f9e6ebf6627abd42618c1fe97e3bda3ce2d133a))
+
 ## [1.4.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.5...v1.4.6) (2026-04-02)
 
 
