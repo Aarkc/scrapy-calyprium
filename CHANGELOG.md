@@ -1,3 +1,10 @@
+## [1.5.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.5.0...v1.5.1) (2026-04-04)
+
+
+### Bug Fixes
+
+* advance Prism offset by raw batch size, not filtered count ([bdab72f](https://github.com/Aarkc/scrapy-calyprium/commit/bdab72fdf7e2f0dda11aedc2bb63fd446bea9a3b))
+
 # [1.5.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.4.6...v1.5.0) (2026-04-04)
 
 
