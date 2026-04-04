@@ -311,6 +311,9 @@ class PrismSitemapSpider(scrapy.Spider):
             self._prism_exhausted = True
             return
 
+        # Filter out fresh URLs if recrawl tracking is enabled
+        urls = self._filter_fresh_urls(urls)
+
         logger.info(
             f"Prism: got {len(urls):,} URLs "
             f"(offset={self._prism_next_offset:,}, total={total:,}, "
@@ -330,6 +333,53 @@ class PrismSitemapSpider(scrapy.Spider):
         # If this batch was smaller than requested, Prism is exhausted
         if len(urls) < min(self.batch_size, 100000):
             self._prism_exhausted = True
+
+    def _filter_fresh_urls(self, urls):
+        """Filter out recently-crawled URLs via Forge's freshness API.
+
+        Only active when RECRAWL_TRACKING_ENABLED=true. Calls Forge's
+        /filter-stale endpoint which checks the crawl_freshness table.
+        If the call fails, returns all URLs (fail-open).
+        """
+        try:
+            enabled = self.settings.getbool("RECRAWL_TRACKING_ENABLED", False)
+        except AttributeError:
+            return urls
+        if not enabled:
+            return urls
+
+        try:
+            forge_url = self.settings.get("FORGE_API_URL", "")
+            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
+            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
+            spider_slug = self.settings.get("RECRAWL_SPIDER_SLUG", "") or self.name
+        except AttributeError:
+            return urls
+
+        if not forge_url or not api_key:
+            return urls
+
+        import requests as req
+        try:
+            resp = req.post(
+                f"{forge_url}/spiders/{spider_slug}/recrawl/filter-stale",
+                json={"urls": urls},
+                headers={"X-Service-Secret": api_key, "X-User-Id": user_id},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            stale = data.get("stale_urls", urls)
+            fresh_count = data.get("fresh_count", 0)
+            if fresh_count > 0:
+                logger.info(
+                    f"Freshness filter: {fresh_count} fresh, "
+                    f"{len(stale)} stale out of {len(urls)}"
+                )
+            return stale
+        except Exception as e:
+            logger.warning(f"Freshness filter failed (proceeding with all URLs): {e}")
+            return urls
 
     def _parse_and_maybe_refill(self, response):
         """Wrapper around parse_item that triggers refill when queue is low."""
