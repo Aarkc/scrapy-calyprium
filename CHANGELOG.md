@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.5.1...v1.6.0) (2026-04-05)
+
+
+### Features
+
+* add crawl targets pipeline and targets:// URL source ([eb1ba0b](https://github.com/Aarkc/scrapy-calyprium/commit/eb1ba0b0d05687b41e8e7b78ba66cc39b6ee4673))
+
 ## [1.5.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.5.0...v1.5.1) (2026-04-04)
 
 
