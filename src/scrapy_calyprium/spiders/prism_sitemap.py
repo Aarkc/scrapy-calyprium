@@ -113,7 +113,9 @@ class PrismSitemapSpider(scrapy.Spider):
 
         parsed = urlparse(self.url_source)
 
-        if parsed.scheme == "recrawl":
+        if parsed.scheme == "targets":
+            yield from self._start_from_targets(parsed)
+        elif parsed.scheme == "recrawl":
             yield from self._start_from_recrawl(parsed)
         elif parsed.scheme == "prism":
             self._prism_parsed = parsed
@@ -136,6 +138,106 @@ class PrismSitemapSpider(scrapy.Spider):
                     yield scrapy.Request(url, callback=self.parse_item)
         else:
             yield scrapy.Request(self.url_source, callback=self.parse_item)
+
+    def _start_from_targets(self, parsed):
+        """Fetch pending crawl targets from Forge's targets API.
+
+        URL source: targets://spider-slug?target_type=document
+        Fetches one batch at a time, refills lazily like recrawl://.
+        """
+        import requests as req
+
+        spider_slug = parsed.netloc or parsed.path
+        from urllib.parse import parse_qs
+        params = parse_qs(parsed.query)
+        target_type = params.get("target_type", [None])[0]
+
+        try:
+            forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
+            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
+            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
+        except AttributeError:
+            forge_url = "http://calyprium-backend:8000"
+            api_key = ""
+            user_id = "internal"
+
+        try:
+            max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
+        except AttributeError:
+            max_urls_setting = 0
+
+        self._targets_forge_url = forge_url
+        self._targets_api_key = api_key
+        self._targets_user_id = user_id
+        self._targets_spider_slug = spider_slug
+        self._targets_type = target_type
+        self._targets_exhausted = False
+        self._targets_offset = 0
+
+        urls = self._fetch_targets_batch()
+        if not urls:
+            return
+
+        for url in urls:
+            if max_urls_setting and self._urls_yielded >= max_urls_setting:
+                self._targets_exhausted = True
+                return
+            self._urls_yielded += 1
+            yield scrapy.Request(url, callback=self._parse_and_maybe_refill_targets)
+
+    def _fetch_targets_batch(self):
+        """Fetch one batch of pending targets from Forge."""
+        import requests as req
+
+        limit = min(self.batch_size, 50000)
+        api_params = {"limit": limit, "offset": self._targets_offset}
+        if self._targets_type:
+            api_params["target_type"] = self._targets_type
+
+        try:
+            resp = req.get(
+                f"{self._targets_forge_url}/spiders/{self._targets_spider_slug}/targets/pending",
+                params=api_params,
+                headers={"X-Service-Secret": self._targets_api_key,
+                          "X-User-Id": self._targets_user_id},
+                timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Targets: failed to fetch pending targets: {e}")
+            self._targets_exhausted = True
+            return []
+
+        urls = data.get("urls", [])
+        total = data.get("total_pending", 0)
+
+        if not urls:
+            logger.info(f"Targets: no more pending targets (total={total})")
+            self._targets_exhausted = True
+            return []
+
+        logger.info(f"Targets: got {len(urls):,} pending (offset={self._targets_offset:,}, total={total:,})")
+        self._targets_offset += len(urls)
+        if len(urls) < limit:
+            self._targets_exhausted = True
+
+        return urls
+
+    def _parse_and_maybe_refill_targets(self, response):
+        """Wrapper for targets:// -- parse item and refill when queue is low."""
+        self._urls_responded += 1
+        yield from self.parse_item(response)
+
+        if (not self._targets_exhausted
+                and not self._refill_in_flight
+                and self._pending_count < _REFILL_THRESHOLD):
+            self._refill_in_flight = True
+            urls = self._fetch_targets_batch()
+            self._refill_in_flight = False
+            if urls:
+                for url in urls:
+                    self._urls_yielded += 1
+                    yield scrapy.Request(url, callback=self._parse_and_maybe_refill_targets)
 
     def _start_from_recrawl(self, parsed):
         """Fetch first batch of stale URLs, then refill lazily via callbacks.
