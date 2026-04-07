@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.6.0...v1.7.0) (2026-04-07)
+
+
+### Features
+
+* local-first auto-routing (AAR-15 + AAR-17) ([16bfb7a](https://github.com/Aarkc/scrapy-calyprium/commit/16bfb7a51b9f39f968fdc0be33faf29a2f71c2b7))
+
 # [1.6.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.5.1...v1.6.0) (2026-04-05)
 
 
