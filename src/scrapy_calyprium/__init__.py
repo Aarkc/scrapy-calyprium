@@ -29,6 +29,20 @@ from scrapy_calyprium.middleware.spectre import SpectreMiddleware
 from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
 from scrapy_calyprium.pipelines.s3_batch import S3BatchPipeline
 
+# AAR-15/17: optional local-first routing surfaces. Importable only if
+# scrapy-calyprium[local] is installed.
+try:
+    from scrapy_calyprium.routing import (
+        LocalFetcher,
+        LocalFetchError,
+        LocalFetchResult,
+        is_local_fetch_available,
+        is_blocked,
+    )
+    _HAS_LOCAL_ROUTING = True
+except ImportError:
+    _HAS_LOCAL_ROUTING = False
+
 __all__ = [
     "__version__",
     "configure",
@@ -39,3 +53,11 @@ __all__ = [
     "MimicBrowserMiddleware",
     "S3BatchPipeline",
 ]
+if _HAS_LOCAL_ROUTING:
+    __all__ += [
+        "LocalFetcher",
+        "LocalFetchError",
+        "LocalFetchResult",
+        "is_local_fetch_available",
+        "is_blocked",
+    ]

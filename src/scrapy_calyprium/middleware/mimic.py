@@ -18,16 +18,39 @@ Settings:
     MIMIC_WAIT_AFTER_LOAD: Extra wait in ms after load (default: 0)
     MIMIC_USE_SPECTRE: Use Spectre for fingerprints (default: True)
     MIMIC_TARGET_DOMAIN: Target domain for per-domain fingerprints (optional)
+
+    MIMIC_LOCAL_FETCH: opt-in local-first auto-routing (AAR-17). When True
+        and the optional [local] extra is installed, requests are first
+        attempted via in-process httpcloak with cached cookies from a per-spider
+        domain cache. Mimic /api/solve is called only when local fetch hits
+        a challenge. Falls back to the existing /api/fetch + /api/session
+        browser path on unrecoverable failure. Default: False.
+    MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
+    MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional)
 """
 
 import logging
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
-from scrapy.http import HtmlResponse
+from scrapy.http import HtmlResponse, Response
+
+# AAR-17: optional local-first routing components. Imported lazily so the
+# middleware still works for users who haven't installed scrapy-calyprium[local].
+try:
+    from scrapy_calyprium.routing.auto import SpiderAutoRouter, RouteResult
+    from scrapy_calyprium.routing.domain_cache import DomainCache
+    from scrapy_calyprium.routing.local_fetch import (
+        LocalFetcher,
+        is_local_fetch_available,
+    )
+    from scrapy_calyprium.routing.solve_client import SolveClient
+    _HAS_LOCAL_ROUTING = True
+except ImportError:
+    _HAS_LOCAL_ROUTING = False
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +95,19 @@ class MimicBrowserMiddleware:
         self._client: Optional[httpx.AsyncClient] = None
         self.crawler = None  # Set in from_crawler
 
+        # AAR-17: local-first routing state — initialized in spider_opened
+        # if MIMIC_LOCAL_FETCH=True and the [local] extra is installed.
+        self._local_router: Optional["SpiderAutoRouter"] = None
+        self._local_cache: Optional["DomainCache"] = None
+        self._solve_client: Optional["SolveClient"] = None
+        self._local_enabled: bool = False
+        self._local_stats = {
+            "local_success": 0,
+            "local_blocked": 0,
+            "local_solve": 0,
+            "fallback_legacy": 0,
+        }
+
     @classmethod
     def from_crawler(cls, crawler):
         service_url = crawler.settings.get("MIMIC_SERVICE_URL")
@@ -105,6 +141,22 @@ class MimicBrowserMiddleware:
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
         middleware.crawler = crawler
 
+        # AAR-17: local-first routing opt-in
+        local_enabled = crawler.settings.getbool("MIMIC_LOCAL_FETCH", False)
+        if local_enabled and not _HAS_LOCAL_ROUTING:
+            logger.warning(
+                "MIMIC_LOCAL_FETCH=True but scrapy-calyprium[local] is not "
+                "installed; falling back to legacy routing"
+            )
+            local_enabled = False
+        if local_enabled and not is_local_fetch_available():
+            logger.warning(
+                "MIMIC_LOCAL_FETCH=True but no local fetch backend is available "
+                "(httpcloak / curl_cffi); falling back to legacy routing"
+            )
+            local_enabled = False
+        middleware._local_enabled = local_enabled
+
         crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
 
@@ -121,8 +173,48 @@ class MimicBrowserMiddleware:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client
 
+    def _init_local_router(self, spider):
+        """AAR-17: stand up the local-first routing components."""
+        if not self._local_enabled or self._local_router is not None:
+            return
+        try:
+            preset = self.crawler.settings.get("MIMIC_LOCAL_PRESET", "chrome-143")
+            proxy_url = self.crawler.settings.get("MIMIC_LOCAL_PROXY_URL")
+            timeout = self.crawler.settings.getint("DOWNLOAD_TIMEOUT", 60)
+            self._local_cache = DomainCache()
+            fetcher = LocalFetcher(default_preset=preset, timeout=timeout)
+            self._solve_client = SolveClient(
+                service_url=self.service_url,
+                api_key=self.api_key,
+                service_secret=self.crawler.settings.get("FORGE_SERVICE_SECRET")
+                or self.crawler.settings.get("MIMIC_SERVICE_SECRET"),
+                user_id=self.crawler.settings.get("FORGE_USER_ID")
+                or self.crawler.settings.get("MIMIC_USER_ID")
+                or self.crawler.settings.get("RECRAWL_USER_ID"),
+            )
+            self._local_router = SpiderAutoRouter(
+                fetcher=fetcher,
+                cache=self._local_cache,
+                solve_client=self._solve_client,
+                proxy_url=proxy_url,
+            )
+            logger.info(
+                f"MimicMiddleware: local-first routing enabled "
+                f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"MimicMiddleware: failed to initialize local routing: {e}; "
+                f"falling back to legacy"
+            )
+            self._local_router = None
+            self._local_enabled = False
+
     async def spider_opened(self, spider):
         """Create browser session when spider opens."""
+        # AAR-17: stand up the local-first router (no-op if disabled)
+        self._init_local_router(spider)
+
         logger.info(
             f"MimicMiddleware: Creating session "
             f"(engine: {self.browser_engine or 'auto'}, "
@@ -182,6 +274,22 @@ class MimicBrowserMiddleware:
 
     async def spider_closed(self, spider):
         """Close browser session when spider closes."""
+        # AAR-17: report local-first stats and tear down the solve client
+        if self._local_enabled:
+            logger.info(
+                "MimicMiddleware: local-first stats: success=%d cookies_solve=%d "
+                "blocked=%d fallback_legacy=%d",
+                self._local_stats["local_success"],
+                self._local_stats["local_solve"],
+                self._local_stats["local_blocked"],
+                self._local_stats["fallback_legacy"],
+            )
+            if self._solve_client:
+                try:
+                    await self._solve_client.close()
+                except Exception:
+                    pass
+
         if self.session_id:
             logger.info(f"MimicMiddleware: Closing session {self.session_id}")
             try:
@@ -199,20 +307,91 @@ class MimicBrowserMiddleware:
 
     _SKIP_PATTERNS = (".xml", "/robots.txt", "/sitemap")
 
+    @staticmethod
+    def _domain_for(request) -> str:
+        try:
+            return urlparse(request.url).netloc
+        except Exception:
+            return ""
+
+    async def _try_local_route(self, request, spider) -> Optional[Response]:
+        """AAR-17: try the local-first auto-router. Return a Response on success,
+        None to fall through to the legacy /api/fetch path.
+
+        Per-request opt-out via meta['mimic_local_skip']=True; per-request
+        opt-in to *always* use the browser via meta['mimic_force_browser']=True.
+        """
+        if not self._local_router:
+            return None
+        if request.meta.get("mimic_force_browser") or request.meta.get("mimic_local_skip"):
+            return None
+
+        domain = self._domain_for(request)
+        if not domain:
+            return None
+
+        try:
+            result = await self._local_router.fetch(request.url, domain=domain)
+        except Exception as e:
+            logger.warning(
+                f"MimicMiddleware: local route raised for {request.url}: {e}; "
+                f"falling back to legacy"
+            )
+            self._local_stats["fallback_legacy"] += 1
+            return None
+
+        if result.needs_legacy_fallback:
+            self._local_stats["fallback_legacy"] += 1
+            logger.debug(
+                f"MimicMiddleware: local route fell through for {domain} "
+                f"({result.routing_method}, error={result.error})"
+            )
+            return None
+
+        if result.fetch is None or result.blocked:
+            self._local_stats["local_blocked"] += 1
+            return None
+
+        # Success — wrap as a Scrapy Response with raw bytes (AAR-12 fix point)
+        if result.routing_method == "solve_then_replay":
+            self._local_stats["local_solve"] += 1
+        else:
+            self._local_stats["local_success"] += 1
+
+        request.meta["mimic_local_route"] = result.routing_method
+        request.meta["mimic_domain_level"] = result.domain_level
+
+        return Response(
+            url=result.fetch.final_url or request.url,
+            status=result.fetch.status_code,
+            headers=result.fetch.headers,
+            body=result.fetch.body,  # raw bytes — never decoded
+            request=request,
+        )
+
     async def process_request(self, request, spider):
         """Intercept requests that need stealth rendering.
 
-        Two modes:
+        Three modes (in order of precedence):
+
+        - **AAR-17 local-first** (MIMIC_LOCAL_FETCH=True + scrapy-calyprium[local]):
+          Every request first tries in-process httpcloak with cached cookies
+          from a per-spider domain cache. Only blocked requests fall through to
+          the legacy /api/fetch path below. Recommended for production.
         - **render_all** (MIMIC_ALL_REQUESTS=True): Every request goes through
-          Mimic's /api/fetch with auto-routing. Mimic tries httpcloak first
-          (~200ms) and only escalates to a real browser if blocked. This is the
-          recommended mode for production spiders.
+          Mimic's /api/fetch with auto-routing. Older mode, kept for compat.
         - **per-request** (meta['mimic']=True): Only flagged requests go through
           a browser session. Used when most pages work with plain HTTP but a few
           need JavaScript rendering.
         """
         if request.meta.get("_internal"):
             return None
+
+        # AAR-17: local-first fast path
+        if self._local_enabled:
+            local_response = await self._try_local_route(request, spider)
+            if local_response is not None:
+                return local_response
 
         explicit_browser = (
             request.meta.get("playwright", False)

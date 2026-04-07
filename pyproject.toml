@@ -33,6 +33,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Local-first auto-routing: do TLS-fingerprinted HTTP fetches in the spider
+# process instead of round-tripping every request through Mimic. Fixes binary
+# content corruption (AAR-12) and removes Mimic from the hot path (AAR-13/14).
+# httpcloak is the Rust extension we use server-side; curl_cffi is a fallback
+# for platforms without the wheel.
+local = [
+    "httpcloak>=0.4.0; platform_system=='Linux'",
+    "curl_cffi>=0.7.0",
+]
 dev = ["pytest", "pytest-asyncio", "responses"]
 
 [project.urls]
