@@ -329,14 +329,22 @@ class LocalFetcher:
         # HTTP headers can be multi-valued); flatten to single strings so
         # downstream code (e.g. Scrapy's HttpCompressionMiddleware) sees
         # plain values like "gzip" instead of the literal string "['gzip']".
-        # The buggy stringification was the root cause of body corruption in
-        # the AAR-17 production rollout — Scrapy saw Content-Encoding="['gzip']",
-        # tried to dispatch on an unsupported encoding name, and partially
-        # mangled the body in the process.
+        #
+        # Two specific headers MUST be stripped: Content-Encoding and
+        # Content-Length. httpcloak transparently decompresses the body
+        # before returning it via .content, so the original Content-Encoding
+        # (gzip / br / deflate) no longer applies and Content-Length no
+        # longer matches. If we left them in place, downstream Scrapy
+        # middlewares would try to decompress the already-decompressed body
+        # — that was the second AAR-17 corruption bug surfaced in the
+        # production rollout on 2026-04-08.
         clean_headers: Dict[str, str] = {}
         raw = response.headers if response.headers else {}
         if hasattr(raw, "items"):
             for k, v in raw.items():
+                key_lower = str(k).lower()
+                if key_lower in ("content-encoding", "content-length"):
+                    continue
                 if isinstance(v, (list, tuple)):
                     clean_headers[str(k)] = ", ".join(str(x) for x in v) if v else ""
                 else:

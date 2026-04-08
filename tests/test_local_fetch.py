@@ -143,6 +143,29 @@ class TestBinaryPreservation:
         assert b"\xef\xbf\xbd" not in result.body
 
     @pytest.mark.asyncio
+    async def test_content_encoding_stripped(self, fake_httpcloak, fetcher):
+        """httpcloak decompresses internally, so Content-Encoding/Content-Length
+        from the wire response no longer apply to the bytes we hand back. They
+        MUST be stripped or downstream Scrapy middlewares will try to gunzip
+        the already-decompressed body. AAR-17 second corruption bug."""
+        fake_httpcloak.Session.next_response = fake_httpcloak.FakeResponse(
+            status_code=200, content=b"%PDF-1.7",
+            headers={
+                "Content-Type": ["application/pdf"],
+                "Content-Encoding": ["gzip"],
+                "Content-Length": ["12345"],
+                "Vary": ["Accept-Encoding"],
+            },
+        )
+        result = await fetcher.fetch("https://example.com/file.pdf")
+        assert "Content-Encoding" not in result.headers
+        assert "content-encoding" not in {k.lower() for k in result.headers}
+        assert "Content-Length" not in result.headers
+        assert "content-length" not in {k.lower() for k in result.headers}
+        # Other headers preserved
+        assert result.headers["Content-Type"] == "application/pdf"
+
+    @pytest.mark.asyncio
     async def test_list_valued_headers_are_flattened(
         self, fake_httpcloak, fetcher,
     ):
@@ -164,11 +187,10 @@ class TestBinaryPreservation:
         result = await fetcher.fetch("https://example.com/file.pdf")
 
         assert result.headers["Content-Type"] == "application/pdf"
-        assert result.headers["Content-Encoding"] == "gzip"
         assert result.headers["Vary"] == "Accept-Encoding, Cookie"
-        # Critically: NOT the literal Python list repr
-        assert "[" not in result.headers["Content-Encoding"]
-        assert "'" not in result.headers["Content-Encoding"]
+        # Content-Encoding is stripped (httpcloak decompresses internally),
+        # so the existence test is the regression for that AAR-17 bug.
+        assert "Content-Encoding" not in result.headers
 
     @pytest.mark.asyncio
     async def test_html_response_decodes_via_text_helper(

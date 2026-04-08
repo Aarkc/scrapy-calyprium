@@ -29,9 +29,10 @@ AAR-17.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from scrapy_calyprium.routing.block_detect import is_blocked
 from scrapy_calyprium.routing.domain_cache import DomainCache
@@ -68,6 +69,18 @@ class SpiderAutoRouter:
         self.cache = cache
         self.solve_client = solve_client
         self.proxy_url = proxy_url
+        # Per-domain locks for solve coalescing. When 32 concurrent spider
+        # requests for the same domain all hit the block path, only one
+        # actually calls /api/solve; the rest wait on the lock and reuse the
+        # cookie pool the winner populated.
+        self._solve_locks: Dict[str, asyncio.Lock] = {}
+
+    def _solve_lock(self, domain: str) -> asyncio.Lock:
+        lock = self._solve_locks.get(domain)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._solve_locks[domain] = lock
+        return lock
 
     async def fetch(self, url: str, *, domain: str) -> RouteResult:
         # Step 1: heavy with no re-probe due → caller should fall through to legacy
@@ -146,43 +159,63 @@ class SpiderAutoRouter:
                 domain_level="light",
             )
 
-        # Step 4: ask Mimic for a solve
+        # Step 4: ask Mimic for a solve.
+        # Coalesce concurrent solves for the same domain — when a swarm of
+        # spider requests all hit the block path at once, only one calls
+        # /api/solve; the rest wait on the per-domain lock and reuse the
+        # cookies the winner caches. Without this we hammer Mimic and trip
+        # its per-domain rate limiter, then fall through to legacy and lose
+        # the AAR-12 binary-correctness benefit.
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d), calling /api/solve",
             domain, result.status_code,
         )
-        try:
-            solve = await self.solve_client.solve(domain=domain, target_url=url)
-        except SolveError as exc:
-            logger.warning("AutoRouter: solve failed for %s: %s", domain, exc)
-            return RouteResult(
-                fetch=result,
-                routing_method="fallback_legacy",
-                blocked=True,
-                domain_level=self.cache.get_level(domain),
-                needs_legacy_fallback=True,
-                error=str(exc),
-            )
 
-        if not solve.success:
-            self.cache._maybe_promote_heavy(domain, "solve_returned_no_cookies")
-            return RouteResult(
-                fetch=result,
-                routing_method="fallback_legacy",
-                blocked=True,
-                domain_level="heavy",
-                needs_legacy_fallback=True,
-                error=solve.error or "solve returned no cookies",
-            )
+        slot = None
+        async with self._solve_lock(domain):
+            # Re-check the cache — another concurrent caller may have already
+            # populated a fresh slot while we were waiting on the lock.
+            entry = self.cache.get(domain)
+            if entry and entry.level == "cookies" and entry.live_slots():
+                slot = entry.next_slot()
+                logger.debug(
+                    "AutoRouter: %s solve coalesced — reusing fresh slot from concurrent solve",
+                    domain,
+                )
 
-        # Cache the new slot and replay
-        slot = self.cache.set_cookies_from_solve(
-            domain=domain,
-            cookies=solve.cookies,
-            user_agent=solve.user_agent,
-            proxy_session_id=solve.proxy_session_id,
-            preset=solve.preset,
-        )
+            if slot is None:
+                try:
+                    solve = await self.solve_client.solve(domain=domain, target_url=url)
+                except SolveError as exc:
+                    logger.warning("AutoRouter: solve failed for %s: %s", domain, exc)
+                    return RouteResult(
+                        fetch=result,
+                        routing_method="fallback_legacy",
+                        blocked=True,
+                        domain_level=self.cache.get_level(domain),
+                        needs_legacy_fallback=True,
+                        error=str(exc),
+                    )
+
+                if not solve.success:
+                    self.cache._maybe_promote_heavy(domain, "solve_returned_no_cookies")
+                    return RouteResult(
+                        fetch=result,
+                        routing_method="fallback_legacy",
+                        blocked=True,
+                        domain_level="heavy",
+                        needs_legacy_fallback=True,
+                        error=solve.error or "solve returned no cookies",
+                    )
+
+                # Cache the new slot
+                slot = self.cache.set_cookies_from_solve(
+                    domain=domain,
+                    cookies=solve.cookies,
+                    user_agent=solve.user_agent,
+                    proxy_session_id=solve.proxy_session_id,
+                    preset=solve.preset,
+                )
         try:
             replay = await self.fetcher.fetch(
                 url=url,
