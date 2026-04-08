@@ -1,3 +1,10 @@
+# [1.9.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.2...v1.9.0) (2026-04-08)
+
+
+### Features
+
+* **local:** silent-failure feedback channel from spider parse callbacks ([fd757cc](https://github.com/Aarkc/scrapy-calyprium/commit/fd757ccf575d7ce2af641b4d7b7f909174f9e2f9))
+
 ## [1.8.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.1...v1.8.2) (2026-04-08)
 
 
