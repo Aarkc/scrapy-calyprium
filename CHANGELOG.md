@@ -1,3 +1,10 @@
+# [1.8.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.4...v1.8.0) (2026-04-08)
+
+
+### Features
+
+* **local:** adaptive per-slot rate cap + slot-stats reporter (AAR-17 follow-up) ([fe3b851](https://github.com/Aarkc/scrapy-calyprium/commit/fe3b85164e0e7ae78832dbfa09464ae6cbce40a9))
+
 ## [1.7.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.3...v1.7.4) (2026-04-08)
 
 
