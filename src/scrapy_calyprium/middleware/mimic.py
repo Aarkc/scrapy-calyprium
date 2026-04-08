@@ -398,12 +398,40 @@ class MimicBrowserMiddleware:
         request.meta["mimic_local_route"] = result.routing_method
         request.meta["mimic_domain_level"] = result.domain_level
 
+        # Pick the right Scrapy response class based on Content-Type so that
+        # spiders can use response.text / response.css() on HTML pages while
+        # binary responses (PDFs, images) stay as raw bytes via Response.
+        # AAR-12 binary preservation still holds — body is raw bytes either
+        # way; only the type wrapper differs.
+        ct = (
+            result.fetch.headers.get("content-type")
+            or result.fetch.headers.get("Content-Type")
+            or ""
+        ).lower()
+        body = result.fetch.body
+        url = result.fetch.final_url or request.url
+        status = result.fetch.status_code
+        headers = result.fetch.headers
+        if "text/html" in ct or "application/xhtml" in ct:
+            from scrapy.http import HtmlResponse
+            encoding = "utf-8"
+            if "charset=" in ct:
+                encoding = ct.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
+            return HtmlResponse(
+                url=url, status=status, headers=headers, body=body,
+                encoding=encoding, request=request,
+            )
+        if "text/" in ct or "json" in ct or "xml" in ct or "javascript" in ct:
+            from scrapy.http import TextResponse
+            encoding = "utf-8"
+            if "charset=" in ct:
+                encoding = ct.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
+            return TextResponse(
+                url=url, status=status, headers=headers, body=body,
+                encoding=encoding, request=request,
+            )
         return Response(
-            url=result.fetch.final_url or request.url,
-            status=result.fetch.status_code,
-            headers=result.fetch.headers,
-            body=result.fetch.body,  # raw bytes — never decoded
-            request=request,
+            url=url, status=status, headers=headers, body=body, request=request,
         )
 
     async def process_request(self, request, spider):
