@@ -244,17 +244,27 @@ class SpectreMiddleware:
         return None
 
     def process_response(self, request, response, spider):
-        """Detect blocks and clear cached fingerprint to force rotation."""
+        """Detect blocks and clear cached fingerprint to force rotation.
+
+        AAR-5: previously this used a substring match on `b"blocked" in
+        body and b"access" in body` which fired on every legitimate page
+        that happened to contain both words (DigiKey product pages
+        contain both 100+ times). Every false positive cleared the
+        fingerprint cache and forced a Spectre re-roll. Now uses the
+        AAR-15 block_detect.is_blocked() helper which checks for real
+        challenge markers.
+        """
         blocked = False
 
         if response.status in (403, 429, 503):
             blocked = True
         elif hasattr(response, "body"):
-            body_lower = response.body.lower()
-            if b"captcha" in body_lower:
-                blocked = True
-            elif b"blocked" in body_lower and b"access" in body_lower:
-                blocked = True
+            try:
+                from scrapy_calyprium.routing.block_detect import is_blocked
+                blocked = is_blocked(response.status, response.body)
+            except ImportError:
+                # Optional [local] extra not installed.
+                pass
 
         if blocked:
             fingerprint_id = request.meta.get("spectre_fingerprint_id")
