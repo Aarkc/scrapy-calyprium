@@ -229,6 +229,12 @@ class MimicBrowserMiddleware:
                 except RuntimeError:
                     pass
 
+            # Expose the router on the spider so parse callbacks can call
+            # mimic_router.report_silent_failure(...) when a 200 response
+            # passed is_blocked but turned out to contain no useful data.
+            if spider is not None:
+                spider.mimic_router = self._local_router
+
             logger.info(
                 f"MimicMiddleware: local-first routing enabled "
                 f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
@@ -397,6 +403,8 @@ class MimicBrowserMiddleware:
 
         request.meta["mimic_local_route"] = result.routing_method
         request.meta["mimic_domain_level"] = result.domain_level
+        request.meta["mimic_slot_id"] = result.slot_id
+        request.meta["mimic_domain"] = domain
 
         # Pick the right Scrapy response class based on Content-Type so that
         # spiders can use response.text / response.css() on HTML pages while

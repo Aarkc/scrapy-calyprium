@@ -217,6 +217,62 @@ class TestRecordRequest:
 # ---------------------------------------------------------------------------
 
 
+class TestSilentFailureFeedback:
+    """Spider-side feedback channel for silent block detection."""
+
+    def _make_router(self):
+        from scrapy_calyprium.routing.auto import SpiderAutoRouter
+        from scrapy_calyprium.routing.local_fetch import LocalFetcher
+        from scrapy_calyprium.routing.solve_client import SolveClient
+
+        cache = DomainCache()
+        slot = cache.set_cookies_from_solve(
+            "example.com",
+            cookies=[{"name": "cf_clearance", "value": "x"}],
+            user_agent="UA",
+            proxy_session_id="sess-A",
+        )
+        # Stand up a router with stub fetcher/solve client we won't actually use
+        class _StubFetcher:
+            backend = "stub"
+            async def fetch(self, *a, **kw):
+                raise NotImplementedError
+        router = SpiderAutoRouter.__new__(SpiderAutoRouter)
+        router.fetcher = _StubFetcher()
+        router.cache = cache
+        router.solve_client = None
+        router.proxy_url = None
+        router._solve_locks = {}
+        return router, cache, slot
+
+    def test_silent_failure_increments_slot_failure(self):
+        router, cache, slot = self._make_router()
+        # Simulate the slot having seen real traffic
+        for _ in range(50):
+            slot.record_request()
+        assert slot.fail_count == 0
+
+        router.report_silent_failure("example.com", slot.slot_id, reason="no_data")
+
+        # Slot should have a failure recorded AND the rate cap should have learned
+        assert slot.fail_count == 1
+        entry = cache.get("example.com")
+        assert entry.learned_rpm_cap is not None
+        # 50 RPM at block time -> cap = 50 * 0.7 = 35
+        assert entry.learned_rpm_cap == pytest.approx(35.0, abs=0.1)
+
+    def test_silent_failure_with_unknown_slot_is_noop(self):
+        router, cache, slot = self._make_router()
+        router.report_silent_failure("example.com", "ghost-slot", reason="x")
+        # No exception, no slot mutated
+        assert slot.fail_count == 0
+
+    def test_silent_failure_with_no_slot_id_is_noop(self):
+        router, cache, slot = self._make_router()
+        router.report_silent_failure("example.com", None, reason="x")
+        assert slot.fail_count == 0
+
+
 class TestCapRecovery:
     def test_no_raise_within_block_cooldown(self):
         cache = DomainCache()

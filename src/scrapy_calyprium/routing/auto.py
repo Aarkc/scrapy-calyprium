@@ -55,6 +55,13 @@ class RouteResult:
     domain_level: str
     needs_legacy_fallback: bool = False
     error: Optional[str] = None
+    # Identifier of the cookie slot used for this fetch (cookies / solve_then_replay
+    # paths only). The middleware stuffs this into request.meta so the spider's
+    # parse callback can call back to record_slot_failure when the response
+    # was structurally valid (status 200, passes is_blocked) but contained no
+    # useful data — a silent block. Without this signal the rate cap never
+    # learns about Cloudflare interstitials served with status 200.
+    slot_id: Optional[str] = None
 
 
 class SpiderAutoRouter:
@@ -81,6 +88,31 @@ class SpiderAutoRouter:
             lock = asyncio.Lock()
             self._solve_locks[domain] = lock
         return lock
+
+    def report_silent_failure(
+        self,
+        domain: str,
+        slot_id: Optional[str],
+        reason: str = "no_useful_data",
+    ) -> None:
+        """Spider-side feedback channel for silent block detection.
+
+        When a spider's parse callback receives a structurally-valid 200
+        response that nevertheless contains no useful data (e.g. a Cloudflare
+        compatibility-mode page with real markup but no product JSON), it
+        calls this method so the routing layer can roll back the slot's
+        success counter and feed the rate-cap learner. Without it, the
+        router happily keeps firing the same dead slot at full speed.
+        """
+        if not slot_id:
+            return
+        logger.info(
+            "AutoRouter: silent failure on %s slot %s (reason=%s)",
+            domain, slot_id, reason,
+        )
+        # Treat as a real domain-side failure: increments slot fail count
+        # and feeds the rate-cap learner with the current slot RPM.
+        self.cache.record_slot_failure(domain, slot_id, status_code=200)
 
     async def fetch(self, url: str, *, domain: str) -> RouteResult:
         # Step 1: heavy with no re-probe due → caller should fall through to legacy
@@ -149,6 +181,7 @@ class SpiderAutoRouter:
                             routing_method="httpcloak_cookies",
                             blocked=False,
                             domain_level="cookies",
+                            slot_id=slot.slot_id,
                         )
                     self.cache.record_slot_failure(
                         domain, slot.slot_id, status_code=result.status_code,
@@ -278,4 +311,5 @@ class SpiderAutoRouter:
             routing_method="solve_then_replay",
             blocked=False,
             domain_level="cookies",
+            slot_id=slot.slot_id,
         )
