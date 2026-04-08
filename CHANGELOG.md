@@ -1,3 +1,10 @@
+## [1.7.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.2...v1.7.3) (2026-04-08)
+
+
+### Bug Fixes
+
+* **mimic:** tighten block detector to use real challenge markers (AAR-5) ([f5f595d](https://github.com/Aarkc/scrapy-calyprium/commit/f5f595dbaa680fe4b1e1efabf3c06a29d8c93a12))
+
 ## [1.7.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.1...v1.7.2) (2026-04-08)
 
 
