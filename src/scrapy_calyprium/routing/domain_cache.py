@@ -48,7 +48,11 @@ def _now() -> float:
 
 @dataclass
 class CookieSlot:
-    """One set of clearance cookies bound to a sticky proxy session."""
+    """One set of clearance cookies bound to a sticky proxy session.
+
+    Tracks per-slot request timestamps in a 60s window so the parent
+    DomainEntry can compute slot RPM and enforce a learned per-slot rate cap.
+    """
     slot_id: str
     cookies: List[Dict]
     user_agent: str
@@ -56,6 +60,9 @@ class CookieSlot:
     preset: str = "chrome-latest"
     created_at: float = field(default_factory=_now)
     fail_count: int = 0
+    success_count: int = 0
+    block_count: int = 0
+    _request_times: List[float] = field(default_factory=list)
 
     @property
     def is_expired(self) -> bool:
@@ -64,6 +71,19 @@ class CookieSlot:
     @property
     def is_live(self) -> bool:
         return not self.is_expired and self.fail_count < MAX_SLOT_FAILURES
+
+    def record_request(self) -> None:
+        """Track a request timestamp for per-slot RPM calculation."""
+        now = _now()
+        self._request_times.append(now)
+        # Trim entries older than 60s
+        cutoff = now - 60
+        if len(self._request_times) > 10 and self._request_times[0] < cutoff:
+            self._request_times = [t for t in self._request_times if t > cutoff]
+
+    def requests_per_minute(self) -> int:
+        cutoff = _now() - 60
+        return sum(1 for t in self._request_times if t > cutoff)
 
     def to_dict(self) -> Dict:
         return {
@@ -74,11 +94,15 @@ class CookieSlot:
             "preset": self.preset,
             "created_at": self.created_at,
             "fail_count": self.fail_count,
+            "success_count": self.success_count,
+            "block_count": self.block_count,
         }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "CookieSlot":
-        return cls(**data)
+        # request_times is intentionally not persisted — it's a rolling window
+        # that gets rebuilt from live traffic after restart.
+        return cls(**{k: v for k, v in data.items() if k != "_request_times"})
 
 
 @dataclass
@@ -92,6 +116,13 @@ class DomainEntry:
     _last_promotion_attempt: float = 0.0
     _next_reprobe_at: float = 0.0
     _reprobe_backoff: float = float(HEAVY_REPROBE_INITIAL_SECONDS)
+    # Adaptive rate limiting (ported from server-side mimic.routing.domain_cache).
+    # learned_rpm_cap is the per-slot RPM ceiling we believe is safe before
+    # the upstream WAF starts blocking. None = no observations yet.
+    learned_rpm_cap: Optional[float] = None
+    _block_rpms: List[float] = field(default_factory=list)
+    _last_block_time: float = 0.0
+    _last_cap_raise_time: float = 0.0
 
     @property
     def is_expired(self) -> bool:
@@ -103,12 +134,73 @@ class DomainEntry:
         return [s for s in self.slots if s.is_live]
 
     def next_slot(self) -> Optional[CookieSlot]:
+        """Pick the least-loaded live slot, respecting the learned rate cap."""
         live = self.live_slots()
         if not live:
             return None
-        slot = live[self._robin_idx % len(live)]
-        self._robin_idx = (self._robin_idx + 1) % max(len(live), 1)
-        return slot
+        if len(live) == 1:
+            return live[0]
+
+        # Sort by current per-slot RPM (ascending — least loaded first)
+        sorted_slots = sorted(live, key=lambda s: s.requests_per_minute())
+
+        if self.learned_rpm_cap is not None:
+            under_cap = [
+                s for s in sorted_slots
+                if s.requests_per_minute() < self.learned_rpm_cap
+            ]
+            if under_cap:
+                return under_cap[0]
+
+        return sorted_slots[0]
+
+    def record_block_rpm(self, slot: CookieSlot) -> None:
+        """Record the RPM the slot was running at when it got blocked.
+
+        Updates learned_rpm_cap to 70% of the median observed block RPM
+        (rolling window of last 10 blocks). Capped at a 5 RPM floor so we
+        never throttle below a sane minimum.
+        """
+        slot_rpm = slot.requests_per_minute()
+        self._last_block_time = _now()
+
+        if slot_rpm < 5:
+            return  # too low to learn from — probably wasn't rate-limited
+
+        self._block_rpms.append(slot_rpm)
+        self._block_rpms = self._block_rpms[-10:]
+
+        sorted_rpms = sorted(self._block_rpms)
+        median_rpm = sorted_rpms[len(sorted_rpms) // 2]
+        old_cap = self.learned_rpm_cap
+        self.learned_rpm_cap = max(5.0, median_rpm * 0.7)
+
+        logger.info(
+            "Rate cap updated: %s -> %.0f RPM/slot (blocked at %d RPM, %d obs)",
+            old_cap, self.learned_rpm_cap, slot_rpm, len(self._block_rpms),
+        )
+
+    def maybe_raise_cap(self) -> None:
+        """Gradually raise the cap when no recent blocks."""
+        if self.learned_rpm_cap is None:
+            return
+        now = _now()
+        if now - self._last_block_time < 300:
+            return
+        if now - self._last_cap_raise_time < 180:
+            return
+
+        old_cap = self.learned_rpm_cap
+        self.learned_rpm_cap *= 1.1
+        self._last_cap_raise_time = now
+        logger.info(
+            "Rate cap raised: %.1f -> %.1f RPM/slot (no blocks for %.0fs)",
+            old_cap, self.learned_rpm_cap, now - self._last_block_time,
+        )
+
+    def domain_rpm(self) -> int:
+        """Aggregate RPM across all live slots."""
+        return sum(s.requests_per_minute() for s in self.live_slots())
 
     def to_dict(self) -> Dict:
         return {
@@ -121,6 +213,10 @@ class DomainEntry:
             "_last_promotion_attempt": self._last_promotion_attempt,
             "_next_reprobe_at": self._next_reprobe_at,
             "_reprobe_backoff": self._reprobe_backoff,
+            "learned_rpm_cap": self.learned_rpm_cap,
+            "_block_rpms": list(self._block_rpms),
+            "_last_block_time": self._last_block_time,
+            "_last_cap_raise_time": self._last_cap_raise_time,
         }
 
     @classmethod
@@ -194,6 +290,22 @@ class DomainCache:
         )
         return slot
 
+    def record_request(self, domain: str, slot_id: str) -> None:
+        """Record an in-flight request against a slot's RPM window.
+
+        Called by SpiderAutoRouter immediately before sending a replay.
+        Drives the per-slot RPM the rate cap is computed against, and
+        opportunistically tries to raise the cap if things are stable.
+        """
+        entry = self._entries.get(domain)
+        if not entry or entry.level != "cookies":
+            return
+        slot = next((s for s in entry.slots if s.slot_id == slot_id), None)
+        if not slot:
+            return
+        slot.record_request()
+        entry.maybe_raise_cap()
+
     def record_slot_failure(
         self,
         domain: str,
@@ -204,6 +316,7 @@ class DomainCache:
 
         AAR-14 semantics: infrastructure failures (None / 502 / 504 / 520 /
         522 / 524 / connection errors) are NOT counted against the slot.
+        Real domain-side blocks (403/429/503) feed the rate-cap learner.
         """
         if _is_infrastructure_failure(status_code):
             logger.debug(
@@ -219,7 +332,13 @@ class DomainCache:
         if not slot:
             return False
         slot.fail_count += 1
+        slot.block_count += 1
         entry._domain_failure_count += 1
+
+        # Feed the rate-cap learner with the RPM the slot was running at
+        # when it got blocked. Source of truth for the spider's adaptive
+        # throttle now that local-first replays don't go through Mimic.
+        entry.record_block_rpm(slot)
 
         if entry.live_slots():
             return False
@@ -229,6 +348,9 @@ class DomainCache:
         entry = self._entries.get(domain)
         if not entry or entry.level != "cookies":
             return
+        slot = next((s for s in entry.slots if s.slot_id == slot_id), None)
+        if slot:
+            slot.success_count += 1
         entry._domain_failure_count = 0
         entry.updated_at = _now()
 

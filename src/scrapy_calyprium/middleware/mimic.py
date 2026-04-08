@@ -48,6 +48,7 @@ try:
         is_local_fetch_available,
     )
     from scrapy_calyprium.routing.solve_client import SolveClient
+    from scrapy_calyprium.routing.slot_stats import SlotStatsReporter
     _HAS_LOCAL_ROUTING = True
 except ImportError:
     _HAS_LOCAL_ROUTING = False
@@ -100,6 +101,7 @@ class MimicBrowserMiddleware:
         self._local_router: Optional["SpiderAutoRouter"] = None
         self._local_cache: Optional["DomainCache"] = None
         self._solve_client: Optional["SolveClient"] = None
+        self._slot_stats_reporter: Optional["SlotStatsReporter"] = None
         self._local_enabled: bool = False
         self._local_stats = {
             "local_success": 0,
@@ -198,9 +200,39 @@ class MimicBrowserMiddleware:
                 solve_client=self._solve_client,
                 proxy_url=proxy_url,
             )
+
+            # Slot-stats reporter — periodically batch the local DomainCache's
+            # per-slot stats and POST them to Mimic so cross-spider visibility
+            # is preserved. Disabled by setting MIMIC_SLOT_STATS_INTERVAL=0.
+            interval = self.crawler.settings.getfloat(
+                "MIMIC_SLOT_STATS_INTERVAL", 30.0,
+            )
+            if interval > 0:
+                self._slot_stats_reporter = SlotStatsReporter(
+                    cache=self._local_cache,
+                    service_url=self.service_url,
+                    api_key=self.api_key,
+                    service_secret=self.crawler.settings.get("FORGE_SERVICE_SECRET")
+                    or self.crawler.settings.get("MIMIC_SERVICE_SECRET"),
+                    user_id=self.crawler.settings.get("FORGE_USER_ID")
+                    or self.crawler.settings.get("MIMIC_USER_ID")
+                    or self.crawler.settings.get("RECRAWL_USER_ID"),
+                    spider=spider.name if spider else None,
+                    interval_seconds=interval,
+                )
+                # Start the background task — fire-and-forget; spider_opened
+                # is sync but we can schedule the asyncio coro on the loop.
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.create_task(self._slot_stats_reporter.start())
+                except RuntimeError:
+                    pass
+
             logger.info(
                 f"MimicMiddleware: local-first routing enabled "
-                f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'})"
+                f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
+                f"slot_stats_interval={interval}s)"
             )
         except Exception as e:
             logger.warning(
@@ -284,6 +316,11 @@ class MimicBrowserMiddleware:
                 self._local_stats["local_blocked"],
                 self._local_stats["fallback_legacy"],
             )
+            if self._slot_stats_reporter:
+                try:
+                    await self._slot_stats_reporter.stop()
+                except Exception:
+                    pass
             if self._solve_client:
                 try:
                     await self._solve_client.close()

@@ -103,6 +103,29 @@ class SpiderAutoRouter:
         if entry and entry.level == "cookies":
             slot = entry.next_slot()
             if slot:
+                # Adaptive rate limiting: defer if this slot is already at
+                # the learned cap. The router waits inside the request
+                # context (counts against Scrapy's CONCURRENT_REQUESTS),
+                # which naturally backpressures the spider's queue without
+                # needing a separate global throttle.
+                if entry.learned_rpm_cap is not None:
+                    while slot.requests_per_minute() >= entry.learned_rpm_cap:
+                        # Try a different slot first
+                        alt = entry.next_slot()
+                        if alt and alt.slot_id != slot.slot_id and (
+                            alt.requests_per_minute() < entry.learned_rpm_cap
+                        ):
+                            slot = alt
+                            break
+                        # All slots at cap — wait briefly for the rolling
+                        # window to advance, then re-check.
+                        await asyncio.sleep(0.5)
+                        slot = entry.next_slot() or slot
+
+                # Record the request BEFORE sending so concurrent peers see
+                # an updated RPM and pick a different slot.
+                self.cache.record_request(domain, slot.slot_id)
+
                 try:
                     result = await self.fetcher.fetch(
                         url=url,
@@ -216,6 +239,8 @@ class SpiderAutoRouter:
                     proxy_session_id=solve.proxy_session_id,
                     preset=solve.preset,
                 )
+        # Track the post-solve replay against the new slot's RPM window too
+        self.cache.record_request(domain, slot.slot_id)
         try:
             replay = await self.fetcher.fetch(
                 url=url,
