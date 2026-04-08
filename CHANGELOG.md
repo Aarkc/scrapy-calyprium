@@ -1,3 +1,10 @@
+## [1.8.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.0...v1.8.1) (2026-04-08)
+
+
+### Bug Fixes
+
+* **local:** wrap text/html responses in HtmlResponse, not Response (AAR-17) ([5366a05](https://github.com/Aarkc/scrapy-calyprium/commit/5366a052956796eb1b5c41918f2136efae0f9096))
+
 # [1.8.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.4...v1.8.0) (2026-04-08)
 
 
