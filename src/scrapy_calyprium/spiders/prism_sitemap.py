@@ -296,14 +296,22 @@ class PrismSitemapSpider(scrapy.Spider):
 
         api_url = f"{self._recrawl_forge_url}/spiders/{spider_slug}/recrawl/stale-urls"
         try:
+            # AAR-XX: pass the Prism cursor so Forge skips past the
+            # already-scanned region of Prism on each call instead of
+            # re-walking the entire fresh prefix (~100s on a 1M-row freshness
+            # table). The response includes `next_prism_offset` which we
+            # adopt for the next batch.
             resp = req.get(
                 api_url,
-                params={"limit": limit, "offset": self._prism_next_offset},
+                params={
+                    "limit": limit,
+                    "prism_offset": self._prism_next_offset,
+                },
                 headers={
                     "X-Service-Secret": self._recrawl_api_key,
                     "X-User-Id": self._recrawl_user_id,
                 },
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -314,6 +322,7 @@ class PrismSitemapSpider(scrapy.Spider):
 
         urls = data.get("urls", [])
         total_stale = data.get("total_stale", 0)
+        next_prism_offset = data.get("next_prism_offset", self._prism_next_offset + len(urls))
 
         if not urls:
             logger.info(f"Recrawl: no more stale URLs (total_stale={total_stale})")
@@ -322,10 +331,14 @@ class PrismSitemapSpider(scrapy.Spider):
 
         logger.info(
             f"Recrawl: got {len(urls):,} stale URLs "
-            f"(offset={self._prism_next_offset:,}, total_stale={total_stale:,})"
+            f"(prism_offset={self._prism_next_offset:,} -> {next_prism_offset:,}, "
+            f"total_stale={total_stale:,})"
         )
 
-        self._prism_next_offset += len(urls)
+        # Advance the cursor by however many Prism URLs the server scanned,
+        # not just the number of stale URLs we got back. Otherwise we'd
+        # re-scan the same fresh prefix on the next call.
+        self._prism_next_offset = next_prism_offset
         if len(urls) < limit:
             self._recrawl_exhausted = True
 
