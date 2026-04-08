@@ -1,3 +1,10 @@
+## [1.7.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.1...v1.7.2) (2026-04-08)
+
+
+### Bug Fixes
+
+* **local-fetch:** strip Content-Encoding/Length + coalesce concurrent solves (AAR-17) ([98df68e](https://github.com/Aarkc/scrapy-calyprium/commit/98df68ed2118ecbbd22f091a85be5774b38a0796))
+
 ## [1.7.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.0...v1.7.1) (2026-04-08)
 
 
