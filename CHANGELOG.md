@@ -1,3 +1,10 @@
+## [1.7.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.7.0...v1.7.1) (2026-04-08)
+
+
+### Bug Fixes
+
+* **local-fetch:** flatten list-valued httpcloak headers (AAR-17) ([416159c](https://github.com/Aarkc/scrapy-calyprium/commit/416159cc5d581f4941f096b088fbaad743b383f1))
+
 # [1.7.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.6.0...v1.7.0) (2026-04-07)
 
 
