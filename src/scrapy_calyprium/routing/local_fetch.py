@@ -325,12 +325,22 @@ class LocalFetcher:
         # Using .text was the root cause of AAR-12.
         body: bytes = response.content if response.content is not None else b""
 
-        # Sanitize headers
+        # Sanitize headers. httpcloak returns header values as lists (since
+        # HTTP headers can be multi-valued); flatten to single strings so
+        # downstream code (e.g. Scrapy's HttpCompressionMiddleware) sees
+        # plain values like "gzip" instead of the literal string "['gzip']".
+        # The buggy stringification was the root cause of body corruption in
+        # the AAR-17 production rollout — Scrapy saw Content-Encoding="['gzip']",
+        # tried to dispatch on an unsupported encoding name, and partially
+        # mangled the body in the process.
         clean_headers: Dict[str, str] = {}
         raw = response.headers if response.headers else {}
         if hasattr(raw, "items"):
             for k, v in raw.items():
-                clean_headers[str(k)] = str(v)
+                if isinstance(v, (list, tuple)):
+                    clean_headers[str(k)] = ", ".join(str(x) for x in v) if v else ""
+                else:
+                    clean_headers[str(k)] = str(v)
 
         return LocalFetchResult(
             url=url,

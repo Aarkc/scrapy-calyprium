@@ -143,6 +143,34 @@ class TestBinaryPreservation:
         assert b"\xef\xbf\xbd" not in result.body
 
     @pytest.mark.asyncio
+    async def test_list_valued_headers_are_flattened(
+        self, fake_httpcloak, fetcher,
+    ):
+        """httpcloak returns headers as lists. They MUST be flattened to plain
+        strings before reaching downstream Scrapy middlewares — otherwise
+        Content-Encoding becomes the literal string "['gzip']" which trips
+        HttpCompressionMiddleware and corrupts the body. This was the root
+        cause of the AAR-17 production rollout failure on 2026-04-08.
+        """
+        fake_httpcloak.Session.next_response = fake_httpcloak.FakeResponse(
+            status_code=200, content=b"%PDF-1.7",
+            headers={
+                "Content-Type": ["application/pdf"],
+                "Content-Encoding": ["gzip"],
+                "Vary": ["Accept-Encoding", "Cookie"],
+            },
+        )
+
+        result = await fetcher.fetch("https://example.com/file.pdf")
+
+        assert result.headers["Content-Type"] == "application/pdf"
+        assert result.headers["Content-Encoding"] == "gzip"
+        assert result.headers["Vary"] == "Accept-Encoding, Cookie"
+        # Critically: NOT the literal Python list repr
+        assert "[" not in result.headers["Content-Encoding"]
+        assert "'" not in result.headers["Content-Encoding"]
+
+    @pytest.mark.asyncio
     async def test_html_response_decodes_via_text_helper(
         self, fake_httpcloak, fetcher,
     ):
