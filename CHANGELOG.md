@@ -1,3 +1,10 @@
+## [1.8.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.1...v1.8.2) (2026-04-08)
+
+
+### Bug Fixes
+
+* **prism-sitemap:** pass + track prism_offset cursor through recrawl batches ([131f17d](https://github.com/Aarkc/scrapy-calyprium/commit/131f17d2710b469bb4cd3e1a3f52c9c02a2c59ca))
+
 ## [1.8.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.0...v1.8.1) (2026-04-08)
 
 
