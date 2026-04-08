@@ -534,7 +534,19 @@ class MimicBrowserMiddleware:
         )
 
     async def process_response(self, request, response, spider):
-        """Detect blocks and potentially upgrade stealth level."""
+        """Detect blocks and potentially upgrade stealth level.
+
+        AAR-5: previously this used a substring match on `b"blocked" in body
+        and b"access" in body` which fired on every legitimate page that
+        happened to contain both words (DigiKey product pages contain
+        "access" 100+ times in markup, "blocked" twice in legal text).
+        Every successful response triggered a stealth-level upgrade and
+        session reset, churning the spider for no reason.
+
+        Now delegates to the AAR-15 block_detect.is_blocked() helper which
+        looks for real challenge markers (cf-browser-verification, just a
+        moment, datadome, hcaptcha, etc.) plus the status-code rules.
+        """
         if not request.meta.get("mimic_browser"):
             return response
 
@@ -542,11 +554,13 @@ class MimicBrowserMiddleware:
         if response.status in (403, 429, 503):
             blocked = True
         elif hasattr(response, "body"):
-            body_lower = response.body.lower()
-            if b"captcha" in body_lower or (
-                b"blocked" in body_lower and b"access" in body_lower
-            ):
-                blocked = True
+            try:
+                from scrapy_calyprium.routing.block_detect import is_blocked
+                blocked = is_blocked(response.status, response.body)
+            except ImportError:
+                # Optional [local] extra not installed — skip detection.
+                # Pages will only be flagged on hard status codes above.
+                pass
 
         if blocked:
             logger.warning(
