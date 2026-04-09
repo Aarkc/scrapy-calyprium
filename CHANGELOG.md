@@ -1,3 +1,10 @@
+# [1.11.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.10.0...v1.11.0) (2026-04-09)
+
+
+### Features
+
+* **local:** proactive cookie pool refill (Phase 5) ([1d51b11](https://github.com/Aarkc/scrapy-calyprium/commit/1d51b11523605f5e942ae1151528a4abfbadd022))
+
 # [1.10.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.9.0...v1.10.0) (2026-04-09)
 
 
