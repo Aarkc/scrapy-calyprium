@@ -1,3 +1,10 @@
+## [1.11.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.1...v1.11.2) (2026-04-09)
+
+
+### Bug Fixes
+
+* **local:** cold-start burst refill + 1s default interval ([cc4266c](https://github.com/Aarkc/scrapy-calyprium/commit/cc4266caa003f9bcf5bcc239f9feacaf7451d9d8))
+
 ## [1.11.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.0...v1.11.1) (2026-04-09)
 
 
