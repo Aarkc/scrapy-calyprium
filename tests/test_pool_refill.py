@@ -175,11 +175,21 @@ class TestHotPathRefill:
         assert router.solve_client._next_session == first_count
 
     @pytest.mark.asyncio
-    async def test_in_flight_flag_prevents_burst(self):
-        # Two _ensure_refill_task calls in the same tick should only fire
-        # one refill solve, not two — the in_flight flag deduplicates.
-        router = _make_router(target=8, interval=0.0)
-        # Seed a single slot manually so refill has something to grow from
+    async def test_cold_start_burst_fires_multiple_in_parallel(self):
+        # Three _ensure_refill_task calls in the same tick: cold start
+        # should burst-fire multiple solves in parallel (capped at
+        # cold_start_burst), but subsequent calls should be deduped by
+        # the cold_start_done flag.
+        router = SpiderAutoRouter(
+            fetcher=FakeFetcher(),
+            cache=DomainCache(),
+            solve_client=FakeSolveClient(),
+            proxy_url=None,
+            target_pool_size=8,
+            refill_interval=10.0,
+            cold_start_burst=4,
+        )
+        # Seed a single slot manually so refill has a target gap
         from scrapy_calyprium.routing.domain_cache import (
             CookieSlot, DomainEntry, TTL_COOKIES,
         )
@@ -190,15 +200,17 @@ class TestHotPathRefill:
         ))
         router.cache._entries["example.com"] = entry
 
+        # First call → cold start burst → fires 4 parallel solves
         router._ensure_refill_task("example.com")
+        # Subsequent calls should hit the cold_start_done flag → no-op
         router._ensure_refill_task("example.com")
         router._ensure_refill_task("example.com")
 
-        for _ in range(5):
+        for _ in range(10):
             await asyncio.sleep(0)
 
-        # Only one fire-and-forget solve from the burst
-        assert router.solve_client._next_session == 1
+        # Exactly cold_start_burst (4) solves should have fired
+        assert router.solve_client._next_session == 4
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +292,8 @@ class TestRefillGuards:
         await router.fetch("https://example.com/", domain="example.com")
         for _ in range(5):
             await asyncio.sleep(0)
-        # in_flight flag should be cleared after the SolveError
-        assert router._refill_in_flight.get("example.com") is False
+        # in_flight counter should be back to 0 after the SolveError
+        assert router._refill_in_flight.get("example.com", 0) == 0
         # And a follow-up fetch should be able to fire another refill
         router.fetcher.queue(_ok())
         await router.fetch("https://example.com/", domain="example.com")

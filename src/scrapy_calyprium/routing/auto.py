@@ -72,7 +72,8 @@ class SpiderAutoRouter:
         solve_client: SolveClient,
         proxy_url: Optional[str] = None,
         target_pool_size: int = 8,
-        refill_interval: float = 5.0,
+        refill_interval: float = 1.0,
+        cold_start_burst: int = 4,
     ):
         self.fetcher = fetcher
         self.cache = cache
@@ -101,6 +102,15 @@ class SpiderAutoRouter:
         # Mimic's per-domain rate limit.
         self.target_pool_size = target_pool_size
         self.refill_interval = refill_interval
+        # Cold-start burst: when the pool is severely under-provisioned
+        # (e.g. just minted the very first slot via solve coalescing), the
+        # one-slot-per-tick refill rhythm can't catch up before the small
+        # pool collapses under concurrent traffic. On the first refill
+        # check after a domain becomes "cookies", fire up to this many
+        # parallel solves to bring the pool to roughly target size right
+        # away. After the burst, refills go back to one-at-a-time at
+        # refill_interval cadence.
+        self.cold_start_burst = cold_start_burst
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
         # Last hot-path refill check per domain. The original design used a
@@ -113,7 +123,11 @@ class SpiderAutoRouter:
         # via asyncio.create_task (which IS pumped because the spider's own
         # await chain is active).
         self._last_refill_check: Dict[str, float] = {}
-        self._refill_in_flight: Dict[str, bool] = {}
+        # Per-domain in-flight refill count. Capped at cold_start_burst on
+        # first refill, 1 thereafter, so the burst can fire several solves
+        # in parallel during cold start without hammering Mimic forever.
+        self._refill_in_flight: Dict[str, int] = {}
+        self._cold_start_done: Dict[str, bool] = {}
 
     def _solve_lock(self, domain: str) -> asyncio.Lock:
         lock = self._solve_locks.get(domain)
@@ -125,12 +139,15 @@ class SpiderAutoRouter:
     def _ensure_refill_task(self, domain: str) -> None:
         """Hot-path refill check.
 
-        Called on every fetch() after a successful solve. Cheap fast path
-        (one dict lookup + one time comparison). When a refill is actually
-        due, spawns a single fire-and-forget solve via asyncio.create_task.
-        Multiple concurrent fetches racing this check are gated by the
-        per-domain `_refill_in_flight` flag so we don't burst-fire 32
-        solves on the same tick.
+        Called on every fetch() after a successful solve. Two modes:
+
+        - **Cold start** (first time this domain becomes "cookies"): fire
+          up to `cold_start_burst` solves in parallel to bring the pool
+          to ~target_pool_size right away. The interval gate is bypassed
+          so the burst happens on the very first call after seeding.
+        - **Steady state**: gated by refill_interval (default 1s) and a
+          single-slot-per-tick cap. Replenishes attrition without
+          hammering Mimic.
 
         Replaces the original long-lived background loop, which doesn't
         survive Scrapy's Twisted/asyncio bridge — `asyncio.sleep` inside a
@@ -138,15 +155,6 @@ class SpiderAutoRouter:
         when there's an active await chain from a Scrapy callback.
         """
         import time as _t
-        now = _t.time()
-        last = self._last_refill_check.get(domain, 0.0)
-        if now - last < self.refill_interval:
-            return
-        self._last_refill_check[domain] = now
-
-        if self._refill_in_flight.get(domain):
-            return
-
         entry = self.cache.get(domain)
         if entry is None or entry.level != "cookies":
             return
@@ -158,13 +166,44 @@ class SpiderAutoRouter:
             # avoid unbounded growth from a hostile domain.
             return
 
-        # Spawn one fire-and-forget refill solve. The flag is cleared in
-        # the helper coroutine's finally block.
-        self._refill_in_flight[domain] = True
-        try:
-            asyncio.create_task(self._refill_one(domain, live))
-        except RuntimeError:
-            self._refill_in_flight[domain] = False
+        cold_start = not self._cold_start_done.get(domain, False)
+
+        # Steady-state path is interval-gated; cold start bypasses the gate.
+        if not cold_start:
+            now = _t.time()
+            last = self._last_refill_check.get(domain, 0.0)
+            if now - last < self.refill_interval:
+                return
+            self._last_refill_check[domain] = now
+
+        # Decide how many parallel solves to fire this tick.
+        if cold_start:
+            # Mark cold start done immediately to dedupe concurrent racers
+            self._cold_start_done[domain] = True
+            self._last_refill_check[domain] = _t.time()
+            # Need (target - live) more slots; cap at cold_start_burst
+            slots_needed = max(0, self.target_pool_size - live)
+            num_to_fire = min(slots_needed, self.cold_start_burst)
+            logger.info(
+                "AutoRouter: cold-start refill for %s — firing %d parallel "
+                "solves (live=%d, target=%d)",
+                domain, num_to_fire, live, self.target_pool_size,
+            )
+        else:
+            # Steady state: one slot per tick, gated by in-flight count
+            in_flight = self._refill_in_flight.get(domain, 0)
+            if in_flight > 0:
+                return
+            num_to_fire = 1
+
+        for _ in range(num_to_fire):
+            self._refill_in_flight[domain] = (
+                self._refill_in_flight.get(domain, 0) + 1
+            )
+            try:
+                asyncio.create_task(self._refill_one(domain, live))
+            except RuntimeError:
+                self._refill_in_flight[domain] -= 1
 
     async def _refill_one(self, domain: str, live_at_check: int) -> None:
         """Mint a single fresh slot. Called via fire-and-forget from
@@ -205,7 +244,9 @@ class SpiderAutoRouter:
                 "AutoRouter: refill_one crashed for %s: %s", domain, exc,
             )
         finally:
-            self._refill_in_flight[domain] = False
+            self._refill_in_flight[domain] = max(
+                0, self._refill_in_flight.get(domain, 0) - 1,
+            )
 
     def stop_refill(self) -> None:
         """No-op since the long-lived loop was replaced by hot-path checks.
