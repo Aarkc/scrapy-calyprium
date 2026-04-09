@@ -1,9 +1,12 @@
 """Phase 5: proactive cookie pool expansion.
 
-Verifies that SpiderAutoRouter spawns a background refill task after the
-first successful solve, that the loop mints fresh slots until it reaches
-target_pool_size, and that it backs off when the pool is full or
-oversaturated with dead slots.
+Verifies that SpiderAutoRouter opportunistically refills the cookie pool
+on the fetch hot path. The original design used a long-lived background
+asyncio task, but that doesn't survive Scrapy's Twisted/asyncio bridge
+(detached task's `await asyncio.sleep` never wakes). The current design
+checks the pool size on each successful fetch, throttled to one check
+every refill_interval seconds per domain, and fires a fire-and-forget
+solve if below target.
 """
 from __future__ import annotations
 
@@ -111,65 +114,91 @@ def _make_router(target=4, interval=0.05):
 # ---------------------------------------------------------------------------
 
 
-class TestRefillLoopLifecycle:
+class TestHotPathRefill:
     @pytest.mark.asyncio
-    async def test_refill_starts_after_first_solve(self):
-        router = _make_router(target=3, interval=0.05)
+    async def test_refill_fires_on_post_solve_path(self):
+        # First fetch hits the solve path, which calls _ensure_refill_task
+        # → spawns one refill solve in background → one extra slot.
+        router = _make_router(target=3, interval=0.0)
         router.fetcher.queue(_blocked(), _ok())
         await router.fetch("https://example.com/", domain="example.com")
 
-        assert "example.com" in router._refill_tasks
-        task = router._refill_tasks["example.com"]
-        assert not task.done()
+        # Yield several times to let the fire-and-forget refill complete
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-        # Let the loop run a few ticks
-        await asyncio.sleep(0.2)
-        # Should have minted enough slots to reach target
+        # 1 slot from solve + 1 from refill = 2; not yet at target
         live = len(router.cache.get("example.com").live_slots())
-        assert live >= 3
-
-        router.stop_refill()
-        await asyncio.sleep(0.05)
+        assert live >= 2
 
     @pytest.mark.asyncio
-    async def test_refill_does_not_exceed_target(self):
-        router = _make_router(target=3, interval=0.05)
+    async def test_refill_saturates_after_multiple_fetches(self):
+        # Each successful cookie-replay fetch checks refill once. With
+        # interval=0 every call refills (until pool == target).
+        router = _make_router(target=3, interval=0.0)
+        # First fetch: solve path (blocked → solve → ok), pool grows to 1+1
         router.fetcher.queue(_blocked(), _ok())
         await router.fetch("https://example.com/", domain="example.com")
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-        await asyncio.sleep(0.4)  # plenty of ticks
+        # Subsequent cookie-replay fetches each fire one more refill
+        for _ in range(4):
+            router.fetcher.queue(_ok())
+            await router.fetch(
+                "https://example.com/", domain="example.com",
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+
         live = len(router.cache.get("example.com").live_slots())
-        assert live == 3, (
-            f"expected exactly 3 live slots after refill saturation, got {live}"
+        assert live == 3, f"expected exactly 3 live slots, got {live}"
+
+    @pytest.mark.asyncio
+    async def test_refill_throttled_by_interval(self):
+        # With a non-zero interval, two fetches in quick succession should
+        # only fire one refill — the second hits the time gate.
+        router = _make_router(target=5, interval=10.0)
+        router.fetcher.queue(_blocked(), _ok())
+        await router.fetch("https://example.com/", domain="example.com")
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        first_count = router.solve_client._next_session
+
+        router.fetcher.queue(_ok())
+        await router.fetch("https://example.com/", domain="example.com")
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # No new solve because second fetch hit the interval gate
+        assert router.solve_client._next_session == first_count
+
+    @pytest.mark.asyncio
+    async def test_in_flight_flag_prevents_burst(self):
+        # Two _ensure_refill_task calls in the same tick should only fire
+        # one refill solve, not two — the in_flight flag deduplicates.
+        router = _make_router(target=8, interval=0.0)
+        # Seed a single slot manually so refill has something to grow from
+        from scrapy_calyprium.routing.domain_cache import (
+            CookieSlot, DomainEntry, TTL_COOKIES,
         )
+        entry = DomainEntry(level="cookies", ttl=float(TTL_COOKIES))
+        entry.slots.append(CookieSlot(
+            slot_id="seed", cookies=[], user_agent="UA",
+            proxy_session_id="seed-sess", egress_ip="10.0.0.1",
+        ))
+        router.cache._entries["example.com"] = entry
 
-        router.stop_refill()
-
-    @pytest.mark.asyncio
-    async def test_refill_idempotent(self):
-        router = _make_router(target=3, interval=0.1)
-        router.fetcher.queue(_blocked(), _ok())
-        await router.fetch("https://example.com/", domain="example.com")
-
-        first = router._refill_tasks["example.com"]
-        # Second call shouldn't replace the task
         router._ensure_refill_task("example.com")
-        second = router._refill_tasks["example.com"]
-        assert first is second
+        router._ensure_refill_task("example.com")
+        router._ensure_refill_task("example.com")
 
-        router.stop_refill()
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-    @pytest.mark.asyncio
-    async def test_stop_refill_cancels_loop(self):
-        router = _make_router(target=3, interval=0.05)
-        router.fetcher.queue(_blocked(), _ok())
-        await router.fetch("https://example.com/", domain="example.com")
-
-        await asyncio.sleep(0.05)
-        router.stop_refill()
-        await asyncio.sleep(0.05)
-        task = router._refill_tasks["example.com"]
-        assert task.done()
+        # Only one fire-and-forget solve from the burst
+        assert router.solve_client._next_session == 1
 
 
 # ---------------------------------------------------------------------------
@@ -177,22 +206,21 @@ class TestRefillLoopLifecycle:
 # ---------------------------------------------------------------------------
 
 
-class TestRefillLoopGuards:
+class TestRefillGuards:
     @pytest.mark.asyncio
     async def test_refill_skips_when_no_cookies_entry(self):
-        router = _make_router(target=3, interval=0.05)
-        # Manually start the refill loop without seeding any entry
+        router = _make_router(target=3, interval=0.0)
+        # No entry seeded, no fetch — call ensure directly
         router._ensure_refill_task("example.com")
-        await asyncio.sleep(0.15)
-        # No entry → no solve calls
-        assert router.solve_client.solve_calls == []
-        router.stop_refill()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert router.solve_client._next_session == 0
 
     @pytest.mark.asyncio
     async def test_refill_caps_oversaturated_dead_slots(self):
-        router = _make_router(target=3, interval=0.05)
+        router = _make_router(target=3, interval=0.0)
         cache = router.cache
-        # Pre-populate with 6 dead slots — 2x target
+        # 6 dead slots → 2x target → refill should bail
         from scrapy_calyprium.routing.domain_cache import (
             CookieSlot, DomainEntry, TTL_COOKIES,
         )
@@ -207,27 +235,26 @@ class TestRefillLoopGuards:
         cache._entries["example.com"] = entry
 
         router._ensure_refill_task("example.com")
-        await asyncio.sleep(0.2)
-        # Refill should bail because total slot count >= 2 * target
-        assert router.solve_client.solve_calls == []
-        router.stop_refill()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert router.solve_client._next_session == 0
 
     @pytest.mark.asyncio
     async def test_refill_survives_solve_error(self):
-        # The refill loop should keep running after a transient solve failure.
-        # Setup: first solve (the hot-path one inside fetch) succeeds, second
-        # solve (first refill tick) raises, third+ succeed. We expect the
-        # refill loop to come back and eventually fill the pool to target.
+        # A SolveError in the refill helper must not raise into the caller
+        # and must clear the in_flight flag so subsequent refills can fire.
         from scrapy_calyprium.routing.solve_client import SolveResult
 
         class _FlakyClient:
             def __init__(self):
                 self.solve_calls = 0
-                self.report_calls = []
 
             async def solve(self, **kwargs):
                 self.solve_calls += 1
-                if self.solve_calls == 2:  # only the first refill fails
+                # First call (hot-path inside fetch): succeeds
+                # Second call (first refill): raises
+                # Third+ : succeed
+                if self.solve_calls == 2:
                     raise SolveError("transient")
                 return SolveResult(
                     success=True,
@@ -239,7 +266,7 @@ class TestRefillLoopGuards:
                 )
 
             async def report_ip_outcome(self, **kwargs):
-                self.report_calls.append(kwargs)
+                pass
 
         router = SpiderAutoRouter(
             fetcher=FakeFetcher(),
@@ -247,15 +274,21 @@ class TestRefillLoopGuards:
             solve_client=_FlakyClient(),
             proxy_url=None,
             target_pool_size=3,
-            refill_interval=0.05,
+            refill_interval=0.0,
         )
         router.fetcher.queue(_blocked(), _ok())
         await router.fetch("https://example.com/", domain="example.com")
-
-        await asyncio.sleep(0.4)
-        # 1 hot-path solve + at least 2 successful refills (after the
-        # transient failure on tick 1) → 3 total slots, 4+ solve calls.
-        assert router.solve_client.solve_calls >= 4
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # in_flight flag should be cleared after the SolveError
+        assert router._refill_in_flight.get("example.com") is False
+        # And a follow-up fetch should be able to fire another refill
+        router.fetcher.queue(_ok())
+        await router.fetch("https://example.com/", domain="example.com")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # By now: hot solve (1) + failed refill (2) + at least one
+        # follow-up refill (3+) — third call returned success
+        assert router.solve_client.solve_calls >= 3
         live = len(router.cache.get("example.com").live_slots())
-        assert live >= 3
-        router.stop_refill()
+        assert live >= 2

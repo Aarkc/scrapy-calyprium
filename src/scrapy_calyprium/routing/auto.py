@@ -103,6 +103,17 @@ class SpiderAutoRouter:
         self.refill_interval = refill_interval
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
+        # Last hot-path refill check per domain. The original design used a
+        # long-lived asyncio.create_task background loop, but in Scrapy's
+        # Twisted-driven environment that task's `await asyncio.sleep` never
+        # gets pumped — Scrapy's reactor only services the asyncio loop
+        # when there's a current await chain. Driving refill from the fetch
+        # hot path is more robust: every request opportunistically checks
+        # whether a refill is due, and if so spawns a fire-and-forget solve
+        # via asyncio.create_task (which IS pumped because the spider's own
+        # await chain is active).
+        self._last_refill_check: Dict[str, float] = {}
+        self._refill_in_flight: Dict[str, bool] = {}
 
     def _solve_lock(self, domain: str) -> asyncio.Lock:
         lock = self._solve_locks.get(domain)
@@ -112,106 +123,94 @@ class SpiderAutoRouter:
         return lock
 
     def _ensure_refill_task(self, domain: str) -> None:
-        """Lazily start a background refill loop for this domain.
+        """Hot-path refill check.
 
-        Idempotent — calling it on every request is cheap (one dict lookup)
-        and safe. Started on the first successful solve so we don't fire a
-        refill task for domains we've never authenticated against.
+        Called on every fetch() after a successful solve. Cheap fast path
+        (one dict lookup + one time comparison). When a refill is actually
+        due, spawns a single fire-and-forget solve via asyncio.create_task.
+        Multiple concurrent fetches racing this check are gated by the
+        per-domain `_refill_in_flight` flag so we don't burst-fire 32
+        solves on the same tick.
+
+        Replaces the original long-lived background loop, which doesn't
+        survive Scrapy's Twisted/asyncio bridge — `asyncio.sleep` inside a
+        detached task never wakes because the asyncio loop is only pumped
+        when there's an active await chain from a Scrapy callback.
         """
-        existing = self._refill_tasks.get(domain)
-        if existing is not None and not existing.done():
+        import time as _t
+        now = _t.time()
+        last = self._last_refill_check.get(domain, 0.0)
+        if now - last < self.refill_interval:
             return
+        self._last_refill_check[domain] = now
+
+        if self._refill_in_flight.get(domain):
+            return
+
+        entry = self.cache.get(domain)
+        if entry is None or entry.level != "cookies":
+            return
+        live = len(entry.live_slots())
+        if live >= self.target_pool_size:
+            return
+        if len(entry.slots) >= self.target_pool_size * 2:
+            # Lots of dead slots accumulated — skip until they expire to
+            # avoid unbounded growth from a hostile domain.
+            return
+
+        # Spawn one fire-and-forget refill solve. The flag is cleared in
+        # the helper coroutine's finally block.
+        self._refill_in_flight[domain] = True
         try:
-            self._refill_tasks[domain] = asyncio.create_task(
-                self._refill_loop(domain)
-            )
+            asyncio.create_task(self._refill_one(domain, live))
         except RuntimeError:
-            # No running loop — fine, we'll try again on the next request.
-            pass
+            self._refill_in_flight[domain] = False
 
-    async def _refill_loop(self, domain: str) -> None:
-        """Background loop that mints fresh slots until the pool is full.
-
-        Tick interval: self.refill_interval seconds. Each tick:
-
-        - Stop if domain isn't in cookies mode (light/heavy means we don't
-          want a slot pool here)
-        - Count live slots; if >= target_pool_size, do nothing
-        - Otherwise call solve_client.solve() ONCE per tick. We don't
-          burst-fill — bursts trip Mimic's per-domain rate limit and
-          waste browser cycles. One solve per tick is sustainable and
-          gradually catches up with attrition.
-        - On solve success, set_cookies_from_solve adds the new slot
-        - On solve failure, log and skip — Mimic's rate limit or worker
-          health issues are not fatal here
-
-        Exits cleanly when self._refill_stop is set or the loop is
-        cancelled (e.g. on spider shutdown).
-        """
-        logger.info(
-            "AutoRouter: refill loop started for %s (target=%d, interval=%.1fs)",
-            domain, self.target_pool_size, self.refill_interval,
-        )
+    async def _refill_one(self, domain: str, live_at_check: int) -> None:
+        """Mint a single fresh slot. Called via fire-and-forget from
+        _ensure_refill_task. Errors are swallowed — refill is best-effort
+        and a transient failure should not affect spider throughput."""
         try:
-            while not self._refill_stop:
-                await asyncio.sleep(self.refill_interval)
-                entry = self.cache.get(domain)
-                if entry is None or entry.level != "cookies":
-                    continue
-                live = len(entry.live_slots())
-                if live >= self.target_pool_size:
-                    continue
-                if len(entry.slots) >= self.target_pool_size * 2:
-                    # Lots of dead slots accumulated — skip until they
-                    # expire to avoid unbounded growth from a hostile domain.
-                    continue
-                logger.debug(
-                    "AutoRouter: refill %s pool=%d/%d, minting fresh slot",
-                    domain, live, self.target_pool_size,
-                )
-                try:
-                    solve = await self.solve_client.solve(domain=domain)
-                except SolveError as exc:
-                    logger.info(
-                        "AutoRouter: refill solve failed for %s: %s",
-                        domain, exc,
-                    )
-                    continue
-                if not solve.success:
-                    logger.info(
-                        "AutoRouter: refill solve returned no cookies for %s",
-                        domain,
-                    )
-                    continue
-                self.cache.set_cookies_from_solve(
-                    domain=domain,
-                    cookies=solve.cookies,
-                    user_agent=solve.user_agent,
-                    proxy_session_id=solve.proxy_session_id,
-                    preset=solve.preset,
-                    egress_ip=solve.egress_ip,
-                )
+            try:
+                solve = await self.solve_client.solve(domain=domain)
+            except SolveError as exc:
                 logger.info(
-                    "AutoRouter: refill added slot for %s (egress_ip=%s, "
-                    "pool=%d/%d)",
-                    domain, solve.egress_ip,
-                    len(self.cache.get(domain).live_slots()),
-                    self.target_pool_size,
+                    "AutoRouter: refill solve failed for %s: %s", domain, exc,
                 )
-        except asyncio.CancelledError:
-            logger.info("AutoRouter: refill loop cancelled for %s", domain)
-            raise
+                return
+            if not solve.success:
+                logger.info(
+                    "AutoRouter: refill solve returned no cookies for %s",
+                    domain,
+                )
+                return
+            self.cache.set_cookies_from_solve(
+                domain=domain,
+                cookies=solve.cookies,
+                user_agent=solve.user_agent,
+                proxy_session_id=solve.proxy_session_id,
+                preset=solve.preset,
+                egress_ip=solve.egress_ip,
+            )
+            entry = self.cache.get(domain)
+            new_live = len(entry.live_slots()) if entry else 0
+            logger.info(
+                "AutoRouter: refill added slot for %s (egress_ip=%s, "
+                "pool=%d->%d/%d)",
+                domain, solve.egress_ip, live_at_check, new_live,
+                self.target_pool_size,
+            )
         except Exception as exc:
             logger.warning(
-                "AutoRouter: refill loop crashed for %s: %s", domain, exc,
+                "AutoRouter: refill_one crashed for %s: %s", domain, exc,
             )
+        finally:
+            self._refill_in_flight[domain] = False
 
     def stop_refill(self) -> None:
-        """Signal all refill loops to exit. Called on spider shutdown."""
+        """No-op since the long-lived loop was replaced by hot-path checks.
+        Kept for backwards compatibility with shutdown handlers."""
         self._refill_stop = True
-        for task in self._refill_tasks.values():
-            if not task.done():
-                task.cancel()
 
     def _report_ip_outcome(
         self,
@@ -372,6 +371,9 @@ class SpiderAutoRouter:
                         self._report_ip_outcome(
                             domain=domain, slot=slot, outcome="success",
                         )
+                        # Hot-path refill check — opportunistically grow
+                        # the pool toward target_pool_size if we're under.
+                        self._ensure_refill_task(domain)
                         return RouteResult(
                             fetch=result,
                             routing_method="httpcloak_cookies",
