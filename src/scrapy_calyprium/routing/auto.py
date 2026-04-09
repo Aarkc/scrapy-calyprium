@@ -89,6 +89,45 @@ class SpiderAutoRouter:
             self._solve_locks[domain] = lock
         return lock
 
+    def _report_ip_outcome(
+        self,
+        *,
+        domain: str,
+        slot,
+        outcome: str,
+        status_code: Optional[int] = None,
+    ) -> None:
+        """Fire-and-forget POST to Mimic /api/ip-health/report.
+
+        Closes the per-(domain, IP) reputation feedback loop. The spider's
+        local httpcloak replays don't flow through Mimic's server-side
+        routing, so without this Mimic only learns about failures from
+        its own /api/fetch traffic — a small fraction of total volume.
+        With it, Mimic's IP blacklist sees real spider observations and
+        the next solve's pre-screen loop can rotate around the burned
+        physical IP.
+
+        Skipped silently when the slot has no resolved egress_ip — there's
+        nothing to feed the IP-level reputation tracker. The session-level
+        tracker still gets the report, but per-(domain, ip) doesn't.
+        """
+        if slot is None or not slot.egress_ip:
+            return
+        try:
+            asyncio.create_task(
+                self.solve_client.report_ip_outcome(
+                    proxy_session_id=slot.proxy_session_id,
+                    domain=domain,
+                    outcome=outcome,
+                    status_code=status_code,
+                    egress_ip=slot.egress_ip,
+                )
+            )
+        except RuntimeError:
+            # No running loop — happens in some test paths. Reputation
+            # is a soft signal; dropping a single report is fine.
+            pass
+
     def report_silent_failure(
         self,
         domain: str,
@@ -103,16 +142,44 @@ class SpiderAutoRouter:
         calls this method so the routing layer can roll back the slot's
         success counter and feed the rate-cap learner. Without it, the
         router happily keeps firing the same dead slot at full speed.
+
+        Two cases:
+        - slot_id is set (cookie replay path): record a slot failure with
+          status_code=200, which feeds the rate-cap learner.
+        - slot_id is None (light path / cold discovery): we have no slot to
+          blame. Drop the "light" classification so the next request escalates
+          through solve instead of replaying a useless light fetch.
         """
-        if not slot_id:
+        if slot_id:
+            logger.info(
+                "AutoRouter: silent failure on %s slot %s (reason=%s)",
+                domain, slot_id, reason,
+            )
+            # Resolve the slot to get its egress_ip for the IP report
+            entry = self.cache.get(domain)
+            slot = None
+            if entry:
+                slot = next((s for s in entry.slots if s.slot_id == slot_id), None)
+            self.cache.record_slot_failure(domain, slot_id, status_code=200)
+            if slot is not None:
+                self._report_ip_outcome(
+                    domain=domain, slot=slot, outcome="blocked",
+                    status_code=200,
+                )
             return
-        logger.info(
-            "AutoRouter: silent failure on %s slot %s (reason=%s)",
-            domain, slot_id, reason,
-        )
-        # Treat as a real domain-side failure: increments slot fail count
-        # and feeds the rate-cap learner with the current slot RPM.
-        self.cache.record_slot_failure(domain, slot_id, status_code=200)
+
+        # Light-path silent failure — drop the cache entry so the next
+        # request re-probes and (hopefully) escalates to /api/solve.
+        entry = self.cache.get(domain)
+        if entry and entry.level == "light":
+            logger.info(
+                "AutoRouter: light-path silent failure on %s (reason=%s); "
+                "dropping light classification to force re-probe",
+                domain, reason,
+            )
+            # Drop the entry entirely so the next request hits step 3 again
+            # and escalates through the solve flow if blocked.
+            self.cache._entries.pop(domain, None)
 
     async def fetch(self, url: str, *, domain: str) -> RouteResult:
         # Step 1: heavy with no re-probe due → caller should fall through to legacy
@@ -173,9 +240,14 @@ class SpiderAutoRouter:
                         domain, exc,
                     )
                     self.cache.record_slot_failure(domain, slot.slot_id, status_code=None)
+                    # Infra failures are NOT reported to IP reputation —
+                    # not the IP's fault.
                 else:
                     if not is_blocked(result.status_code, result.body):
                         self.cache.record_slot_success(domain, slot.slot_id)
+                        self._report_ip_outcome(
+                            domain=domain, slot=slot, outcome="success",
+                        )
                         return RouteResult(
                             fetch=result,
                             routing_method="httpcloak_cookies",
@@ -185,6 +257,10 @@ class SpiderAutoRouter:
                         )
                     self.cache.record_slot_failure(
                         domain, slot.slot_id, status_code=result.status_code,
+                    )
+                    self._report_ip_outcome(
+                        domain=domain, slot=slot, outcome="blocked",
+                        status_code=result.status_code,
                     )
 
         # Step 3: try httpcloak without cookies (light path)
@@ -264,13 +340,16 @@ class SpiderAutoRouter:
                         error=solve.error or "solve returned no cookies",
                     )
 
-                # Cache the new slot
+                # Cache the new slot. Carry the egress_ip Mimic resolved
+                # for this proxy_session_id so the spider's failure feedback
+                # can name a physical IP rather than just a session token.
                 slot = self.cache.set_cookies_from_solve(
                     domain=domain,
                     cookies=solve.cookies,
                     user_agent=solve.user_agent,
                     proxy_session_id=solve.proxy_session_id,
                     preset=solve.preset,
+                    egress_ip=solve.egress_ip,
                 )
         # Track the post-solve replay against the new slot's RPM window too
         self.cache.record_request(domain, slot.slot_id)
@@ -298,6 +377,10 @@ class SpiderAutoRouter:
             self.cache.record_slot_failure(
                 domain, slot.slot_id, status_code=replay.status_code,
             )
+            self._report_ip_outcome(
+                domain=domain, slot=slot, outcome="blocked",
+                status_code=replay.status_code,
+            )
             return RouteResult(
                 fetch=replay,
                 routing_method="solve_then_replay",
@@ -306,6 +389,9 @@ class SpiderAutoRouter:
                 needs_legacy_fallback=True,
             )
 
+        self._report_ip_outcome(
+            domain=domain, slot=slot, outcome="success",
+        )
         return RouteResult(
             fetch=replay,
             routing_method="solve_then_replay",

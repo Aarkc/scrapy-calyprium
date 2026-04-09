@@ -62,6 +62,13 @@ class CookieSlot:
     fail_count: int = 0
     success_count: int = 0
     block_count: int = 0
+    # Resolved physical egress IP for this slot, populated from the
+    # /api/solve response. Reported back to Mimic on slot failures so the
+    # server-side per-(domain, ip) reputation tracker rotates around
+    # burned IPs across the whole spider fleet. None means Mimic
+    # couldn't resolve it (no proxy creds, probe failed) — the slot is
+    # still usable, it just contributes no reputation signal.
+    egress_ip: Optional[str] = None
     _request_times: List[float] = field(default_factory=list)
 
     @property
@@ -96,6 +103,7 @@ class CookieSlot:
             "fail_count": self.fail_count,
             "success_count": self.success_count,
             "block_count": self.block_count,
+            "egress_ip": self.egress_ip,
         }
 
     @classmethod
@@ -266,6 +274,7 @@ class DomainCache:
         user_agent: str,
         proxy_session_id: str,
         preset: str = "chrome-latest",
+        egress_ip: Optional[str] = None,
     ) -> CookieSlot:
         """Add a new cookie slot from a Mimic /api/solve response."""
         entry = self._entries.get(domain)
@@ -279,14 +288,15 @@ class DomainCache:
             user_agent=user_agent,
             proxy_session_id=proxy_session_id,
             preset=preset,
+            egress_ip=egress_ip,
         )
         entry.slots.append(slot)
         if len(entry.slots) > MAX_SLOTS_PER_DOMAIN:
             entry.slots = entry.slots[-MAX_SLOTS_PER_DOMAIN:]
         entry.updated_at = _now()
         logger.debug(
-            "DomainCache: added slot for %s (slots=%d, session=%s)",
-            domain, len(entry.slots), proxy_session_id,
+            "DomainCache: added slot for %s (slots=%d, session=%s, egress_ip=%s)",
+            domain, len(entry.slots), proxy_session_id, egress_ip,
         )
         return slot
 

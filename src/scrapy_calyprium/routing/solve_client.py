@@ -25,6 +25,12 @@ class SolveResult:
     duration_ms: int
     learned_rpm_cap: Optional[float] = None
     error: Optional[str] = None
+    # Resolved physical egress IP behind proxy_session_id, populated by
+    # Mimic via a one-shot api.ipify.org probe during the solve. Spider
+    # stores it on its CookieSlot and reports it back via /api/ip-health/
+    # report on failures so Mimic's per-(domain, ip) reputation tracker
+    # can rotate around burned IPs across the whole spider fleet.
+    egress_ip: Optional[str] = None
 
 
 class SolveError(Exception):
@@ -150,4 +156,58 @@ class SolveClient:
             preset=data.get("preset", "chrome-latest"),
             duration_ms=int(data.get("duration_ms", 0)),
             learned_rpm_cap=data.get("learned_rpm_cap"),
+            egress_ip=data.get("egress_ip"),
         )
+
+    async def report_ip_outcome(
+        self,
+        *,
+        proxy_session_id: str,
+        domain: str,
+        outcome: str,
+        status_code: Optional[int] = None,
+        egress_ip: Optional[str] = None,
+    ) -> None:
+        """Fire-and-forget POST to /api/ip-health/report.
+
+        Closes the per-(domain, IP) reputation feedback loop. The spider's
+        local httpcloak replay does not flow through Mimic's server-side
+        routing, so without this report Mimic only learns about failures
+        from its own /api/fetch path — a small fraction of total traffic.
+        Reporting here lets Mimic populate its IP blacklist from real
+        spider observations and rotate around burned IPs on the next
+        solve.
+
+        Errors are swallowed: a failure to report should never affect
+        spider throughput. The reputation system is a soft signal.
+        """
+        if outcome not in ("blocked", "success"):
+            logger.warning(
+                "SolveClient.report_ip_outcome: invalid outcome %r", outcome,
+            )
+            return
+        client = await self._get_client()
+        body: Dict = {
+            "proxy_session_id": proxy_session_id,
+            "domain": domain,
+            "outcome": outcome,
+        }
+        if status_code is not None:
+            body["status_code"] = status_code
+        if egress_ip:
+            body["egress_ip"] = egress_ip
+        url = f"{self.service_url}/api/ip-health/report"
+        try:
+            response = await client.post(
+                url, json=body, headers=self._build_headers(), timeout=5.0,
+            )
+            if response.status_code >= 400:
+                logger.debug(
+                    "report_ip_outcome %s/%s -> %d: %s",
+                    domain, outcome, response.status_code,
+                    response.text[:200],
+                )
+        except Exception as exc:
+            logger.debug(
+                "report_ip_outcome %s/%s failed: %s", domain, outcome, exc,
+            )
