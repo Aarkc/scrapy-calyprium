@@ -1,3 +1,10 @@
+# [1.10.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.9.0...v1.10.0) (2026-04-09)
+
+
+### Features
+
+* **local:** end-to-end egress_ip feedback to Mimic per-(domain, IP) reputation ([8d8f03b](https://github.com/Aarkc/scrapy-calyprium/commit/8d8f03bf4f62c90cd006077df6a63a3edb309a80))
+
 # [1.9.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.8.2...v1.9.0) (2026-04-08)
 
 
