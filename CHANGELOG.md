@@ -1,3 +1,10 @@
+## [1.11.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.0...v1.11.1) (2026-04-09)
+
+
+### Bug Fixes
+
+* **local:** drive refill from fetch hot path, not background asyncio task ([aa24820](https://github.com/Aarkc/scrapy-calyprium/commit/aa24820d6a2a67ccc134072535835ae04bb72ec4))
+
 # [1.11.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.10.0...v1.11.0) (2026-04-09)
 
 
