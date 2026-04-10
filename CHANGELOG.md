@@ -1,3 +1,10 @@
+## [1.11.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.2...v1.11.3) (2026-04-10)
+
+
+### Bug Fixes
+
+* **prism-sitemap:** separate freshness tracking from freshness filtering ([daed5e3](https://github.com/Aarkc/scrapy-calyprium/commit/daed5e3d04c1b0a1fe5c59f58143065323b5e449))
+
 ## [1.11.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.1...v1.11.2) (2026-04-09)
 
 
