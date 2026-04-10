@@ -1,3 +1,10 @@
+## [1.11.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.3...v1.11.4) (2026-04-10)
+
+
+### Bug Fixes
+
+* **prism-sitemap:** revert filter split + fast-skip fresh prefix ([e537a7a](https://github.com/Aarkc/scrapy-calyprium/commit/e537a7a1fd4f7b88d0043c2073d820c3e93ca10d))
+
 ## [1.11.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.2...v1.11.3) (2026-04-10)
 
 
