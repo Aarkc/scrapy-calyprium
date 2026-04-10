@@ -463,12 +463,14 @@ class PrismSitemapSpider(scrapy.Spider):
     def _filter_fresh_urls(self, urls):
         """Filter out recently-crawled URLs via Forge's freshness API.
 
-        Only active when RECRAWL_TRACKING_ENABLED=true. Calls Forge's
-        /filter-stale endpoint which checks the crawl_freshness table.
-        If the call fails, returns all URLs (fail-open).
+        Only active when RECRAWL_FILTER_STALE=true. This is set by the
+        recrawl endpoint but NOT by the regular /run endpoint, so full
+        runs walk the entire Prism corpus without skipping. The tracking
+        pipeline (RECRAWL_TRACKING_ENABLED) is independent — a full run
+        can write to crawl_freshness without filtering reads.
         """
         try:
-            enabled = self.settings.getbool("RECRAWL_TRACKING_ENABLED", False)
+            enabled = self.settings.getbool("RECRAWL_FILTER_STALE", False)
         except AttributeError:
             return urls
         if not enabled:
