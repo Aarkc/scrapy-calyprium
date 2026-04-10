@@ -451,26 +451,34 @@ class PrismSitemapSpider(scrapy.Spider):
         # Prism is exhausted only if the RAW batch was smaller than requested
         if raw_count < min(self.batch_size, 100000):
             self._prism_exhausted = True
-        # If filtering removed all URLs but Prism has more, trigger
-        # immediate refill so we don't stall with an empty queue
+        # If filtering removed all URLs but Prism has more, skip forward
+        # aggressively. With ~1.15M already-fresh URLs at the start of the
+        # Prism corpus, the spider needs to advance past them quickly
+        # instead of fetching 5k at a time (230+ empty batches). Jump by
+        # 50k per hop to clear the fresh prefix in ~23 hops (~30s) instead
+        # of ~230 hops (~5 min). Once we hit batches with stale URLs, the
+        # normal 5k cadence resumes.
         elif not urls and not self._prism_exhausted:
+            skip_stride = 50000
+            self._prism_next_offset += skip_stride - raw_count
             logger.info(
-                f"Batch fully fresh at offset {self._prism_next_offset:,}, "
-                f"fetching next batch"
+                f"Batch fully fresh, skipping ahead to offset "
+                f"{self._prism_next_offset:,} (stride={skip_stride:,})"
             )
             yield self._make_refill_request()
 
     def _filter_fresh_urls(self, urls):
         """Filter out recently-crawled URLs via Forge's freshness API.
 
-        Only active when RECRAWL_FILTER_STALE=true. This is set by the
-        recrawl endpoint but NOT by the regular /run endpoint, so full
-        runs walk the entire Prism corpus without skipping. The tracking
-        pipeline (RECRAWL_TRACKING_ENABLED) is independent — a full run
-        can write to crawl_freshness without filtering reads.
+        Active when RECRAWL_TRACKING_ENABLED=true. Calls Forge's
+        /filter-stale endpoint to skip URLs already in crawl_freshness
+        with a recent last_crawled_at. This way full runs skip the
+        ~1.15M already-tracked URLs and only scrape the ~15M that have
+        never been crawled (or are overdue for refresh). If the call
+        fails, returns all URLs (fail-open).
         """
         try:
-            enabled = self.settings.getbool("RECRAWL_FILTER_STALE", False)
+            enabled = self.settings.getbool("RECRAWL_TRACKING_ENABLED", False)
         except AttributeError:
             return urls
         if not enabled:
