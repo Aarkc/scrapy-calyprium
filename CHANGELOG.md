@@ -1,3 +1,10 @@
+## [1.11.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.4...v1.11.5) (2026-04-11)
+
+
+### Bug Fixes
+
+* **local:** suppress HEAVY promotion on all_slots_exhausted ([b0a30e5](https://github.com/Aarkc/scrapy-calyprium/commit/b0a30e5235e38549d4174ef7a11642a6394c5f40))
+
 ## [1.11.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.3...v1.11.4) (2026-04-10)
 
 
