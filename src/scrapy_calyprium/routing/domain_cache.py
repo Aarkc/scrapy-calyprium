@@ -352,7 +352,21 @@ class DomainCache:
 
         if entry.live_slots():
             return False
-        return self._maybe_promote_heavy(domain, "all_slots_exhausted")
+
+        # All slots dead — but DON'T promote to heavy. With per-(domain, ip)
+        # reputation and the refill loop, this is a temporary condition: IPs
+        # are in cooldown and will recover. Promoting to heavy switches the
+        # domain to "browser on every request" mode, which kills the refill
+        # loop (it skips non-cookies domains) and the spider gives up.
+        # Instead, stay in cookies mode with 0 live slots. The refill loop
+        # will keep trying to mint fresh slots at its normal cadence, and
+        # when an IP comes out of cooldown the next solve will succeed.
+        logger.warning(
+            "DomainCache: all slots exhausted for %s — staying in cookies "
+            "mode for refill recovery (NOT promoting to heavy)",
+            domain,
+        )
+        return False
 
     def record_slot_success(self, domain: str, slot_id: str) -> None:
         entry = self._entries.get(domain)
