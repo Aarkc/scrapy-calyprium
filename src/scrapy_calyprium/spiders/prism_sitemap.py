@@ -126,8 +126,10 @@ class PrismSitemapSpider(scrapy.Spider):
                 meta={
                     "_internal": True,
                     "download_timeout": 120,
+                    "download_slot": "_prism_internal",
                 },
                 dont_filter=True,
+                priority=100,
             )
         elif parsed.scheme == "file":
             yield from self._start_from_file(parsed.path)
@@ -545,8 +547,16 @@ class PrismSitemapSpider(scrapy.Spider):
             meta={
                 "_internal": True,
                 "download_timeout": 120,
+                # Use a separate download slot so Prism API calls don't
+                # compete with proxy-routed scrape requests. Without this,
+                # when all CONCURRENT_REQUESTS slots are occupied by
+                # stuck/failing proxy requests, the Prism pagination
+                # request can't get through → no new URLs → spider
+                # finishes prematurely.
+                "download_slot": "_prism_internal",
             },
             dont_filter=True,
+            priority=100,  # higher priority than normal scrape requests
         )
 
     def _start_from_file(self, path):
