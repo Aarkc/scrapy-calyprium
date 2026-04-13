@@ -1,3 +1,10 @@
+## [1.11.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.5...v1.11.6) (2026-04-13)
+
+
+### Bug Fixes
+
+* **prism-sitemap:** separate download slot for Prism pagination ([75818e2](https://github.com/Aarkc/scrapy-calyprium/commit/75818e29aa0e58120e4fd6dd5e9009092c75a5ae))
+
 ## [1.11.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.4...v1.11.5) (2026-04-11)
 
 
