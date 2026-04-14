@@ -1,3 +1,10 @@
+## [1.11.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.6...v1.11.7) (2026-04-14)
+
+
+### Performance Improvements
+
+* **local:** reduce bandwidth waste — MAX_SLOT_FAILURES=1, hard-cap RPM ([d38b9d2](https://github.com/Aarkc/scrapy-calyprium/commit/d38b9d2cd3e88ae456992c9f1312149821b7d98f))
+
 ## [1.11.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.5...v1.11.6) (2026-04-13)
 
 
