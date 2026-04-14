@@ -324,11 +324,14 @@ class TestRouterReportsIPOutcome:
             egress_ip="203.0.113.99",
         )
         fetcher = FakeFetcher()
-        # 1) cookie replay: blocked
-        # 2) light fetch:   blocked
-        # 3) post-solve replay (reuses cached slot): also blocked
+        # With MAX_SLOT_FAILURES=1, the cookie replay 403 immediately kills
+        # the slot. Router then: light fetch → blocked → solve → replay.
+        # Queue responses for the full fall-through path.
         fetcher.queue(_blocked_403(), _blocked_403(), _blocked_403())
-        solve = FakeSolveClient()  # never reached because cache reused
+        solve = FakeSolveClient()
+        # Solve must succeed so the router gets to replay; that replay's
+        # 403 produces another IP report against the NEW egress IP.
+        solve.queue(_solve_result_with_egress("203.0.113.99"))
 
         router = _make_router(fetcher=fetcher, solve=solve, cache=cache)
         await router.fetch("https://example.com/", domain="example.com")

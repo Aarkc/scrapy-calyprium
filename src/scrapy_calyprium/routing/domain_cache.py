@@ -32,8 +32,21 @@ logger = logging.getLogger(__name__)
 TTL_LIGHT = 3600
 TTL_COOKIES = 1800
 TTL_HEAVY = 21600
-MAX_SLOT_FAILURES = 3
+# Kill a slot on its first real block instead of waiting for 3. With static
+# residential proxies + Cloudflare, each 403 retry wastes ~130KB and burns
+# the IP further without improving odds. Fresh slot via refill is faster
+# and cheaper. If we see a block, the slot is done.
+MAX_SLOT_FAILURES = 1
 MAX_SLOTS_PER_DOMAIN = 8
+
+# Hard cap on per-slot RPM regardless of what the adaptive learner observes.
+# Cloudflare per-cookie rate limits appear to be around 10-15 RPM; burning
+# slots at higher rates just wastes bandwidth. The learned_rpm_cap may
+# settle higher (~40 RPM) based on block observations, but that's still
+# too aggressive. Cap at 10 RPM to let each cookie set last much longer
+# (at 10 RPM over a 20min cf_clearance TTL, we get 200 successful requests
+# per solve vs ~30 currently).
+SLOT_RPM_HARD_CAP = 10.0
 
 # AAR-14 circuit breaker tunables
 PROMOTION_COOLDOWN_SECONDS = 300
@@ -142,7 +155,13 @@ class DomainEntry:
         return [s for s in self.slots if s.is_live]
 
     def next_slot(self) -> Optional[CookieSlot]:
-        """Pick the least-loaded live slot, respecting the learned rate cap."""
+        """Pick the least-loaded live slot, respecting the learned rate cap.
+
+        Applies SLOT_RPM_HARD_CAP as a ceiling — even if the adaptive
+        learner hasn't observed enough blocks to set learned_rpm_cap,
+        we never exceed the hard cap. This protects the cookie lifetime
+        by keeping per-slot RPM below Cloudflare's per-cookie threshold.
+        """
         live = self.live_slots()
         if not live:
             return None
@@ -152,13 +171,16 @@ class DomainEntry:
         # Sort by current per-slot RPM (ascending — least loaded first)
         sorted_slots = sorted(live, key=lambda s: s.requests_per_minute())
 
+        # Effective cap = min(learned, hard_cap)
+        cap = SLOT_RPM_HARD_CAP
         if self.learned_rpm_cap is not None:
-            under_cap = [
-                s for s in sorted_slots
-                if s.requests_per_minute() < self.learned_rpm_cap
-            ]
-            if under_cap:
-                return under_cap[0]
+            cap = min(cap, self.learned_rpm_cap)
+
+        under_cap = [
+            s for s in sorted_slots if s.requests_per_minute() < cap
+        ]
+        if under_cap:
+            return under_cap[0]
 
         return sorted_slots[0]
 

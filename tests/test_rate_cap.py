@@ -84,10 +84,10 @@ class TestRateCapLearning:
 
         cache.record_slot_failure("example.com", slot.slot_id, status_code=403)
 
-        # Cap should be 70% of 100 = 70 RPM
-        entry = cache.get("example.com")
-        # Note: after slot fails, it may not be in entry anymore if all dead
-        # but we set MAX_SLOT_FAILURES=3 so 1 fail leaves it live
+        # Cap should be 70% of 100 = 70 RPM. After MAX_SLOT_FAILURES=1
+        # the slot is dead so cache.get() returns None; inspect the
+        # internal entry to verify the cap was still learned.
+        entry = cache._entries.get("example.com")
         assert entry is not None
         assert entry.learned_rpm_cap is not None
         assert entry.learned_rpm_cap == pytest.approx(70.0, abs=0.1)
@@ -99,7 +99,7 @@ class TestRateCapLearning:
         for _ in range(3):
             slot.record_request()
         cache.record_slot_failure("example.com", slot.slot_id, status_code=403)
-        entry = cache.get("example.com")
+        entry = cache._entries.get("example.com")
         assert entry.learned_rpm_cap is None
 
     def test_infra_failure_does_not_update_cap(self):
@@ -109,7 +109,7 @@ class TestRateCapLearning:
         for _ in range(50):
             slot.record_request()
         cache.record_slot_failure("example.com", slot.slot_id, status_code=None)
-        entry = cache.get("example.com")
+        entry = cache._entries.get("example.com")
         assert entry.learned_rpm_cap is None  # AAR-14: infra doesn't blame domain
 
     def test_cap_uses_median_of_block_rpms(self):
@@ -256,7 +256,7 @@ class TestSilentFailureFeedback:
 
         # Slot should have a failure recorded AND the rate cap should have learned
         assert slot.fail_count == 1
-        entry = cache.get("example.com")
+        entry = cache._entries.get("example.com")
         assert entry.learned_rpm_cap is not None
         # 50 RPM at block time -> cap = 50 * 0.7 = 35
         assert entry.learned_rpm_cap == pytest.approx(35.0, abs=0.1)
