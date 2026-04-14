@@ -32,11 +32,13 @@ logger = logging.getLogger(__name__)
 TTL_LIGHT = 3600
 TTL_COOKIES = 1800
 TTL_HEAVY = 21600
-# Kill a slot on its first real block instead of waiting for 3. With static
-# residential proxies + Cloudflare, each 403 retry wastes ~130KB and burns
-# the IP further without improving odds. Fresh slot via refill is faster
-# and cheaper. If we see a block, the slot is done.
-MAX_SLOT_FAILURES = 1
+# Tolerate 3 failures per slot before declaring it dead. Tested
+# MAX_SLOT_FAILURES=1 in production — block rate WORSENED from 72%
+# to 93% because Cloudflare often 403s the first 1-2 requests through
+# a fresh slot before "warming up" and accepting subsequent ones.
+# Killing slots prematurely loses those would-have-recovered cookies
+# and forces more solves (each ~25s + browser bandwidth).
+MAX_SLOT_FAILURES = 3
 MAX_SLOTS_PER_DOMAIN = 8
 
 # Hard cap on per-slot RPM regardless of what the adaptive learner observes.
