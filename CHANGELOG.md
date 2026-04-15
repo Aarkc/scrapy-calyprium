@@ -1,3 +1,15 @@
+# [1.12.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.7...v1.12.0) (2026-04-15)
+
+
+### Features
+
+* **extensions:** CalypriumRunStats — per-run telemetry to Forge ([68b7973](https://github.com/Aarkc/scrapy-calyprium/commit/68b79735d7ea53b88167b6dd2e9cf77a5af371e0))
+
+
+### Reverts
+
+* **local:** MAX_SLOT_FAILURES back to 3 — 1 made block rate worse ([db66e10](https://github.com/Aarkc/scrapy-calyprium/commit/db66e101b30cab3168f610aec76c86a2834ccfd9))
+
 ## [1.11.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.6...v1.11.7) (2026-04-14)
 
 
