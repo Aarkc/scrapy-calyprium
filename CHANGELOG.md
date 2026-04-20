@@ -1,3 +1,10 @@
+## [1.13.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.1...v1.13.2) (2026-04-20)
+
+
+### Performance Improvements
+
+* **local:** skip httpcloak light probe for known-cookies domains ([54fe9c9](https://github.com/Aarkc/scrapy-calyprium/commit/54fe9c9eba17a5a5c6f5e493f57c0b9e3bb82f51))
+
 ## [1.13.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.0...v1.13.1) (2026-04-20)
 
 
