@@ -194,11 +194,20 @@ class MimicBrowserMiddleware:
                 or self.crawler.settings.get("MIMIC_USER_ID")
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
             )
+            # Look for CalypriumRequestTracer extension if active
+            tracer = None
+            if hasattr(self.crawler, 'extensions') and self.crawler.extensions:
+                for ext in self.crawler.extensions.middlewares:
+                    if hasattr(ext, 'record_span'):
+                        tracer = ext
+                        break
+
             self._local_router = SpiderAutoRouter(
                 fetcher=fetcher,
                 cache=self._local_cache,
                 solve_client=self._solve_client,
                 proxy_url=proxy_url,
+                tracer=tracer,
             )
 
             # Slot-stats reporter — periodically batch the local DomainCache's

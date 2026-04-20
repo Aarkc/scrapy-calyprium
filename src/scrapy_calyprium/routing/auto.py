@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -74,11 +76,16 @@ class SpiderAutoRouter:
         target_pool_size: int = 8,
         refill_interval: float = 1.0,
         cold_start_burst: int = 4,
+        tracer=None,
     ):
         self.fetcher = fetcher
         self.cache = cache
         self.solve_client = solve_client
         self.proxy_url = proxy_url
+        # Request tracer — if set, emits per-URL spans to ClickHouse.
+        # Injected by MimicBrowserMiddleware when the CalypriumRequestTracer
+        # extension is active.
+        self.tracer = tracer
         # Per-domain locks for solve coalescing. When 32 concurrent spider
         # requests for the same domain all hit the block path, only one
         # actually calls /api/solve; the rest wait on the lock and reuse the
@@ -346,6 +353,36 @@ class SpiderAutoRouter:
             self.cache._entries.pop(domain, None)
 
     async def fetch(self, url: str, *, domain: str) -> RouteResult:
+        start_time = time.monotonic()
+        trace_id = uuid.uuid4().hex
+        result = await self._fetch_inner(url, domain=domain)
+        # Emit trace span if tracer is active
+        if self.tracer and self.tracer.run_number:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            slot = None
+            if result.slot_id:
+                entry = self.cache.get(domain)
+                if entry:
+                    slot = next((s for s in entry.slots if s.slot_id == result.slot_id), None)
+            self.tracer.record_span(
+                trace_id=trace_id,
+                url=url,
+                domain=domain,
+                component="spider",
+                operation="fetch",
+                status="success" if not result.blocked else "blocked",
+                status_code=result.fetch.status_code if result.fetch else 0,
+                duration_ms=duration_ms,
+                routing_method=result.routing_method,
+                slot_id=result.slot_id or "",
+                egress_ip=slot.egress_ip if slot and slot.egress_ip else "",
+                proxy_session_id=slot.proxy_session_id if slot else "",
+                response_bytes=len(result.fetch.body) if result.fetch and result.fetch.body else 0,
+                error_message=result.error or "",
+            )
+        return result
+
+    async def _fetch_inner(self, url: str, *, domain: str) -> RouteResult:
         # Step 1: heavy with no re-probe due → caller should fall through to legacy
         level = self.cache.get_level(domain)
         if level == "heavy":
