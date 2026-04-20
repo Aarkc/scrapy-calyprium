@@ -140,15 +140,14 @@ class CalypriumRequestTracer:
             "response_bytes": response_bytes,
             "error_message": error_message,
         }
+        batch = None
         with self._lock:
             self._buffer.append(span)
             if len(self._buffer) >= BATCH_SIZE:
                 batch = self._buffer[:]
                 self._buffer.clear()
-        else:
-            return
-        # Flush outside lock
-        self._post_batch(batch)
+        if batch:
+            self._post_batch(batch)
 
     # -- Lifecycle ---------------------------------------------------------
 
