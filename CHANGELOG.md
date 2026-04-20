@@ -1,3 +1,10 @@
+# [1.13.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.12.0...v1.13.0) (2026-04-20)
+
+
+### Features
+
+* **extensions:** CalypriumRequestTracer — per-URL trace spans ([18d4af0](https://github.com/Aarkc/scrapy-calyprium/commit/18d4af068f7f5da9cf62af3a97e83a9c92aa40cd))
+
 # [1.12.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.11.7...v1.12.0) (2026-04-15)
 
 
