@@ -1,3 +1,10 @@
+## [1.13.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.0...v1.13.1) (2026-04-20)
+
+
+### Bug Fixes
+
+* **request_tracer:** syntax error — with/else is not valid Python ([046f544](https://github.com/Aarkc/scrapy-calyprium/commit/046f544212576ff697bff98b8c4d9cf6a3a7f16e))
+
 # [1.13.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.12.0...v1.13.0) (2026-04-20)
 
 
