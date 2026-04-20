@@ -260,7 +260,11 @@ class TestCookieReplayPath:
         assert f.calls[0]["cookies"] == [{"name": "cf_clearance", "value": "abc"}]
 
     @pytest.mark.asyncio
-    async def test_failed_replay_marks_slot_falls_through_to_light(self):
+    async def test_failed_replay_skips_light_goes_to_solve(self):
+        # When cookies exist but replay fails, the router skips the light
+        # probe (domain is already known as "cookies" level) and goes
+        # straight to solve. This avoids poisoning the proxy IP with a
+        # failed httpcloak probe before the browser solve.
         cache = DomainCache()
         slot = cache.set_cookies_from_solve(
             "example.com",
@@ -271,7 +275,7 @@ class TestCookieReplayPath:
 
         f = FakeFetcher()
         f.queue(_blocked_403())  # cookie replay fails
-        f.queue(_blocked_403())  # light path also fails
+        # NO light probe queued — skipped because domain is "cookies" level
         s = FakeSolveClient()
         s.queue(SolveResult(
             success=True,

@@ -467,33 +467,40 @@ class SpiderAutoRouter:
                         status_code=result.status_code,
                     )
 
-        # Step 3: try httpcloak without cookies (light path)
-        try:
-            result = await self.fetcher.fetch(
-                url=url,
-                proxy_url=self.proxy_url,
-            )
-        except LocalFetchError as exc:
-            logger.info(
-                "AutoRouter: light httpcloak failed for %s: %s", domain, exc,
-            )
-            return RouteResult(
-                fetch=None,
-                routing_method="fallback_legacy",
-                blocked=True,
-                domain_level=self.cache.get_level(domain),
-                needs_legacy_fallback=True,
-                error=str(exc),
-            )
+        # Step 3: try httpcloak without cookies (light path).
+        # SKIP if we already know this domain needs cookies — the light
+        # probe always 403s on Turnstile-protected sites and the failed
+        # request poisons the proxy IP's reputation with Cloudflare,
+        # making the subsequent browser solve harder. Only probe domains
+        # we've never seen before.
+        # Skip the light probe for domains already known to need cookies —
+        # the probe always 403s and poisons the proxy IP. Only probe for
+        # unknown/light domains OR heavy domains due for re-probe (Step 1
+        # already checked is_due_for_reprobe and fell through here).
+        current_level = self.cache.get_level(domain)
+        reprobe = current_level == "heavy" and self.cache.is_due_for_reprobe(domain)
+        if current_level in (None, "unknown", "light", "") or reprobe:
+            try:
+                result = await self.fetcher.fetch(
+                    url=url,
+                    proxy_url=self.proxy_url,
+                )
+            except LocalFetchError as exc:
+                logger.info(
+                    "AutoRouter: light httpcloak failed for %s: %s", domain, exc,
+                )
+                result = None
 
-        if not is_blocked(result.status_code, result.body):
-            self.cache.set_light(domain)
-            return RouteResult(
-                fetch=result,
-                routing_method="httpcloak_light",
-                blocked=False,
-                domain_level="light",
-            )
+            if result and not is_blocked(result.status_code, result.body):
+                self.cache.set_light(domain)
+                return RouteResult(
+                    fetch=result,
+                    routing_method="httpcloak_light",
+                    blocked=False,
+                    domain_level="light",
+                )
+        else:
+            result = None  # known cookies/heavy domain, skip light probe
 
         # Step 4: ask Mimic for a solve.
         # Coalesce concurrent solves for the same domain — when a swarm of
@@ -502,9 +509,10 @@ class SpiderAutoRouter:
         # cookies the winner caches. Without this we hammer Mimic and trip
         # its per-domain rate limiter, then fall through to legacy and lose
         # the AAR-12 binary-correctness benefit.
+        block_status = result.status_code if result else 403
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d), calling /api/solve",
-            domain, result.status_code,
+            domain, block_status,
         )
 
         slot = None
