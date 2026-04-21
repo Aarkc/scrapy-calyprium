@@ -1,3 +1,10 @@
+# [1.15.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.14.0...v1.15.0) (2026-04-21)
+
+
+### Features
+
+* thread VEIL_PROVIDER through solve→cache→replay pipeline ([7902d40](https://github.com/Aarkc/scrapy-calyprium/commit/7902d40af7f0dcb3f4e7a96371feab5ea281c41a))
+
 # [1.14.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.2...v1.14.0) (2026-04-21)
 
 
