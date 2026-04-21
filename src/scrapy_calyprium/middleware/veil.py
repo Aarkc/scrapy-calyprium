@@ -9,6 +9,7 @@ Settings:
     CALYPRIUM_API_KEY: API key for authentication (required)
     VEIL_USER_ID: User ID for proxy routing (required)
     VEIL_PROFILE: Optional profile ID for custom routing rules
+    VEIL_PROVIDER: Optional provider name (e.g. webshare_rotating, webshare_static)
     VEIL_PROXY_TYPE: Optional proxy type (datacenter, residential, residential_rotating)
 """
 
@@ -52,12 +53,14 @@ class VeilProxyMiddleware:
         user_id: str,
         profile: Optional[str] = None,
         proxy_type: Optional[str] = None,
+        provider: Optional[str] = None,
     ):
         self.gateway_url = gateway_url
         self.api_key = api_key
         self.user_id = user_id
         self.profile = profile
         self.proxy_type = proxy_type
+        self.provider = provider
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -85,6 +88,7 @@ class VeilProxyMiddleware:
             user_id=user_id,
             profile=crawler.settings.get("VEIL_PROFILE"),
             proxy_type=crawler.settings.get("VEIL_PROXY_TYPE"),
+            provider=crawler.settings.get("VEIL_PROVIDER"),
         )
         crawler.signals.connect(
             middleware.spider_opened, signal=signals.spider_opened
@@ -94,7 +98,8 @@ class VeilProxyMiddleware:
     def spider_opened(self, spider):
         logger.info(
             f"VeilProxyMiddleware: gateway={self.gateway_url}, "
-            f"user={self.user_id}, profile={self.profile or 'default'}"
+            f"user={self.user_id}, provider={self.provider or 'auto'}, "
+            f"profile={self.profile or 'default'}"
         )
 
     def process_request(self, request, spider):
@@ -104,8 +109,10 @@ class VeilProxyMiddleware:
 
         request.meta["proxy"] = self.gateway_url
 
-        # Build username with optional proxy type parameter
+        # Build username with optional routing parameters
         username = self.user_id
+        if self.provider:
+            username = f"{username}-p_{self.provider}"
         if self.proxy_type and self.proxy_type in self.PROXY_TYPE_MAP:
             username = f"{username}-type_{self.PROXY_TYPE_MAP[self.proxy_type]}"
 
