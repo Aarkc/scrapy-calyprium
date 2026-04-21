@@ -73,6 +73,7 @@ class SpiderAutoRouter:
         cache: DomainCache,
         solve_client: SolveClient,
         proxy_url: Optional[str] = None,
+        provider: Optional[str] = None,
         target_pool_size: int = 8,
         refill_interval: float = 1.0,
         cold_start_burst: int = 4,
@@ -82,6 +83,7 @@ class SpiderAutoRouter:
         self.cache = cache
         self.solve_client = solve_client
         self.proxy_url = proxy_url
+        self.provider = provider
         # Request tracer — if set, emits per-URL spans to ClickHouse.
         # Injected by MimicBrowserMiddleware when the CalypriumRequestTracer
         # extension is active.
@@ -218,7 +220,7 @@ class SpiderAutoRouter:
         and a transient failure should not affect spider throughput."""
         try:
             try:
-                solve = await self.solve_client.solve(domain=domain)
+                solve = await self.solve_client.solve(domain=domain, provider=self.provider)
             except SolveError as exc:
                 logger.info(
                     "AutoRouter: refill solve failed for %s: %s", domain, exc,
@@ -237,6 +239,7 @@ class SpiderAutoRouter:
                 proxy_session_id=solve.proxy_session_id,
                 preset=solve.preset,
                 egress_ip=solve.egress_ip,
+                provider=solve.provider,
             )
             entry = self.cache.get(domain)
             new_live = len(entry.live_slots()) if entry else 0
@@ -433,6 +436,7 @@ class SpiderAutoRouter:
                         user_agent=slot.user_agent,
                         proxy_url=self.proxy_url,
                         proxy_session_id=slot.proxy_session_id,
+                        provider=slot.provider,
                         preset=slot.preset,
                     )
                 except LocalFetchError as exc:
@@ -529,7 +533,7 @@ class SpiderAutoRouter:
 
             if slot is None:
                 try:
-                    solve = await self.solve_client.solve(domain=domain, target_url=url)
+                    solve = await self.solve_client.solve(domain=domain, target_url=url, provider=self.provider)
                 except SolveError as exc:
                     logger.warning("AutoRouter: solve failed for %s: %s", domain, exc)
                     return RouteResult(
@@ -562,6 +566,7 @@ class SpiderAutoRouter:
                     proxy_session_id=solve.proxy_session_id,
                     preset=solve.preset,
                     egress_ip=solve.egress_ip,
+                    provider=solve.provider,
                 )
                 # Phase 5: kick off the background refill loop now that
                 # we have at least one slot for this domain. Idempotent —
@@ -576,6 +581,7 @@ class SpiderAutoRouter:
                 user_agent=slot.user_agent,
                 proxy_url=self.proxy_url,
                 proxy_session_id=slot.proxy_session_id,
+                provider=slot.provider,
                 preset=slot.preset,
             )
         except LocalFetchError as exc:

@@ -207,6 +207,7 @@ class MimicBrowserMiddleware:
                 cache=self._local_cache,
                 solve_client=self._solve_client,
                 proxy_url=proxy_url,
+                provider=self.crawler.settings.get("VEIL_PROVIDER"),
                 tracer=tracer,
             )
 

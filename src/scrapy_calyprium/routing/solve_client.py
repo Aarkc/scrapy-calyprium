@@ -31,6 +31,8 @@ class SolveResult:
     # report on failures so Mimic's per-(domain, ip) reputation tracker
     # can rotate around burned IPs across the whole spider fleet.
     egress_ip: Optional[str] = None
+    # Veil provider used for the solve — replay must use the same provider
+    provider: Optional[str] = None
 
 
 class SolveError(Exception):
@@ -88,6 +90,7 @@ class SolveClient:
         target_url: Optional[str] = None,
         engine_hint: Optional[str] = None,
         proxy_session_id: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> SolveResult:
         """Call /api/solve and return the cookies (or a structured failure)."""
         client = await self._get_client()
@@ -98,6 +101,8 @@ class SolveClient:
             body["engine_hint"] = engine_hint
         if proxy_session_id:
             body["proxy_session_id"] = proxy_session_id
+        if provider:
+            body["provider"] = provider
 
         url = f"{self.service_url}/api/solve"
         try:
@@ -157,6 +162,7 @@ class SolveClient:
             duration_ms=int(data.get("duration_ms", 0)),
             learned_rpm_cap=data.get("learned_rpm_cap"),
             egress_ip=data.get("egress_ip"),
+            provider=data.get("provider"),
         )
 
     async def report_ip_outcome(

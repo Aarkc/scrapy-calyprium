@@ -123,16 +123,25 @@ class LocalFetchError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _inject_proxy_session(proxy_url: str, proxy_session_id: str) -> str:
-    """Inject a sticky proxy session id into the proxy URL username.
+def _inject_proxy_session(
+    proxy_url: str,
+    proxy_session_id: str,
+    provider: Optional[str] = None,
+) -> str:
+    """Inject sticky proxy session and provider into the proxy URL username.
 
-    Mirrors the server-side mimic.routing.httpcloak helper so the spider can
-    request the same upstream IP that earned a cookie.
+    Encodes the provider (e.g. webshare_rotating) and session id into the
+    gateway proxy username so the Veil gateway routes through the correct
+    upstream with sticky IP pinning.
     """
     parsed = urlparse(proxy_url)
     if not parsed.username:
         return proxy_url
-    new_user = f"{parsed.username}-p_webshare_rotating-session_{proxy_session_id}"
+    parts = [parsed.username]
+    if provider:
+        parts.append(f"p_{provider}")
+    parts.append(f"session_{proxy_session_id}")
+    new_user = "-".join(parts)
     netloc = f"{new_user}:{parsed.password}@{parsed.hostname}"
     if parsed.port:
         netloc += f":{parsed.port}"
@@ -206,6 +215,7 @@ class LocalFetcher:
         user_agent: Optional[str] = None,
         proxy_url: Optional[str] = None,
         proxy_session_id: Optional[str] = None,
+        provider: Optional[str] = None,
         preset: Optional[str] = None,
         timeout: Optional[int] = None,
         extra_headers: Optional[Dict[str, str]] = None,
@@ -246,6 +256,7 @@ class LocalFetcher:
                 user_agent=user_agent,
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
+                provider=provider,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
@@ -257,6 +268,7 @@ class LocalFetcher:
                 user_agent=user_agent,
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
+                provider=provider,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
@@ -276,6 +288,7 @@ class LocalFetcher:
         user_agent: Optional[str],
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
+        provider: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
@@ -287,7 +300,7 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id)
+            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
 
         headers: Dict[str, str] = {}
         if user_agent:
@@ -372,6 +385,7 @@ class LocalFetcher:
         user_agent: Optional[str],
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
+        provider: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
@@ -392,7 +406,7 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id)
+            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
 
         proxies = None
         if effective_proxy:

@@ -84,6 +84,9 @@ class CookieSlot:
     # couldn't resolve it (no proxy creds, probe failed) — the slot is
     # still usable, it just contributes no reputation signal.
     egress_ip: Optional[str] = None
+    # Veil provider used for the solve — replay must route through the same
+    # provider so cookies stay valid for the upstream IP.
+    provider: Optional[str] = None
     _request_times: List[float] = field(default_factory=list)
 
     @property
@@ -299,6 +302,7 @@ class DomainCache:
         proxy_session_id: str,
         preset: str = "chrome-latest",
         egress_ip: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> CookieSlot:
         """Add a new cookie slot from a Mimic /api/solve response."""
         entry = self._entries.get(domain)
@@ -313,6 +317,7 @@ class DomainCache:
             proxy_session_id=proxy_session_id,
             preset=preset,
             egress_ip=egress_ip,
+            provider=provider,
         )
         entry.slots.append(slot)
         if len(entry.slots) > MAX_SLOTS_PER_DOMAIN:
