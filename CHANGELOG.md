@@ -1,3 +1,10 @@
+# [1.14.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.2...v1.14.0) (2026-04-21)
+
+
+### Features
+
+* add VEIL_PROVIDER setting for upstream provider selection ([ad542bd](https://github.com/Aarkc/scrapy-calyprium/commit/ad542bda8ba9d76aaabb7615b9a1578e4b7b84b9))
+
 ## [1.13.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.13.1...v1.13.2) (2026-04-20)
 
 
