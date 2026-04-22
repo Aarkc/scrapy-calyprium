@@ -128,12 +128,14 @@ def _make_router(
     cache: Optional[DomainCache] = None,
     proxy_url: Optional[str] = None,
 ):
-    return SpiderAutoRouter(
+    router = SpiderAutoRouter(
         fetcher=fetcher or FakeFetcher(),
         cache=cache or DomainCache(),
         solve_client=solve or FakeSolveClient(),
         proxy_url=proxy_url,
+        target_pool_size=0,  # disable refill in tests
     )
+    return router
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +198,7 @@ class TestSolvePath:
 
         cache = DomainCache()
         router = _make_router(fetcher=f, solve=s, cache=cache)
+        router.solve_parallel_solves = 1  # deterministic for testing
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
@@ -225,6 +228,7 @@ class TestSolvePath:
         cache = DomainCache()
         router = _make_router(fetcher=f, solve=s, cache=cache)
         router.solve_max_retries = 3
+        router.solve_parallel_solves = 1
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
@@ -245,6 +249,7 @@ class TestSolvePath:
         cache = DomainCache()
         router = _make_router(fetcher=f, solve=s, cache=cache)
         router.solve_max_retries = 2
+        router.solve_parallel_solves = 1
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
@@ -262,6 +267,7 @@ class TestSolvePath:
         f.queue(_ok())
         router = _make_router(fetcher=f, solve=s)
         router.solve_max_retries = 3
+        router.solve_parallel_solves = 1
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
@@ -326,6 +332,7 @@ class TestCookieReplayPath:
         ))
         f.queue(_ok())  # post-solve replay
         router = _make_router(fetcher=f, solve=s, cache=cache)
+        router.solve_parallel_solves = 1
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
@@ -356,6 +363,7 @@ class TestHeavyDomainBehavior:
         s = FakeSolveClient()
         s.queue(_solve_ok())
         router = _make_router(fetcher=f, solve=s, cache=cache)
+        router.solve_parallel_solves = 1
 
         result = await router.fetch("https://example.com/", domain="example.com")
 

@@ -78,6 +78,7 @@ class SpiderAutoRouter:
         refill_interval: float = 1.0,
         cold_start_burst: int = 4,
         solve_max_retries: int = 5,
+        solve_parallel_solves: int = 3,
         tracer=None,
     ):
         self.fetcher = fetcher
@@ -122,6 +123,7 @@ class SpiderAutoRouter:
         # refill_interval cadence.
         self.cold_start_burst = cold_start_burst
         self.solve_max_retries = solve_max_retries
+        self.solve_parallel_solves = solve_parallel_solves
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
         # Last hot-path refill check per domain. The original design used a
@@ -497,22 +499,23 @@ class SpiderAutoRouter:
         else:
             result = None  # known cookies/heavy domain, skip light probe
 
-        # Step 4: solve for cookies, retrying with fresh IPs on failure.
-        # Each attempt gets a new session_id → new IP from the rotating pool.
-        # Concurrent requests coalesce on the per-domain lock so only one
-        # actually calls /api/solve; the rest reuse the winner's cookies.
+        # Step 4: solve for cookies with parallel attempts.
+        #
+        # Fire solve_parallel_solves concurrent solve requests, each with a
+        # different session_id → different IP.  First one to succeed populates
+        # the cache; the rest are bonus slots for the pool.  Concurrent spider
+        # requests that arrive while a solve batch is in flight wait on the
+        # per-domain lock briefly, then coalesce on the winner's cookies.
         block_status = result.status_code if result else 403
         logger.info(
-            "AutoRouter: %s blocked at httpcloak (status=%d), calling /api/solve",
+            "AutoRouter: %s blocked at httpcloak (status=%d), solving",
             domain, block_status,
         )
 
-        last_error = None
         for attempt in range(1, self.solve_max_retries + 1):
-            slot = None
+            # Quick lock to check cache — release immediately so concurrent
+            # requests can coalesce on a slot if one just appeared.
             async with self._solve_lock(domain):
-                # Re-check the cache — another concurrent caller may have
-                # already populated a fresh slot while we were waiting.
                 entry = self.cache.get(domain)
                 if entry and entry.level == "cookies" and entry.live_slots():
                     slot = entry.next_slot()
@@ -520,88 +523,41 @@ class SpiderAutoRouter:
                         "AutoRouter: %s solve coalesced — reusing fresh slot",
                         domain,
                     )
+                    return await self._replay_with_slot(url, domain, slot, result)
 
-                if slot is None:
-                    try:
-                        solve = await self.solve_client.solve(
-                            domain=domain, target_url=url, provider=self.provider,
-                        )
-                    except SolveError as exc:
-                        last_error = str(exc)
-                        logger.info(
-                            "AutoRouter: solve attempt %d/%d failed for %s: %s",
-                            attempt, self.solve_max_retries, domain, exc,
-                        )
-                        # Brief pause before retry so Mimic rate limiter resets
-                        await asyncio.sleep(min(attempt * 2, 10))
-                        continue
+            # No slot available — fire parallel solves outside the lock so
+            # other requests aren't blocked during the ~15s solve duration.
+            n = min(self.solve_parallel_solves, self.solve_max_retries - attempt + 1)
+            tasks = [
+                asyncio.create_task(self._try_one_solve(domain, url))
+                for _ in range(n)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    if not solve.success:
-                        last_error = solve.error or "solve returned no cookies"
-                        logger.info(
-                            "AutoRouter: solve attempt %d/%d returned no cookies "
-                            "for %s (trying new IP)",
-                            attempt, self.solve_max_retries, domain,
-                        )
-                        await asyncio.sleep(min(attempt * 2, 10))
-                        continue
+            # Find the first successful solve
+            winning_slot = None
+            last_error = None
+            for r in results:
+                if isinstance(r, Exception):
+                    last_error = str(r)
+                elif r is not None:
+                    winning_slot = winning_slot or r  # keep first winner
 
-                    slot = self.cache.set_cookies_from_solve(
-                        domain=domain,
-                        cookies=solve.cookies,
-                        user_agent=solve.user_agent,
-                        proxy_session_id=solve.proxy_session_id,
-                        preset=solve.preset,
-                        egress_ip=solve.egress_ip,
-                        provider=solve.provider,
-                    )
-                    self._ensure_refill_task(domain)
+            if winning_slot is not None:
+                return await self._replay_with_slot(url, domain, winning_slot, result)
 
-            # Got a slot (from solve or coalescing) — replay with cookies
-            self.cache.record_request(domain, slot.slot_id)
-            try:
-                replay = await self.fetcher.fetch(
-                    url=url,
-                    cookies=slot.cookies,
-                    user_agent=slot.user_agent,
-                    proxy_url=self.proxy_url,
-                    proxy_session_id=slot.proxy_session_id,
-                    provider=slot.provider,
-                    preset=slot.preset,
-                )
-            except LocalFetchError as exc:
-                logger.warning(
-                    "AutoRouter: post-solve replay error for %s: %s", domain, exc,
-                )
-                last_error = str(exc)
-                continue
-
-            if is_blocked(replay.status_code, replay.body):
-                self.cache.record_slot_failure(
-                    domain, slot.slot_id, status_code=replay.status_code,
-                )
-                self._report_ip_outcome(
-                    domain=domain, slot=slot, outcome="blocked",
-                    status_code=replay.status_code,
-                )
-                last_error = f"replay blocked (status={replay.status_code})"
-                continue
-
-            self._report_ip_outcome(
-                domain=domain, slot=slot, outcome="success",
+            # All parallel attempts failed — brief pause before next round
+            logger.info(
+                "AutoRouter: solve round %d/%d: %d parallel attempts all failed "
+                "for %s, retrying",
+                attempt, self.solve_max_retries, n, domain,
             )
-            return RouteResult(
-                fetch=replay,
-                routing_method="solve_then_replay",
-                blocked=False,
-                domain_level="cookies",
-                slot_id=slot.slot_id,
-            )
+            await asyncio.sleep(min(attempt * 2, 10))
 
         # All retries exhausted
         logger.warning(
-            "AutoRouter: all %d solve attempts failed for %s: %s",
-            self.solve_max_retries, domain, last_error,
+            "AutoRouter: all solve attempts exhausted for %s: %s",
+            domain, last_error,
         )
         return RouteResult(
             fetch=result,
@@ -609,4 +565,88 @@ class SpiderAutoRouter:
             blocked=True,
             domain_level="cookies",
             error=last_error,
+        )
+
+    async def _try_one_solve(self, domain: str, url: str):
+        """Attempt a single solve. Returns a CookieSlot on success, None on failure."""
+        try:
+            solve = await self.solve_client.solve(
+                domain=domain, target_url=url, provider=self.provider,
+            )
+        except SolveError as exc:
+            logger.debug("AutoRouter: solve attempt failed for %s: %s", domain, exc)
+            return None
+
+        if not solve.success:
+            logger.debug(
+                "AutoRouter: solve returned no cookies for %s", domain,
+            )
+            return None
+
+        slot = self.cache.set_cookies_from_solve(
+            domain=domain,
+            cookies=solve.cookies,
+            user_agent=solve.user_agent,
+            proxy_session_id=solve.proxy_session_id,
+            preset=solve.preset,
+            egress_ip=solve.egress_ip,
+            provider=solve.provider,
+        )
+        logger.info(
+            "AutoRouter: solve succeeded for %s (egress_ip=%s)",
+            domain, solve.egress_ip,
+        )
+        self._ensure_refill_task(domain)
+        return slot
+
+    async def _replay_with_slot(self, url, domain, slot, original_result):
+        """Replay a URL with a cookie slot. Returns RouteResult."""
+        self.cache.record_request(domain, slot.slot_id)
+        try:
+            replay = await self.fetcher.fetch(
+                url=url,
+                cookies=slot.cookies,
+                user_agent=slot.user_agent,
+                proxy_url=self.proxy_url,
+                proxy_session_id=slot.proxy_session_id,
+                provider=slot.provider,
+                preset=slot.preset,
+            )
+        except LocalFetchError as exc:
+            logger.warning(
+                "AutoRouter: replay error for %s: %s", domain, exc,
+            )
+            return RouteResult(
+                fetch=original_result,
+                routing_method="solve_then_replay",
+                blocked=True,
+                domain_level="cookies",
+                error=str(exc),
+            )
+
+        if is_blocked(replay.status_code, replay.body):
+            self.cache.record_slot_failure(
+                domain, slot.slot_id, status_code=replay.status_code,
+            )
+            self._report_ip_outcome(
+                domain=domain, slot=slot, outcome="blocked",
+                status_code=replay.status_code,
+            )
+            return RouteResult(
+                fetch=replay,
+                routing_method="solve_then_replay",
+                blocked=True,
+                domain_level="cookies",
+                error=f"replay blocked (status={replay.status_code})",
+            )
+
+        self._report_ip_outcome(
+            domain=domain, slot=slot, outcome="success",
+        )
+        return RouteResult(
+            fetch=replay,
+            routing_method="solve_then_replay",
+            blocked=False,
+            domain_level="cookies",
+            slot_id=slot.slot_id,
         )

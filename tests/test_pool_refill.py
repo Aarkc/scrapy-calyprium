@@ -106,6 +106,7 @@ def _make_router(target=4, interval=0.05):
         proxy_url=None,
         target_pool_size=target,
         refill_interval=interval,
+        solve_parallel_solves=1,  # deterministic for testing
     )
 
 
