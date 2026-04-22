@@ -1,3 +1,10 @@
+## [1.15.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.15.0...v1.15.1) (2026-04-22)
+
+
+### Bug Fixes
+
+* **routing:** retry solve with new IPs instead of falling back to legacy browser ([4fd1a61](https://github.com/Aarkc/scrapy-calyprium/commit/4fd1a61d2d760de04aa89c55e0b1b74f2d69a983))
+
 # [1.15.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.14.0...v1.15.0) (2026-04-21)
 
 
