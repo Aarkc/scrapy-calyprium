@@ -262,7 +262,7 @@ class TestHeaderInjection:
 
         proxy = fake_httpcloak.Session.last_init["proxy"]
         assert "session_sess-abc" in proxy
-        assert "user-p_webshare_rotating-session_sess-abc" in proxy
+        assert "user-session_sess-abc" in proxy
 
     @pytest.mark.asyncio
     async def test_no_proxy_session_when_no_proxy(self, fake_httpcloak, fetcher):

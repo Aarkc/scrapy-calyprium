@@ -276,6 +276,7 @@ class TestRouterReportsIPOutcome:
         solve = FakeSolveClient()
         solve.queue(_solve_result_with_egress("203.0.113.10"))
         router = _make_router(fetcher=fetcher, solve=solve)
+        router.solve_max_retries = 1  # single attempt so test is deterministic
 
         await router.fetch("https://example.com/", domain="example.com")
         import asyncio
@@ -296,6 +297,7 @@ class TestRouterReportsIPOutcome:
         solve = FakeSolveClient()
         solve.queue(_solve_result_with_egress(None))
         router = _make_router(fetcher=fetcher, solve=solve)
+        router.solve_max_retries = 1
 
         await router.fetch("https://example.com/", domain="example.com")
         import asyncio
@@ -334,6 +336,7 @@ class TestRouterReportsIPOutcome:
         solve.queue(_solve_result_with_egress("203.0.113.99"))
 
         router = _make_router(fetcher=fetcher, solve=solve, cache=cache)
+        router.solve_max_retries = 1
         await router.fetch("https://example.com/", domain="example.com")
         import asyncio
         await asyncio.sleep(0)

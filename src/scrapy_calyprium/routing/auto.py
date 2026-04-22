@@ -52,10 +52,10 @@ logger = logging.getLogger(__name__)
 class RouteResult:
     """Outcome of an auto-route attempt."""
     fetch: Optional[LocalFetchResult]
-    routing_method: str  # "httpcloak_light" | "httpcloak_cookies" | "solve_then_replay" | "fallback_legacy"
+    routing_method: str  # "httpcloak_light" | "httpcloak_cookies" | "solve_then_replay"
     blocked: bool
     domain_level: str
-    needs_legacy_fallback: bool = False
+    needs_legacy_fallback: bool = False  # deprecated — solve retries instead of falling back
     error: Optional[str] = None
     # Identifier of the cookie slot used for this fetch (cookies / solve_then_replay
     # paths only). The middleware stuffs this into request.meta so the spider's
@@ -77,6 +77,7 @@ class SpiderAutoRouter:
         target_pool_size: int = 8,
         refill_interval: float = 1.0,
         cold_start_burst: int = 4,
+        solve_max_retries: int = 5,
         tracer=None,
     ):
         self.fetcher = fetcher
@@ -120,6 +121,7 @@ class SpiderAutoRouter:
         # away. After the burst, refills go back to one-at-a-time at
         # refill_interval cadence.
         self.cold_start_burst = cold_start_burst
+        self.solve_max_retries = solve_max_retries
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
         # Last hot-path refill check per domain. The original design used a
@@ -386,20 +388,9 @@ class SpiderAutoRouter:
         return result
 
     async def _fetch_inner(self, url: str, *, domain: str) -> RouteResult:
-        # Step 1: heavy with no re-probe due → caller should fall through to legacy
-        level = self.cache.get_level(domain)
-        if level == "heavy":
-            if not self.cache.is_due_for_reprobe(domain):
-                return RouteResult(
-                    fetch=None,
-                    routing_method="fallback_legacy",
-                    blocked=True,
-                    domain_level=level,
-                    needs_legacy_fallback=True,
-                )
-            logger.info(
-                "AutoRouter: %s heavy but due for re-probe, trying httpcloak", domain,
-            )
+        # No "heavy" bail-out.  When every slot is dead the right move is to
+        # solve again with a fresh IP, not to fall through to the legacy
+        # browser path (which also gets 403 without cookies).
 
         # Step 2: cookies in pool → try replay
         entry = self.cache.get(domain)
@@ -506,118 +497,116 @@ class SpiderAutoRouter:
         else:
             result = None  # known cookies/heavy domain, skip light probe
 
-        # Step 4: ask Mimic for a solve.
-        # Coalesce concurrent solves for the same domain — when a swarm of
-        # spider requests all hit the block path at once, only one calls
-        # /api/solve; the rest wait on the per-domain lock and reuse the
-        # cookies the winner caches. Without this we hammer Mimic and trip
-        # its per-domain rate limiter, then fall through to legacy and lose
-        # the AAR-12 binary-correctness benefit.
+        # Step 4: solve for cookies, retrying with fresh IPs on failure.
+        # Each attempt gets a new session_id → new IP from the rotating pool.
+        # Concurrent requests coalesce on the per-domain lock so only one
+        # actually calls /api/solve; the rest reuse the winner's cookies.
         block_status = result.status_code if result else 403
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d), calling /api/solve",
             domain, block_status,
         )
 
-        slot = None
-        async with self._solve_lock(domain):
-            # Re-check the cache — another concurrent caller may have already
-            # populated a fresh slot while we were waiting on the lock.
-            entry = self.cache.get(domain)
-            if entry and entry.level == "cookies" and entry.live_slots():
-                slot = entry.next_slot()
-                logger.debug(
-                    "AutoRouter: %s solve coalesced — reusing fresh slot from concurrent solve",
-                    domain,
-                )
-
-            if slot is None:
-                try:
-                    solve = await self.solve_client.solve(domain=domain, target_url=url, provider=self.provider)
-                except SolveError as exc:
-                    logger.warning("AutoRouter: solve failed for %s: %s", domain, exc)
-                    return RouteResult(
-                        fetch=result,
-                        routing_method="fallback_legacy",
-                        blocked=True,
-                        domain_level=self.cache.get_level(domain),
-                        needs_legacy_fallback=True,
-                        error=str(exc),
+        last_error = None
+        for attempt in range(1, self.solve_max_retries + 1):
+            slot = None
+            async with self._solve_lock(domain):
+                # Re-check the cache — another concurrent caller may have
+                # already populated a fresh slot while we were waiting.
+                entry = self.cache.get(domain)
+                if entry and entry.level == "cookies" and entry.live_slots():
+                    slot = entry.next_slot()
+                    logger.debug(
+                        "AutoRouter: %s solve coalesced — reusing fresh slot",
+                        domain,
                     )
 
-                if not solve.success:
-                    self.cache._maybe_promote_heavy(domain, "solve_returned_no_cookies")
-                    return RouteResult(
-                        fetch=result,
-                        routing_method="fallback_legacy",
-                        blocked=True,
-                        domain_level="heavy",
-                        needs_legacy_fallback=True,
-                        error=solve.error or "solve returned no cookies",
+                if slot is None:
+                    try:
+                        solve = await self.solve_client.solve(
+                            domain=domain, target_url=url, provider=self.provider,
+                        )
+                    except SolveError as exc:
+                        last_error = str(exc)
+                        logger.info(
+                            "AutoRouter: solve attempt %d/%d failed for %s: %s",
+                            attempt, self.solve_max_retries, domain, exc,
+                        )
+                        # Brief pause before retry so Mimic rate limiter resets
+                        await asyncio.sleep(min(attempt * 2, 10))
+                        continue
+
+                    if not solve.success:
+                        last_error = solve.error or "solve returned no cookies"
+                        logger.info(
+                            "AutoRouter: solve attempt %d/%d returned no cookies "
+                            "for %s (trying new IP)",
+                            attempt, self.solve_max_retries, domain,
+                        )
+                        await asyncio.sleep(min(attempt * 2, 10))
+                        continue
+
+                    slot = self.cache.set_cookies_from_solve(
+                        domain=domain,
+                        cookies=solve.cookies,
+                        user_agent=solve.user_agent,
+                        proxy_session_id=solve.proxy_session_id,
+                        preset=solve.preset,
+                        egress_ip=solve.egress_ip,
+                        provider=solve.provider,
                     )
+                    self._ensure_refill_task(domain)
 
-                # Cache the new slot. Carry the egress_ip Mimic resolved
-                # for this proxy_session_id so the spider's failure feedback
-                # can name a physical IP rather than just a session token.
-                slot = self.cache.set_cookies_from_solve(
-                    domain=domain,
-                    cookies=solve.cookies,
-                    user_agent=solve.user_agent,
-                    proxy_session_id=solve.proxy_session_id,
-                    preset=solve.preset,
-                    egress_ip=solve.egress_ip,
-                    provider=solve.provider,
+            # Got a slot (from solve or coalescing) — replay with cookies
+            self.cache.record_request(domain, slot.slot_id)
+            try:
+                replay = await self.fetcher.fetch(
+                    url=url,
+                    cookies=slot.cookies,
+                    user_agent=slot.user_agent,
+                    proxy_url=self.proxy_url,
+                    proxy_session_id=slot.proxy_session_id,
+                    provider=slot.provider,
+                    preset=slot.preset,
                 )
-                # Phase 5: kick off the background refill loop now that
-                # we have at least one slot for this domain. Idempotent —
-                # safe to call repeatedly.
-                self._ensure_refill_task(domain)
-        # Track the post-solve replay against the new slot's RPM window too
-        self.cache.record_request(domain, slot.slot_id)
-        try:
-            replay = await self.fetcher.fetch(
-                url=url,
-                cookies=slot.cookies,
-                user_agent=slot.user_agent,
-                proxy_url=self.proxy_url,
-                proxy_session_id=slot.proxy_session_id,
-                provider=slot.provider,
-                preset=slot.preset,
-            )
-        except LocalFetchError as exc:
-            logger.warning("AutoRouter: post-solve replay infra error for %s: %s", domain, exc)
-            return RouteResult(
-                fetch=None,
-                routing_method="solve_then_replay",
-                blocked=True,
-                domain_level="cookies",
-                needs_legacy_fallback=True,
-                error=str(exc),
-            )
+            except LocalFetchError as exc:
+                logger.warning(
+                    "AutoRouter: post-solve replay error for %s: %s", domain, exc,
+                )
+                last_error = str(exc)
+                continue
 
-        if is_blocked(replay.status_code, replay.body):
-            self.cache.record_slot_failure(
-                domain, slot.slot_id, status_code=replay.status_code,
-            )
+            if is_blocked(replay.status_code, replay.body):
+                self.cache.record_slot_failure(
+                    domain, slot.slot_id, status_code=replay.status_code,
+                )
+                self._report_ip_outcome(
+                    domain=domain, slot=slot, outcome="blocked",
+                    status_code=replay.status_code,
+                )
+                last_error = f"replay blocked (status={replay.status_code})"
+                continue
+
             self._report_ip_outcome(
-                domain=domain, slot=slot, outcome="blocked",
-                status_code=replay.status_code,
+                domain=domain, slot=slot, outcome="success",
             )
             return RouteResult(
                 fetch=replay,
                 routing_method="solve_then_replay",
-                blocked=True,
+                blocked=False,
                 domain_level="cookies",
-                needs_legacy_fallback=True,
+                slot_id=slot.slot_id,
             )
 
-        self._report_ip_outcome(
-            domain=domain, slot=slot, outcome="success",
+        # All retries exhausted
+        logger.warning(
+            "AutoRouter: all %d solve attempts failed for %s: %s",
+            self.solve_max_retries, domain, last_error,
         )
         return RouteResult(
-            fetch=replay,
+            fetch=result,
             routing_method="solve_then_replay",
-            blocked=False,
+            blocked=True,
             domain_level="cookies",
-            slot_id=slot.slot_id,
+            error=last_error,
         )

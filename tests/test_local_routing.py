@@ -108,6 +108,20 @@ def _real_pdf():
     )
 
 
+def _solve_ok(**overrides):
+    defaults = dict(
+        success=True,
+        cookies=[{"name": "cf_clearance", "value": "x"}],
+        user_agent="Mozilla/5.0 Test",
+        proxy_session_id="sess-1",
+        engine="camoufox",
+        preset="chrome-latest",
+        duration_ms=12000,
+    )
+    defaults.update(overrides)
+    return SolveResult(**defaults)
+
+
 def _make_router(
     fetcher: Optional[FakeFetcher] = None,
     solve: Optional[FakeSolveClient] = None,
@@ -194,41 +208,65 @@ class TestSolvePath:
         assert f.calls[1]["proxy_session_id"] == "sess-1"
 
     @pytest.mark.asyncio
-    async def test_solve_returns_no_cookies_falls_through(self):
+    async def test_solve_retries_on_no_cookies(self):
+        """When a solve returns no cookies, the router retries with a new IP
+        instead of falling back to legacy."""
+        f = FakeFetcher()
+        f.queue(_blocked_403())  # initial light probe
+        s = FakeSolveClient()
+        # First 2 attempts fail, third succeeds
+        for _ in range(2):
+            s.queue(SolveResult(
+                success=False, cookies=[], user_agent="", proxy_session_id="",
+                engine="", preset="", duration_ms=100, error="blocked",
+            ))
+        s.queue(_solve_ok())
+        f.queue(_ok())  # post-solve replay succeeds
+        cache = DomainCache()
+        router = _make_router(fetcher=f, solve=s, cache=cache)
+        router.solve_max_retries = 3
+
+        result = await router.fetch("https://example.com/", domain="example.com")
+
+        assert result.blocked is False
+        assert len(s.calls) == 3  # tried 3 times
+
+    @pytest.mark.asyncio
+    async def test_solve_exhausts_retries(self):
+        """All solve retries fail → blocked result, no legacy fallback."""
         f = FakeFetcher()
         f.queue(_blocked_403())
         s = FakeSolveClient()
-        s.queue(SolveResult(
-            success=False,
-            cookies=[],
-            user_agent="",
-            proxy_session_id="",
-            engine="",
-            preset="",
-            duration_ms=10000,
-            error="real domain block",
-        ))
+        for _ in range(2):
+            s.queue(SolveResult(
+                success=False, cookies=[], user_agent="", proxy_session_id="",
+                engine="", preset="", duration_ms=100, error="blocked",
+            ))
         cache = DomainCache()
         router = _make_router(fetcher=f, solve=s, cache=cache)
+        router.solve_max_retries = 2
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
         assert result.blocked is True
-        assert result.needs_legacy_fallback is True
+        assert len(s.calls) == 2
 
     @pytest.mark.asyncio
-    async def test_solve_transport_error_falls_through(self):
+    async def test_solve_retries_on_transport_error(self):
+        """Transport errors trigger retry with new IP, not legacy fallback."""
         f = FakeFetcher()
         f.queue(_blocked_403())
         s = FakeSolveClient()
         s.queue(SolveError("mimic unreachable"))
+        s.queue(_solve_ok())
+        f.queue(_ok())
         router = _make_router(fetcher=f, solve=s)
+        router.solve_max_retries = 3
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
-        assert result.blocked is True
-        assert result.needs_legacy_fallback is True
-        assert "mimic unreachable" in (result.error or "")
+        assert result.blocked is False
+        assert len(s.calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +339,10 @@ class TestCookieReplayPath:
 # ---------------------------------------------------------------------------
 
 
-class TestHeavyFallThrough:
+class TestHeavyDomainBehavior:
     @pytest.mark.asyncio
-    async def test_heavy_domain_signals_legacy_fallback(self):
+    async def test_heavy_domain_still_tries_solve(self):
+        """Heavy domains don't bail out — they solve for fresh cookies."""
         from scrapy_calyprium.routing.domain_cache import DomainEntry, TTL_HEAVY
 
         cache = DomainCache()
@@ -312,14 +351,16 @@ class TestHeavyFallThrough:
         )
         cache._entries["example.com"]._next_reprobe_at = time.time() + 9999
 
-        router = _make_router(cache=cache)
+        f = FakeFetcher()
+        f.queue(_ok())  # post-solve replay
+        s = FakeSolveClient()
+        s.queue(_solve_ok())
+        router = _make_router(fetcher=f, solve=s, cache=cache)
 
         result = await router.fetch("https://example.com/", domain="example.com")
 
-        assert result.needs_legacy_fallback is True
-        assert result.blocked is True
-        assert result.domain_level == "heavy"
-        assert result.routing_method == "fallback_legacy"
+        assert result.blocked is False
+        assert len(s.calls) == 1  # went straight to solve
 
     @pytest.mark.asyncio
     async def test_heavy_due_for_reprobe_attempts_httpcloak(self):
