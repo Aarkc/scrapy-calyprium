@@ -1,3 +1,10 @@
+# [1.16.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.15.1...v1.16.0) (2026-04-22)
+
+
+### Features
+
+* **routing:** parallel solve attempts and non-blocking solve lock ([2eae9aa](https://github.com/Aarkc/scrapy-calyprium/commit/2eae9aa5eb51b098fc05286984cb232d3cbb4798))
+
 ## [1.15.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.15.0...v1.15.1) (2026-04-22)
 
 
