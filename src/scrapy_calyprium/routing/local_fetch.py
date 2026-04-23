@@ -467,8 +467,14 @@ class LocalFetcher:
 
         body: bytes = response.content or b""
 
+        # Strip Content-Encoding and Content-Length — curl_cffi transparently
+        # decompresses the body, so the original encoding no longer applies.
+        # Without this, Scrapy's HttpCompressionMiddleware tries to decompress
+        # the already-decompressed body → gzip.BadGzipFile.
         clean_headers: Dict[str, str] = {}
         for k, v in response.headers.items():
+            if str(k).lower() in ("content-encoding", "content-length"):
+                continue
             clean_headers[str(k)] = str(v)
 
         return LocalFetchResult(
