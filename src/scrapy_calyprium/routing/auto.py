@@ -394,11 +394,28 @@ class SpiderAutoRouter:
         # solve again with a fresh IP, not to fall through to the legacy
         # browser path (which also gets 403 without cookies).
 
-        # Step 2: cookies in pool → try replay.
-        # Skip if the domain is "light" — the light path works without
-        # cookies, so don't waste time on cookie replay + rate cap.
+        # Step 2a: always try light path first. If curl_cffi's fingerprint
+        # passes without cookies, there's no need for cookie replay at all.
+        # This avoids the rate cap from dead cookie slots throttling the
+        # entire spider.
         entry = self.cache.get(domain)
         level = entry.level if entry else None
+        try:
+            light_result = await self.fetcher.fetch(
+                url=url, proxy_url=self.proxy_url,
+            )
+        except LocalFetchError:
+            light_result = None
+        if light_result and not is_blocked(light_result.status_code, light_result.body):
+            self.cache.set_light(domain)
+            return RouteResult(
+                fetch=light_result,
+                routing_method="httpcloak_light",
+                blocked=False,
+                domain_level="light",
+            )
+
+        # Step 2b: light path failed → try cookie replay if available.
         if entry and level == "cookies":
             slot = entry.next_slot()
             if slot:
@@ -468,44 +485,8 @@ class SpiderAutoRouter:
                     )
 
         # Step 3: try httpcloak without cookies (light path).
-        # SKIP if we already know this domain needs cookies — the light
-        # probe always 403s on Turnstile-protected sites and the failed
-        # request poisons the proxy IP's reputation with Cloudflare,
-        # making the subsequent browser solve harder. Only probe domains
-        # we've never seen before.
-        # Skip the light probe for domains already known to need cookies —
-        # the probe always 403s and poisons the proxy IP. Only probe for
-        # unknown/light domains OR heavy domains due for re-probe (Step 1
-        # already checked is_due_for_reprobe and fell through here).
-        current_level = self.cache.get_level(domain)
-        reprobe = current_level == "heavy" and self.cache.is_due_for_reprobe(domain)
-        # Also try light path when all cookie slots are exhausted — the
-        # domain may have been mis-classified as "cookies" from early
-        # solve failures, but the light path (curl_cffi firefox135) may
-        # pass without cookies at all.
-        cookies_exhausted = (
-            current_level == "cookies" and entry and not entry.live_slots()
-        )
-        if current_level in (None, "unknown", "light", "") or reprobe or cookies_exhausted:
-            try:
-                result = await self.fetcher.fetch(
-                    url=url,
-                    proxy_url=self.proxy_url,
-                )
-            except LocalFetchError as exc:
-                logger.info(
-                    "AutoRouter: light httpcloak failed for %s: %s", domain, exc,
-                )
-                result = None
-
-            if result and not is_blocked(result.status_code, result.body):
-                self.cache.set_light(domain)
-                return RouteResult(
-                    fetch=result,
-                    routing_method="httpcloak_light",
-                    blocked=False,
-                    domain_level="light",
-                )
+        # Step 3: light path already tried in Step 2a above. If we're here,
+        # both light and cookie paths failed.
         else:
             result = None  # known cookies/heavy domain, skip light probe
 
