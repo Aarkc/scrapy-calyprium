@@ -1,3 +1,10 @@
+# [1.18.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.17.1...v1.18.0) (2026-04-23)
+
+
+### Features
+
+* **routing:** add detailed replay logging for cookie/fingerprint debugging ([6f4614c](https://github.com/Aarkc/scrapy-calyprium/commit/6f4614c2aef458e287504df78bbd47ac19377344))
+
 ## [1.17.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.17.0...v1.17.1) (2026-04-23)
 
 
