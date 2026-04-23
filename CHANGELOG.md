@@ -1,3 +1,10 @@
+## [1.18.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.1...v1.18.2) (2026-04-23)
+
+
+### Bug Fixes
+
+* **routing:** don't re-promote "light" domains to "cookies" on stale solves ([ad2cf0d](https://github.com/Aarkc/scrapy-calyprium/commit/ad2cf0d1439ae85ea019321ee9a4acf987b2c246))
+
 ## [1.18.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.0...v1.18.1) (2026-04-23)
 
 
