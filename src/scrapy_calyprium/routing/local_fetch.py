@@ -249,7 +249,13 @@ class LocalFetcher:
         effective_preset = preset or self.default_preset
         effective_timeout = timeout or self.timeout
 
-        if self.backend == "httpcloak":
+        # Pick the best backend per-request. Firefox presets should use
+        # curl_cffi because httpcloak's Firefox presets are fake (Chrome
+        # internals with wrong H2/header fingerprints). Chrome presets
+        # work best with httpcloak (faster, native Rust).
+        backend = self._select_backend(effective_preset)
+
+        if backend == "httpcloak":
             return await self._fetch_httpcloak(
                 url=url,
                 cookies=cookies,
@@ -261,7 +267,7 @@ class LocalFetcher:
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
             )
-        elif self.backend == "curl_cffi":
+        elif backend == "curl_cffi":
             return await self._fetch_curl_cffi(
                 url=url,
                 cookies=cookies,
@@ -274,7 +280,22 @@ class LocalFetcher:
                 extra_headers=extra_headers,
             )
         else:
-            raise LocalFetchError(f"Unknown backend state: {self.backend}")
+            raise LocalFetchError(f"Unknown backend state: {backend}")
+
+    def _select_backend(self, preset: str) -> str:
+        """Pick the best backend for this preset.
+
+        Firefox presets → curl_cffi (proper Firefox TLS fingerprints)
+        Chrome presets → httpcloak (faster, proper Chrome TLS)
+        Falls back to whatever is available if the preferred backend isn't.
+        """
+        is_firefox = preset.startswith("firefox-") or preset == "firefox-latest"
+        if is_firefox and _CURL_CFFI_ASYNC is not None:
+            return "curl_cffi"
+        if not is_firefox and _HTTPCLOAK is not None:
+            return "httpcloak"
+        # Fallback to whatever is available
+        return self.backend
 
     # ------------------------------------------------------------------
     # httpcloak backend
@@ -395,14 +416,21 @@ class LocalFetcher:
         assert _CURL_CFFI_ASYNC is not None
         AsyncSession = _CURL_CFFI_ASYNC
 
-        # Map httpcloak preset names to curl_cffi impersonate names where possible.
+        # Map preset names to curl_cffi impersonate values.
+        # curl_cffi uses "firefoxNNN" / "chromeNNN" format (no dash).
         impersonate = preset
-        if preset.startswith("chrome-"):
-            impersonate = "chrome120"
-        elif preset.startswith("firefox-"):
-            impersonate = "firefox110"
-        elif preset == "chrome-latest":
-            impersonate = "chrome120"
+        if preset.startswith("firefox-"):
+            version = preset.split("-", 1)[1]
+            if version == "latest":
+                impersonate = "firefox135"
+            else:
+                impersonate = f"firefox{version}"
+        elif preset.startswith("chrome-"):
+            version = preset.split("-", 1)[1]
+            if version == "latest":
+                impersonate = "chrome146"
+            else:
+                impersonate = f"chrome{version}"
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
