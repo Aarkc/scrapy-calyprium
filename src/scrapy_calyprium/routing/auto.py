@@ -476,7 +476,14 @@ class SpiderAutoRouter:
         # already checked is_due_for_reprobe and fell through here).
         current_level = self.cache.get_level(domain)
         reprobe = current_level == "heavy" and self.cache.is_due_for_reprobe(domain)
-        if current_level in (None, "unknown", "light", "") or reprobe:
+        # Also try light path when all cookie slots are exhausted — the
+        # domain may have been mis-classified as "cookies" from early
+        # solve failures, but the light path (curl_cffi firefox135) may
+        # pass without cookies at all.
+        cookies_exhausted = (
+            current_level == "cookies" and entry and not entry.live_slots()
+        )
+        if current_level in (None, "unknown", "light", "") or reprobe or cookies_exhausted:
             try:
                 result = await self.fetcher.fetch(
                     url=url,
