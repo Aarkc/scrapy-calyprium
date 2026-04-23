@@ -1,3 +1,10 @@
+## [1.18.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.2...v1.18.3) (2026-04-23)
+
+
+### Bug Fixes
+
+* **routing:** try light path FIRST, before cookie replay ([465192c](https://github.com/Aarkc/scrapy-calyprium/commit/465192c7e4475f2dd275bfc49146b35e7b0cd947))
+
 ## [1.18.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.1...v1.18.2) (2026-04-23)
 
 
