@@ -1,3 +1,10 @@
+# [1.19.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.3...v1.19.0) (2026-04-23)
+
+
+### Features
+
+* **middleware:** add StealthFetchMiddleware — drop-in TLS-fingerprinted HTTP ([bf5e550](https://github.com/Aarkc/scrapy-calyprium/commit/bf5e5506461d9601167cf7c37b4eecc09379ca72))
+
 ## [1.18.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.2...v1.18.3) (2026-04-23)
 
 
