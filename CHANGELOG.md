@@ -1,3 +1,10 @@
+## [1.17.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.17.0...v1.17.1) (2026-04-23)
+
+
+### Bug Fixes
+
+* **routing:** strip content-encoding from curl_cffi responses ([fb582c4](https://github.com/Aarkc/scrapy-calyprium/commit/fb582c4c4d269076635281e4d62001c6a80407a5))
+
 # [1.17.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.16.0...v1.17.0) (2026-04-23)
 
 
