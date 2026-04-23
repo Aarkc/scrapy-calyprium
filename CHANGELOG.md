@@ -1,3 +1,10 @@
+# [1.17.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.16.0...v1.17.0) (2026-04-23)
+
+
+### Features
+
+* **routing:** route Firefox presets to curl_cffi for proper TLS fingerprinting ([2bfc502](https://github.com/Aarkc/scrapy-calyprium/commit/2bfc502d7f08c2db5051595ac97031d0c8450d34))
+
 # [1.16.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.15.1...v1.16.0) (2026-04-22)
 
 
