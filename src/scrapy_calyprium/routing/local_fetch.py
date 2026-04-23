@@ -331,6 +331,13 @@ class LocalFetcher:
             # Disable compression to avoid httpcloak decompression errors
             # (the server-side fetcher does the same — see AAR-12 sibling).
             headers["Accept-Encoding"] = "identity"
+            logger.info(
+                "httpcloak fetch %s: preset=%s, cookies=%s, "
+                "ua=%s, proxy_session=%s",
+                url, preset,
+                [c.get("name") for c in cookies[:10]],
+                (user_agent or "")[:60], proxy_session_id,
+            )
         if extra_headers:
             headers.update(extra_headers)
 
@@ -383,6 +390,27 @@ class LocalFetcher:
                     clean_headers[str(k)] = ", ".join(str(x) for x in v) if v else ""
                 else:
                     clean_headers[str(k)] = str(v)
+
+        # Log replay outcome for debugging cookie/fingerprint issues
+        if cookies:
+            cf_mitigated = clean_headers.get("cf-mitigated", "")
+            cf_ray = clean_headers.get("cf-ray", "")
+            blocked = response.status_code >= 400 or len(body) < 20000
+            body_hint = ""
+            if blocked and body:
+                text = body[:200].decode("utf-8", errors="replace")
+                if "Just a moment" in text:
+                    body_hint = "cf-challenge"
+                elif "Attention Required" in text:
+                    body_hint = "cf-block"
+                else:
+                    body_hint = text[:60].replace("\n", " ")
+            logger.info(
+                "httpcloak replay %s: status=%d size=%d elapsed=%dms "
+                "blocked=%s cf_mitigated=%s body_hint=%s",
+                url, response.status_code, len(body), elapsed_ms,
+                blocked, cf_mitigated, body_hint,
+            )
 
         return LocalFetchResult(
             url=url,
@@ -447,8 +475,18 @@ class LocalFetcher:
             headers.update(extra_headers)
 
         cookies_dict = None
+        cookie_names = []
         if cookies:
             cookies_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
+            cookie_names = list(cookies_dict.keys())
+
+        if cookies:
+            logger.info(
+                "curl_cffi fetch %s: impersonate=%s, cookies=%s, "
+                "ua=%s, proxy_session=%s",
+                url, impersonate, cookie_names,
+                (user_agent or "")[:60], proxy_session_id,
+            )
 
         start = time.time()
         try:
@@ -476,6 +514,33 @@ class LocalFetcher:
             if str(k).lower() in ("content-encoding", "content-length"):
                 continue
             clean_headers[str(k)] = str(v)
+
+        # Log replay outcome for debugging cookie/fingerprint issues
+        if cookies:
+            cf_mitigated = clean_headers.get("cf-mitigated", "")
+            cf_ray = clean_headers.get("cf-ray", "")
+            server = clean_headers.get("server", "")
+            new_cookies = "set-cookie" in clean_headers
+            blocked = response.status_code >= 400 or len(body) < 20000
+            body_hint = ""
+            if blocked and body:
+                text = body[:200].decode("utf-8", errors="replace")
+                if "Just a moment" in text:
+                    body_hint = "cf-challenge"
+                elif "Attention Required" in text:
+                    body_hint = "cf-block"
+                elif "captcha" in text.lower():
+                    body_hint = "captcha"
+                else:
+                    body_hint = text[:60].replace("\n", " ")
+            logger.info(
+                "curl_cffi replay %s: status=%d size=%d elapsed=%dms "
+                "blocked=%s cf_mitigated=%s cf_ray=%s server=%s "
+                "new_set_cookie=%s body_hint=%s",
+                url, response.status_code, len(body), elapsed_ms,
+                blocked, cf_mitigated, cf_ray, server,
+                new_cookies, body_hint,
+            )
 
         return LocalFetchResult(
             url=url,
