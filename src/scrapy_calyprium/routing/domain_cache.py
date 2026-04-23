@@ -306,7 +306,13 @@ class DomainCache:
     ) -> CookieSlot:
         """Add a new cookie slot from a Mimic /api/solve response."""
         entry = self._entries.get(domain)
-        if not entry or entry.level != "cookies":
+        if entry and entry.level == "light":
+            # Don't re-promote — the light path works without cookies.
+            # Stale concurrent solves may still arrive but their cookies
+            # aren't needed. Keep the entry so the slot gets cached but
+            # don't change the level.
+            pass
+        elif not entry or entry.level != "cookies":
             entry = DomainEntry(level="cookies", ttl=float(TTL_COOKIES))
             self._entries[domain] = entry
 

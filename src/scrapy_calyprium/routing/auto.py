@@ -394,9 +394,12 @@ class SpiderAutoRouter:
         # solve again with a fresh IP, not to fall through to the legacy
         # browser path (which also gets 403 without cookies).
 
-        # Step 2: cookies in pool → try replay
+        # Step 2: cookies in pool → try replay.
+        # Skip if the domain is "light" — the light path works without
+        # cookies, so don't waste time on cookie replay + rate cap.
         entry = self.cache.get(domain)
-        if entry and entry.level == "cookies":
+        level = entry.level if entry else None
+        if entry and level == "cookies":
             slot = entry.next_slot()
             if slot:
                 # Adaptive rate limiting: defer if this slot is already at
