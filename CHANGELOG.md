@@ -1,3 +1,10 @@
+## [1.18.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.0...v1.18.1) (2026-04-23)
+
+
+### Bug Fixes
+
+* **routing:** try light path when all cookie slots are exhausted ([610ecc3](https://github.com/Aarkc/scrapy-calyprium/commit/610ecc3fbfd023effbde5deb7ae3a154bb5b1bc9))
+
 # [1.18.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.17.1...v1.18.0) (2026-04-23)
 
 
