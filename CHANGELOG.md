@@ -1,3 +1,10 @@
+## [1.19.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.19.0...v1.19.1) (2026-04-26)
+
+
+### Bug Fixes
+
+* **spiders:** preserve start_offset in PrismSitemapSpider.start_requests ([9941173](https://github.com/Aarkc/scrapy-calyprium/commit/994117341da4717784607fff956f54f84ebffaed))
+
 # [1.19.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.18.3...v1.19.0) (2026-04-23)
 
 
