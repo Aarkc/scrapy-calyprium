@@ -119,9 +119,11 @@ class PrismSitemapSpider(scrapy.Spider):
             yield from self._start_from_recrawl(parsed)
         elif parsed.scheme == "prism":
             self._prism_parsed = parsed
-            self._prism_next_offset = 0
+            # Preserve start_offset if set by spider subclass
+            if not self._prism_next_offset:
+                self._prism_next_offset = 0
             yield scrapy.Request(
-                self._build_prism_api_url(parsed, offset=0),
+                self._build_prism_api_url(parsed, offset=self._prism_next_offset),
                 callback=self._handle_prism_page,
                 meta={
                     "_internal": True,

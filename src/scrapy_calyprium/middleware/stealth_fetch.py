@@ -12,6 +12,10 @@ Settings:
     STEALTH_FETCH_BACKEND: Force a backend ("curl_cffi" or "httpcloak").
         If omitted, auto-selects based on preset.
     STEALTH_FETCH_TIMEOUT: Request timeout in seconds (default: 30).
+    STEALTH_FETCH_PROXY_URL: Proxy URL with embedded credentials.
+        e.g. http://user-p_evomi_rotating:secret@gateway:8080
+        If set, this is used directly instead of VeilProxyMiddleware's
+        request.meta["proxy"] (which lacks auth credentials).
 """
 
 import logging
