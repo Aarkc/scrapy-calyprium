@@ -122,17 +122,7 @@ class PrismSitemapSpider(scrapy.Spider):
             # Preserve start_offset if set by spider subclass
             if not self._prism_next_offset:
                 self._prism_next_offset = 0
-            yield scrapy.Request(
-                self._build_prism_api_url(parsed, offset=self._prism_next_offset),
-                callback=self._handle_prism_page,
-                meta={
-                    "_internal": True,
-                    "download_timeout": 120,
-                    "download_slot": "_prism_internal",
-                },
-                dont_filter=True,
-                priority=100,
-            )
+            yield self._make_refill_request()
         elif parsed.scheme == "file":
             yield from self._start_from_file(parsed.path)
         elif parsed.scheme == "inline":
@@ -534,11 +524,17 @@ class PrismSitemapSpider(scrapy.Spider):
             and not self._refill_in_flight
             and self._pending_count < _REFILL_THRESHOLD
         ):
-            self._refill_in_flight = True
             yield self._make_refill_request()
 
     def _make_refill_request(self):
-        """Create a request to fetch the next Prism page."""
+        """Create a request to fetch the next Prism page.
+
+        Sets ``_refill_in_flight = True`` so any concurrent call sites
+        (fast-skip path in ``_handle_prism_page`` and the per-response
+        refill check in ``_parse_and_maybe_refill``) cannot fire a second
+        refill at the same offset.
+        """
+        self._refill_in_flight = True
         logger.info(
             f"Prism: refilling from offset {self._prism_next_offset:,} "
             f"(pending={self._pending_count:,})"
@@ -546,6 +542,7 @@ class PrismSitemapSpider(scrapy.Spider):
         return scrapy.Request(
             self._build_prism_api_url(self._prism_parsed, offset=self._prism_next_offset),
             callback=self._handle_prism_page,
+            errback=self._handle_prism_error,
             meta={
                 "_internal": True,
                 "download_timeout": 120,
@@ -560,6 +557,24 @@ class PrismSitemapSpider(scrapy.Spider):
             dont_filter=True,
             priority=100,  # higher priority than normal scrape requests
         )
+
+    def _handle_prism_error(self, failure):
+        """Reset refill flag and re-queue if the Prism page request fails.
+
+        Without this, a failed Prism fetch leaves ``_refill_in_flight=True``
+        forever, no further refills are attempted, and the spider exits
+        with finish_reason='finished' once the pending queue drains. We
+        re-queue the request so the spider self-heals from transient
+        Prism outages even if no scrape response arrives to re-trigger
+        the refill check.
+        """
+        self._refill_in_flight = False
+        logger.warning(
+            f"Prism refill request failed at offset {self._prism_next_offset:,}: "
+            f"{failure.value!r}. Re-queuing."
+        )
+        if not self._prism_exhausted:
+            return self._make_refill_request()
 
     def _start_from_file(self, path):
         """Read URLs from a text file (one per line)."""
