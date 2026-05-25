@@ -1,3 +1,10 @@
+# [1.20.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.19.2...v1.20.0) (2026-05-25)
+
+
+### Features
+
+* **extensions:** PrismOffsetCheckpoint — persist/resume Prism offset across runs ([2860a9a](https://github.com/Aarkc/scrapy-calyprium/commit/2860a9a2f3ea238b9caf99d99b3c3de98d74e748))
+
 ## [1.19.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.19.1...v1.19.2) (2026-05-17)
 
 
