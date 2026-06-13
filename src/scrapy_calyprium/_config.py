@@ -24,6 +24,7 @@ from typing import Optional
 _DEFAULTS = {
     "veil_url": "https://proxy.calyprium.com",
     "mimic_url": "https://mimic.calyprium.com",
+    "tessera_url": "https://tessera.calyprium.com",
     "spectre_url": "https://spectre.calyprium.com",
     "prism_url": "https://prism.calyprium.com",
 }
@@ -43,6 +44,11 @@ class CalypriumConfig:
 
     mimic_url: Optional[str] = None
     mimic_stealth_level: str = "moderate"
+
+    # Tessera captcha-solver service. When set, the local-first path sends its
+    # /api/solve calls here (Jevi/2Captcha API solving, with a mimic-browser
+    # fallback) instead of to mimic directly.
+    tessera_url: Optional[str] = None
 
     spectre_url: Optional[str] = None
 
@@ -74,6 +80,10 @@ class CalypriumConfig:
         # Mimic
         if not self.mimic_url:
             self.mimic_url = os.getenv("MIMIC_SERVICE_URL", _DEFAULTS["mimic_url"])
+
+        # Tessera
+        if not self.tessera_url:
+            self.tessera_url = os.getenv("TESSERA_SERVICE_URL", _DEFAULTS["tessera_url"])
 
         # Spectre
         if not self.spectre_url:
@@ -126,6 +136,10 @@ class CalypriumConfig:
             settings["MIMIC_SERVICE_URL"] = self.mimic_url
         settings["MIMIC_STEALTH_LEVEL"] = self.mimic_stealth_level
         settings["MIMIC_USE_SPECTRE"] = True
+
+        # Tessera
+        if self.tessera_url:
+            settings["TESSERA_SERVICE_URL"] = self.tessera_url
 
         # Prism
         if self.prism_url:
