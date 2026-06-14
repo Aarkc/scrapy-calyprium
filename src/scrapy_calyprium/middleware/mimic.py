@@ -192,9 +192,20 @@ class MimicBrowserMiddleware:
             rpm_cap = self.crawler.settings.getfloat("MIMIC_LOCAL_SLOT_RPM_CAP", 10.0)
             parallel_solves = self.crawler.settings.getint("MIMIC_LOCAL_PARALLEL_SOLVES", 3)
             cold_start_burst = self.crawler.settings.getint("MIMIC_LOCAL_COLD_START_BURST", 4)
+            # httpcloak fetches run in a dedicated thread pool; size it to the
+            # pool so N slots x rpm_cap is the real throughput limit, not the
+            # default asyncio executor's ~32 workers. Default tracks the pool
+            # (min 64) so scaling the pool scales fetch concurrency with it.
+            fetch_concurrency = self.crawler.settings.getint(
+                "MIMIC_LOCAL_FETCH_CONCURRENCY", max(64, pool_size * 2)
+            )
             domain_cache_module.configure(max_slots=max_slots, rpm_cap=rpm_cap)
             self._local_cache = DomainCache()
-            fetcher = LocalFetcher(default_preset=preset, timeout=timeout)
+            fetcher = LocalFetcher(
+                default_preset=preset,
+                timeout=timeout,
+                fetch_concurrency=fetch_concurrency,
+            )
             # Solve via Tessera when configured (Jevi/2Captcha API solving with a
             # mimic-browser fallback); otherwise fall back to mimic's /api/solve.
             # Same request/response contract, so SolveClient is unchanged.
