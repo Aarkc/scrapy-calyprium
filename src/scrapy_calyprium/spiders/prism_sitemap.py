@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 # Only fetch the next batch when pending requests drop below this
 _REFILL_THRESHOLD = 1000
 
+# A transient targets-fetch error (Forge restart, network blip, timeout) must
+# not permanently end the source — that would kill a multi-day catch-up after a
+# single hiccup. Tolerate this many *consecutive* failures (retrying on each
+# refill) before giving up.
+_TARGETS_MAX_FETCH_FAILURES = 5
+
 
 class PrismSitemapSpider(scrapy.Spider):
     """Spider that reads start URLs from Prism's sitemap URL database.
@@ -167,6 +173,7 @@ class PrismSitemapSpider(scrapy.Spider):
         self._targets_type = target_type
         self._targets_exhausted = False
         self._targets_offset = 0
+        self._targets_fetch_failures = 0
 
         urls = self._fetch_targets_batch()
         if not urls:
@@ -198,9 +205,24 @@ class PrismSitemapSpider(scrapy.Spider):
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.error(f"Targets: failed to fetch pending targets: {e}")
-            self._targets_exhausted = True
+            # Don't permanently exhaust on a transient error — retry on the next
+            # refill (there are still in-flight requests to drive it). Only give
+            # up after a sustained run of failures (Forge genuinely down).
+            self._targets_fetch_failures += 1
+            if self._targets_fetch_failures >= _TARGETS_MAX_FETCH_FAILURES:
+                logger.error(
+                    f"Targets: {self._targets_fetch_failures} consecutive fetch "
+                    f"failures (offset={self._targets_offset:,}), stopping refill: {e}")
+                self._targets_exhausted = True
+            else:
+                logger.warning(
+                    f"Targets: transient fetch failure "
+                    f"{self._targets_fetch_failures}/{_TARGETS_MAX_FETCH_FAILURES} "
+                    f"(offset={self._targets_offset:,}), will retry: {e}")
             return []
+
+        # A successful fetch clears the consecutive-failure run.
+        self._targets_fetch_failures = 0
 
         urls = data.get("urls", [])
         total = data.get("total_pending", 0)
