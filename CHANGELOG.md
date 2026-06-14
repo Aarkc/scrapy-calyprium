@@ -1,3 +1,10 @@
+# [1.23.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.22.0...v1.23.0) (2026-06-14)
+
+
+### Features
+
+* **local:** dedicated thread pool for httpcloak fetches (lift ~32-worker ceiling) ([#3](https://github.com/Aarkc/scrapy-calyprium/issues/3)) ([fdb174c](https://github.com/Aarkc/scrapy-calyprium/commit/fdb174c09eaa1c9e171d048781ebcece4fbfd24d))
+
 # [1.22.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.21.0...v1.22.0) (2026-06-14)
 
 
