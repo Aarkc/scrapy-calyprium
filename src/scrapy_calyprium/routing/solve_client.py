@@ -53,8 +53,12 @@ class SolveClient:
         service_secret: Optional[str] = None,
         user_id: Optional[str] = None,
         timeout: float = 90.0,
+        ip_health_url: Optional[str] = None,
     ):
         self.service_url = service_url.rstrip("/")
+        # IP-health reputation lives in mimic; when /api/solve is pointed at a
+        # separate solver service (Tessera), reports still go to mimic.
+        self.ip_health_url = (ip_health_url or service_url).rstrip("/")
         self.api_key = api_key
         self.service_secret = service_secret
         self.user_id = user_id
@@ -202,7 +206,7 @@ class SolveClient:
             body["status_code"] = status_code
         if egress_ip:
             body["egress_ip"] = egress_ip
-        url = f"{self.service_url}/api/ip-health/report"
+        url = f"{self.ip_health_url}/api/ip-health/report"
         try:
             response = await client.post(
                 url, json=body, headers=self._build_headers(), timeout=5.0,

@@ -185,8 +185,18 @@ class MimicBrowserMiddleware:
             timeout = self.crawler.settings.getint("DOWNLOAD_TIMEOUT", 60)
             self._local_cache = DomainCache()
             fetcher = LocalFetcher(default_preset=preset, timeout=timeout)
+            # Solve via Tessera when configured (Jevi/2Captcha API solving with a
+            # mimic-browser fallback); otherwise fall back to mimic's /api/solve.
+            # Same request/response contract, so SolveClient is unchanged.
+            solve_service_url = (
+                self.crawler.settings.get("TESSERA_SERVICE_URL") or self.service_url
+            )
+            self._solve_backend = (
+                "tessera" if self.crawler.settings.get("TESSERA_SERVICE_URL") else "mimic"
+            )
             self._solve_client = SolveClient(
-                service_url=self.service_url,
+                service_url=solve_service_url,
+                ip_health_url=self.service_url,  # IP reputation stays in mimic
                 api_key=self.api_key,
                 service_secret=self.crawler.settings.get("FORGE_SERVICE_SECRET")
                 or self.crawler.settings.get("MIMIC_SERVICE_SECRET"),
@@ -248,6 +258,7 @@ class MimicBrowserMiddleware:
             logger.info(
                 f"MimicMiddleware: local-first routing enabled "
                 f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
+                f"solve_backend={self._solve_backend}, "
                 f"slot_stats_interval={interval}s)"
             )
         except Exception as e:
