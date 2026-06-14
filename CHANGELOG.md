@@ -1,3 +1,10 @@
+## [1.23.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.0...v1.23.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* **local:** stop the rate-cap learner ratcheting to 5 RPM on cookie expiry ([#4](https://github.com/Aarkc/scrapy-calyprium/issues/4)) ([aa9cba5](https://github.com/Aarkc/scrapy-calyprium/commit/aa9cba500db772aa8c2ec7f5d64fe97afd961e6f))
+
 # [1.23.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.22.0...v1.23.0) (2026-06-14)
 
 
