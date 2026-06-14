@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -174,9 +175,18 @@ class LocalFetcher:
         default_preset: str = "chrome-143",
         timeout: int = 30,
         backend: Optional[str] = None,
+        fetch_concurrency: int = 128,
     ):
         self.default_preset = default_preset
         self.timeout = timeout
+        # httpcloak is a synchronous library, so each fetch is dispatched to a
+        # thread pool. asyncio.to_thread() shares Python's *default* executor,
+        # capped at min(32, cpu+4) workers — which silently throttles local
+        # throughput to ~32 in-flight fetches regardless of the cookie-pool
+        # size or CONCURRENT_REQUESTS. Give the httpcloak backend its own,
+        # larger pool so the cookie pool (N slots x RPM cap) is the real limit.
+        self._fetch_concurrency = max(1, int(fetch_concurrency))
+        self._executor: Optional[ThreadPoolExecutor] = None
 
         if backend == "httpcloak":
             if _HTTPCLOAK is None:
@@ -205,7 +215,20 @@ class LocalFetcher:
         else:
             raise LocalFetchError(f"Unknown backend: {backend!r}")
 
-        logger.info("LocalFetcher initialized with backend=%s", self.backend)
+        # The httpcloak backend is synchronous; give it a dedicated thread
+        # pool so concurrency isn't silently capped at the default executor's
+        # ~32 workers. curl_cffi uses a native AsyncSession (no thread pool).
+        if self.backend == "httpcloak":
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._fetch_concurrency,
+                thread_name_prefix="local-fetch",
+            )
+
+        logger.info(
+            "LocalFetcher initialized with backend=%s (fetch_concurrency=%s)",
+            self.backend,
+            self._fetch_concurrency if self.backend == "httpcloak" else "n/a",
+        )
 
     async def fetch(
         self,
@@ -355,8 +378,11 @@ class LocalFetcher:
                 session.close()
 
         try:
-            # httpcloak is sync; run in a thread to avoid blocking the loop.
-            response = await asyncio.to_thread(_do_sync_fetch)
+            # httpcloak is sync; run in our dedicated thread pool (not the
+            # default asyncio executor, which is capped at ~32 workers and
+            # would throttle local throughput well below the cookie-pool size).
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(self._executor, _do_sync_fetch)
         except Exception as exc:  # noqa: BLE001
             raise LocalFetchError(f"httpcloak fetch failed for {url}: {exc}") from exc
 
