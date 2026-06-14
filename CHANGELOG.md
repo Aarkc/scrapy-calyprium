@@ -1,3 +1,10 @@
+# [1.22.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.21.0...v1.22.0) (2026-06-14)
+
+
+### Features
+
+* **local:** make cookie-pool size + rate cap tunable via settings ([#2](https://github.com/Aarkc/scrapy-calyprium/issues/2)) ([4d70eb9](https://github.com/Aarkc/scrapy-calyprium/commit/4d70eb995a93f696de1d875179ade863ff73bbf8))
+
 # [1.21.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.20.0...v1.21.0) (2026-06-14)
 
 
