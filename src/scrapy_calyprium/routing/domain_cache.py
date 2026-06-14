@@ -50,6 +50,21 @@ MAX_SLOTS_PER_DOMAIN = 8
 # per solve vs ~30 currently).
 SLOT_RPM_HARD_CAP = 10.0
 
+
+def configure(max_slots: int = None, rpm_cap: float = None) -> None:
+    """Override the pool caps at runtime (from spider settings).
+
+    next_slot()/set_cookies_from_solve() read these module globals at call time,
+    so updating them before the crawl starts takes effect. Used to scale the
+    cookie pool for higher throughput (more slots) while keeping the per-slot
+    RPM cap that protects cf_clearance lifetime.
+    """
+    global MAX_SLOTS_PER_DOMAIN, SLOT_RPM_HARD_CAP
+    if max_slots is not None:
+        MAX_SLOTS_PER_DOMAIN = int(max_slots)
+    if rpm_cap is not None:
+        SLOT_RPM_HARD_CAP = float(rpm_cap)
+
 # AAR-14 circuit breaker tunables
 PROMOTION_COOLDOWN_SECONDS = 300
 MIN_DOMAIN_FAILURES_FOR_PROMOTION = 3

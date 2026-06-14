@@ -43,6 +43,7 @@ from scrapy.http import HtmlResponse, Response
 try:
     from scrapy_calyprium.routing.auto import SpiderAutoRouter, RouteResult
     from scrapy_calyprium.routing.domain_cache import DomainCache
+    from scrapy_calyprium.routing import domain_cache as domain_cache_module
     from scrapy_calyprium.routing.local_fetch import (
         LocalFetcher,
         is_local_fetch_available,
@@ -183,6 +184,15 @@ class MimicBrowserMiddleware:
             preset = self.crawler.settings.get("MIMIC_LOCAL_PRESET", "chrome-143")
             proxy_url = self.crawler.settings.get("MIMIC_LOCAL_PROXY_URL")
             timeout = self.crawler.settings.getint("DOWNLOAD_TIMEOUT", 60)
+            # Cookie-pool sizing (throughput ≈ pool_size × rpm_cap). Defaults
+            # match the legacy 8 slots × 10 RPM. Raise the pool to scale up;
+            # keep rpm_cap low to protect cf_clearance lifetime.
+            pool_size = self.crawler.settings.getint("MIMIC_LOCAL_POOL_SIZE", 8)
+            max_slots = self.crawler.settings.getint("MIMIC_LOCAL_MAX_SLOTS", max(8, pool_size))
+            rpm_cap = self.crawler.settings.getfloat("MIMIC_LOCAL_SLOT_RPM_CAP", 10.0)
+            parallel_solves = self.crawler.settings.getint("MIMIC_LOCAL_PARALLEL_SOLVES", 3)
+            cold_start_burst = self.crawler.settings.getint("MIMIC_LOCAL_COLD_START_BURST", 4)
+            domain_cache_module.configure(max_slots=max_slots, rpm_cap=rpm_cap)
             self._local_cache = DomainCache()
             fetcher = LocalFetcher(default_preset=preset, timeout=timeout)
             # Solve via Tessera when configured (Jevi/2Captcha API solving with a
@@ -219,6 +229,9 @@ class MimicBrowserMiddleware:
                 proxy_url=proxy_url,
                 provider=self.crawler.settings.get("VEIL_PROVIDER"),
                 tracer=tracer,
+                target_pool_size=pool_size,
+                solve_parallel_solves=parallel_solves,
+                cold_start_burst=cold_start_burst,
             )
 
             # Slot-stats reporter — periodically batch the local DomainCache's
