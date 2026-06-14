@@ -50,6 +50,13 @@ MAX_SLOTS_PER_DOMAIN = 8
 # per solve vs ~30 currently).
 SLOT_RPM_HARD_CAP = 10.0
 
+# A block only feeds the rate-cap learner if the slot got blocked *before*
+# serving this many successful requests. A slot that sustained its rate for
+# longer than this and then died was killed by cf_clearance expiry (time /
+# request-count), not by rate — counting those expiry blocks ratchets the
+# learned cap down to its floor and pins it there. See record_block_rpm().
+RATE_LEARN_MAX_SUCCESS = 10
+
 
 def configure(max_slots: int = None, rpm_cap: float = None) -> None:
     """Override the pool caps at runtime (from spider settings).
@@ -210,13 +217,33 @@ class DomainEntry:
         Updates learned_rpm_cap to 70% of the median observed block RPM
         (rolling window of last 10 blocks). Capped at a 5 RPM floor so we
         never throttle below a sane minimum.
+
+        Only blocks that look *rate*-induced count. A slot that served many
+        requests successfully at its current rate before getting blocked was
+        almost certainly killed by cf_clearance expiry (Cloudflare clearance
+        is time- and request-count-limited), not by rate — and learning from
+        those expiry blocks is a one-way ratchet: every cookie death is one
+        block, so the learner lowers the cap on each, drives it to the 5 RPM
+        floor, and then (since every slot is now throttled to ~5 RPM) every
+        subsequent expiry block reports "5 RPM" and re-pins the floor. That's
+        how a domain that happily serves ~10 RPM gets permanently stuck at 5.
+        A genuine rate limit instead blocks a slot *quickly*, before it has
+        sustained the rate — i.e. while success_count is still low.
         """
         slot_rpm = slot.requests_per_minute()
-        self._last_block_time = _now()
 
         if slot_rpm < 5:
-            return  # too low to learn from — probably wasn't rate-limited
+            return  # too slow to be a rate limit
 
+        if slot.success_count >= RATE_LEARN_MAX_SUCCESS:
+            # The slot proved it can sustain this rate (many clean requests
+            # before dying) — this block is expiry/terminal, not rate. Don't
+            # learn from it, and don't reset the recovery timer (otherwise a
+            # steady drip of expiry blocks starves maybe_raise_cap() of the
+            # quiet window it needs to probe the cap back up).
+            return
+
+        self._last_block_time = _now()
         self._block_rpms.append(slot_rpm)
         self._block_rpms = self._block_rpms[-10:]
 

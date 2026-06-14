@@ -102,6 +102,34 @@ class TestRateCapLearning:
         entry = cache._entries.get("example.com")
         assert entry.learned_rpm_cap is None
 
+    def test_expiry_block_does_not_ratchet_cap(self):
+        """A slot blocked after sustaining its rate for many clean requests
+        was killed by cf_clearance expiry, not by rate. Feeding those blocks
+        to the learner is a one-way ratchet that pins the cap at the 5 RPM
+        floor — so they must be ignored even at high RPM."""
+        cache = self._seeded_cache()
+        entry = cache.get("example.com")
+        slot = entry.slots[0]
+        slot.success_count = 50  # served 50 clean requests at this rate
+        for _ in range(10):
+            slot.record_request()  # running ~10 RPM when it finally blocked
+        cache.record_slot_failure("example.com", slot.slot_id, status_code=403)
+        entry = cache._entries.get("example.com")
+        assert entry.learned_rpm_cap is None  # expiry block, not learned
+
+    def test_fast_block_still_learns_cap(self):
+        """A slot blocked *before* sustaining its rate (low success_count) is
+        genuine rate evidence and must still lower the cap."""
+        cache = self._seeded_cache()
+        entry = cache.get("example.com")
+        slot = entry.slots[0]
+        slot.success_count = 2  # barely got going before blocking
+        for _ in range(40):
+            slot.record_request()
+        cache.record_slot_failure("example.com", slot.slot_id, status_code=403)
+        entry = cache._entries.get("example.com")
+        assert entry.learned_rpm_cap == pytest.approx(28.0, abs=0.1)  # 40 * 0.7
+
     def test_infra_failure_does_not_update_cap(self):
         cache = self._seeded_cache()
         entry = cache.get("example.com")
