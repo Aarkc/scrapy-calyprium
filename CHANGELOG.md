@@ -1,3 +1,10 @@
+## [1.23.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.1...v1.23.2) (2026-06-14)
+
+
+### Bug Fixes
+
+* **targets:** tolerate transient Forge errors instead of exhausting the source ([#5](https://github.com/Aarkc/scrapy-calyprium/issues/5)) ([e572d25](https://github.com/Aarkc/scrapy-calyprium/commit/e572d25b95ed07ff6374e8460fbd2ce3568f53cb))
+
 ## [1.23.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.0...v1.23.1) (2026-06-14)
 
 
