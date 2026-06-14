@@ -1,3 +1,10 @@
+# [1.21.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.20.0...v1.21.0) (2026-06-14)
+
+
+### Features
+
+* **local:** route /api/solve to Tessera when TESSERA_SERVICE_URL is set ([#1](https://github.com/Aarkc/scrapy-calyprium/issues/1)) ([eb84fe9](https://github.com/Aarkc/scrapy-calyprium/commit/eb84fe9a22412cc03fe4d6295f449c758a1dfcb4))
+
 # [1.20.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.19.2...v1.20.0) (2026-05-25)
 
 
