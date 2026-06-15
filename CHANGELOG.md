@@ -1,3 +1,10 @@
+# [1.24.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.3...v1.24.0) (2026-06-15)
+
+
+### Features
+
+* **local:** target-throughput proactive refill + configurable cookie TTL ([#7](https://github.com/Aarkc/scrapy-calyprium/issues/7)) ([e83a6bd](https://github.com/Aarkc/scrapy-calyprium/commit/e83a6bd4639e1056329bfacf055c34623d7de6a8))
+
 ## [1.23.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.2...v1.23.3) (2026-06-15)
 
 
