@@ -190,8 +190,21 @@ class MimicBrowserMiddleware:
             pool_size = self.crawler.settings.getint("MIMIC_LOCAL_POOL_SIZE", 8)
             max_slots = self.crawler.settings.getint("MIMIC_LOCAL_MAX_SLOTS", max(8, pool_size))
             rpm_cap = self.crawler.settings.getfloat("MIMIC_LOCAL_SLOT_RPM_CAP", 10.0)
+            # Target throughput: ask for a pages/min rate and let the pool size
+            # itself to meet it — slots = ceil(target_rpm / rpm_cap), clamped to
+            # MAX_SLOTS. The proactive refill (in SpiderAutoRouter) then holds
+            # the pool there, so throughput levels out at the target instead of
+            # decaying into a low-gear equilibrium after a disruption.
+            target_rpm = self.crawler.settings.getint("MIMIC_LOCAL_TARGET_RPM", 0)
+            if target_rpm > 0 and rpm_cap > 0:
+                import math
+                pool_size = min(max_slots, max(1, math.ceil(target_rpm / rpm_cap)))
             parallel_solves = self.crawler.settings.getint("MIMIC_LOCAL_PARALLEL_SOLVES", 3)
             cold_start_burst = self.crawler.settings.getint("MIMIC_LOCAL_COLD_START_BURST", 4)
+            # Cookie TTL (seconds): how long a solved cf_clearance is reused
+            # before retirement. Extend it (0 = keep the built-in default) when
+            # the domain's clearance outlives the default, for more pages/solve.
+            cookie_ttl = self.crawler.settings.getfloat("MIMIC_LOCAL_COOKIE_TTL", 0.0)
             # httpcloak fetches run in a dedicated thread pool; size it to the
             # pool so N slots x rpm_cap is the real throughput limit, not the
             # default asyncio executor's ~32 workers. Default tracks the pool
@@ -199,7 +212,10 @@ class MimicBrowserMiddleware:
             fetch_concurrency = self.crawler.settings.getint(
                 "MIMIC_LOCAL_FETCH_CONCURRENCY", max(64, pool_size * 2)
             )
-            domain_cache_module.configure(max_slots=max_slots, rpm_cap=rpm_cap)
+            domain_cache_module.configure(
+                max_slots=max_slots, rpm_cap=rpm_cap,
+                cookie_ttl=(cookie_ttl if cookie_ttl > 0 else None),
+            )
             self._local_cache = DomainCache()
             fetcher = LocalFetcher(
                 default_preset=preset,
@@ -283,6 +299,10 @@ class MimicBrowserMiddleware:
                 f"MimicMiddleware: local-first routing enabled "
                 f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
                 f"solve_backend={self._solve_backend}, "
+                f"target_pool={pool_size}"
+                + (f" (from target_rpm={target_rpm}@{rpm_cap}rpm)" if target_rpm > 0 else "")
+                + (f", cookie_ttl={int(cookie_ttl)}s" if cookie_ttl > 0 else "")
+                + f", parallel_solves={parallel_solves}, "
                 f"slot_stats_interval={interval}s)"
             )
         except Exception as e:

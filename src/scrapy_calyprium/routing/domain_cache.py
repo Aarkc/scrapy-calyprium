@@ -58,19 +58,24 @@ SLOT_RPM_HARD_CAP = 10.0
 RATE_LEARN_MAX_SUCCESS = 10
 
 
-def configure(max_slots: int = None, rpm_cap: float = None) -> None:
+def configure(max_slots: int = None, rpm_cap: float = None,
+              cookie_ttl: float = None) -> None:
     """Override the pool caps at runtime (from spider settings).
 
-    next_slot()/set_cookies_from_solve() read these module globals at call time,
-    so updating them before the crawl starts takes effect. Used to scale the
-    cookie pool for higher throughput (more slots) while keeping the per-slot
-    RPM cap that protects cf_clearance lifetime.
+    next_slot()/set_cookies_from_solve()/CookieSlot.is_expired() read these
+    module globals at call time, so updating them before the crawl starts takes
+    effect. Used to scale the cookie pool for higher throughput (more slots),
+    keep the per-slot RPM cap that protects cf_clearance lifetime, and extend
+    how long a solved clearance is reused (cookie_ttl) when the domain's
+    clearance outlives the default — more pages per solve.
     """
-    global MAX_SLOTS_PER_DOMAIN, SLOT_RPM_HARD_CAP
+    global MAX_SLOTS_PER_DOMAIN, SLOT_RPM_HARD_CAP, TTL_COOKIES
     if max_slots is not None:
         MAX_SLOTS_PER_DOMAIN = int(max_slots)
     if rpm_cap is not None:
         SLOT_RPM_HARD_CAP = float(rpm_cap)
+    if cookie_ttl is not None:
+        TTL_COOKIES = float(cookie_ttl)
 
 # AAR-14 circuit breaker tunables
 PROMOTION_COOLDOWN_SECONDS = 300
