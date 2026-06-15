@@ -203,11 +203,22 @@ class SpiderAutoRouter:
                 domain, num_to_fire, live, self.target_pool_size,
             )
         else:
-            # Steady state: one slot per tick, gated by in-flight count
+            # Steady state: proactively solve toward target_pool_size using the
+            # full parallel-solve budget. The original code fired one solve at a
+            # time (in_flight>0 -> return), capping refill at ~1 solve per
+            # solve-latency (~3/min). After any dip (veil blip, restart decay)
+            # the pool could never climb back: deaths at the shrunken pool just
+            # matched that trickle, so it stuck in a low-throughput equilibrium.
+            # Topping the in-flight solves up to solve_parallel_solves lets the
+            # pool actually return to — and hold — the target.
+            budget = max(1, self.solve_parallel_solves)
             in_flight = self._refill_in_flight.get(domain, 0)
-            if in_flight > 0:
+            if in_flight >= budget:
                 return
-            num_to_fire = 1
+            slots_needed = self.target_pool_size - live
+            num_to_fire = min(slots_needed, budget - in_flight)
+            if num_to_fire <= 0:
+                return
 
         for _ in range(num_to_fire):
             self._refill_in_flight[domain] = (
