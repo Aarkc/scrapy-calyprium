@@ -184,7 +184,11 @@ class PrismSitemapSpider(scrapy.Spider):
                 self._targets_exhausted = True
                 return
             self._urls_yielded += 1
-            yield scrapy.Request(url, callback=self._parse_and_maybe_refill_targets)
+            yield scrapy.Request(
+                url,
+                callback=self._parse_and_maybe_refill_targets,
+                errback=self._targets_errback,
+            )
 
     def _fetch_targets_batch(self):
         """Fetch one batch of pending targets from Forge."""
@@ -239,21 +243,46 @@ class PrismSitemapSpider(scrapy.Spider):
 
         return urls
 
+    def _maybe_refill_targets(self):
+        """Fetch the next batch of targets when the in-flight queue runs low.
+
+        Yields the new Requests (possibly none). Shared by the success callback
+        AND the errback: a request that fails leaves the queue just like one
+        that succeeds, so it must drive refill too. Otherwise failed requests
+        (which never reach the callback) inflate _pending_count without bound —
+        once cumulative failures exceed _REFILL_THRESHOLD the gate below can
+        never open again, refill stops, the queue drains, and the crawl ends
+        early with millions of targets still pending (AAR: a run died at ~25k of
+        8.5M after 5,837 errback'd requests pinned _pending_count at ~5.8k)."""
+        if (self._targets_exhausted
+                or self._refill_in_flight
+                or self._pending_count >= _REFILL_THRESHOLD):
+            return
+        self._refill_in_flight = True
+        try:
+            urls = self._fetch_targets_batch()
+        finally:
+            self._refill_in_flight = False
+        for url in urls:
+            self._urls_yielded += 1
+            yield scrapy.Request(
+                url,
+                callback=self._parse_and_maybe_refill_targets,
+                errback=self._targets_errback,
+            )
+
     def _parse_and_maybe_refill_targets(self, response):
         """Wrapper for targets:// -- parse item and refill when queue is low."""
         self._urls_responded += 1
         yield from self.parse_item(response)
+        yield from self._maybe_refill_targets()
 
-        if (not self._targets_exhausted
-                and not self._refill_in_flight
-                and self._pending_count < _REFILL_THRESHOLD):
-            self._refill_in_flight = True
-            urls = self._fetch_targets_batch()
-            self._refill_in_flight = False
-            if urls:
-                for url in urls:
-                    self._urls_yielded += 1
-                    yield scrapy.Request(url, callback=self._parse_and_maybe_refill_targets)
+    def _targets_errback(self, failure):
+        """A failed target request still leaves the in-flight queue. Count it so
+        _pending_count stays accurate, then drive refill — otherwise accumulated
+        errors permanently block refill and end the crawl early."""
+        self._urls_responded += 1
+        yield from self._maybe_refill_targets()
 
     def _start_from_recrawl(self, parsed):
         """Fetch first batch of stale URLs, then refill lazily via callbacks.
