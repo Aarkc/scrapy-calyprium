@@ -12,6 +12,7 @@ from unittest import mock
 from scrapy_calyprium.spiders.prism_sitemap import (
     PrismSitemapSpider,
     _TARGETS_MAX_FETCH_FAILURES,
+    _REFILL_THRESHOLD,
 )
 
 
@@ -80,3 +81,48 @@ def test_empty_response_still_exhausts():
         urls = spider._fetch_targets_batch()
     assert urls == []
     assert spider._targets_exhausted is True
+
+
+# ---------------------------------------------------------------------------
+# Refill must count failed requests (errback), not just successes — otherwise
+# accumulated errors pin _pending_count high and refill stops forever (a run
+# died at ~25k of 8.5M after 5,837 errback'd requests).
+# ---------------------------------------------------------------------------
+
+
+def _make_refill_spider(yielded, responded):
+    s = _make_targets_spider()
+    s._urls_yielded = yielded
+    s._urls_responded = responded
+    s._refill_in_flight = False
+    return s
+
+
+def test_errback_counts_failed_request():
+    s = _make_refill_spider(yielded=5000, responded=0)
+    s._targets_exhausted = True  # isolate the counter from refill
+    list(s._targets_errback(None))
+    assert s._urls_responded == 1
+
+
+def test_errback_drives_refill_when_queue_drains():
+    # pending = yielded - responded, starting just above the refill threshold
+    s = _make_refill_spider(yielded=_REFILL_THRESHOLD + 2, responded=0)
+    batch = [f"http://x/{i}" for i in range(5000)]
+    out = []
+    with mock.patch.object(s, "_fetch_targets_batch", return_value=batch):
+        for _ in range(3):  # three failed requests drain the queue below threshold
+            out += list(s._targets_errback(None))
+    assert len(out) == 5000  # refill fired from the errback path
+    assert s._urls_responded == 3
+    assert out[0].callback == s._parse_and_maybe_refill_targets
+    assert out[0].errback == s._targets_errback
+
+
+def test_refill_noop_while_queue_full_but_still_counts():
+    s = _make_refill_spider(yielded=10_000, responded=0)  # pending >> threshold
+    with mock.patch.object(s, "_fetch_targets_batch", return_value=["x"]) as m:
+        out = list(s._targets_errback(None))
+    assert out == []          # no refill while the queue is full
+    assert m.call_count == 0
+    assert s._urls_responded == 1  # ...but the failure is still counted
