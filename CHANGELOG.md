@@ -1,3 +1,10 @@
+## [1.23.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.2...v1.23.3) (2026-06-15)
+
+
+### Bug Fixes
+
+* **targets:** count failed requests so refill doesn't stop early ([#6](https://github.com/Aarkc/scrapy-calyprium/issues/6)) ([bc2f623](https://github.com/Aarkc/scrapy-calyprium/commit/bc2f6232a71a2586472954a0ce6395e7bb031090))
+
 ## [1.23.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.1...v1.23.2) (2026-06-14)
 
 
