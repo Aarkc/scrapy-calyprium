@@ -1,3 +1,10 @@
+# [1.25.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.24.1...v1.25.0) (2026-06-16)
+
+
+### Features
+
+* **local:** MIMIC_LOCAL_SOLVERS to restrict Tessera captcha solvers ([c4b7c89](https://github.com/Aarkc/scrapy-calyprium/commit/c4b7c89ca1fa4438d1043c3ede9b5f5b140f4db6))
+
 ## [1.24.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.24.0...v1.24.1) (2026-06-16)
 
 
