@@ -1,3 +1,10 @@
+## [1.24.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.24.0...v1.24.1) (2026-06-16)
+
+
+### Bug Fixes
+
+* **local:** serialize solve path to prevent Tessera flooding and remove synchronized TTL expiry ([20fe5f6](https://github.com/Aarkc/scrapy-calyprium/commit/20fe5f678bb633a1c19a565e57cf59c528856ea9))
+
 # [1.24.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.23.3...v1.24.0) (2026-06-15)
 
 
