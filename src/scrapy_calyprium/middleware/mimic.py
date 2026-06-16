@@ -255,6 +255,9 @@ class MimicBrowserMiddleware:
                 solve_client=self._solve_client,
                 proxy_url=proxy_url,
                 provider=self.crawler.settings.get("VEIL_PROVIDER"),
+                # Restrict captcha solving to these Tessera solvers (e.g. ["jevi"]).
+                # Comma-separated MIMIC_LOCAL_SOLVERS; empty -> Tessera's full chain.
+                solvers=self.crawler.settings.getlist("MIMIC_LOCAL_SOLVERS") or None,
                 tracer=tracer,
                 target_pool_size=pool_size,
                 solve_parallel_solves=parallel_solves,

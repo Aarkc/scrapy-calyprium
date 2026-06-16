@@ -127,12 +127,14 @@ def _make_router(
     solve: Optional[FakeSolveClient] = None,
     cache: Optional[DomainCache] = None,
     proxy_url: Optional[str] = None,
+    solvers: Optional[List[str]] = None,
 ):
     router = SpiderAutoRouter(
         fetcher=fetcher or FakeFetcher(),
         cache=cache or DomainCache(),
         solve_client=solve or FakeSolveClient(),
         proxy_url=proxy_url,
+        solvers=solvers,
         target_pool_size=0,  # disable refill in tests
     )
     return router
@@ -209,6 +211,49 @@ class TestSolvePath:
         assert f.calls[1]["cookies"] == [{"name": "cf_clearance", "value": "x"}]
         assert f.calls[1]["user_agent"] == "Mozilla/5.0 Test"
         assert f.calls[1]["proxy_session_id"] == "sess-1"
+
+    @pytest.mark.asyncio
+    async def test_solvers_allowlist_forwarded_to_solve(self):
+        f = FakeFetcher()
+        f.queue(_blocked_403())  # step 2a: light probe blocked
+        f.queue(_ok())           # step 4: post-solve replay
+        s = FakeSolveClient()
+        s.queue(SolveResult(
+            success=True,
+            cookies=[{"name": "cf_clearance", "value": "x"}],
+            user_agent="Mozilla/5.0 Test",
+            proxy_session_id="sess-1",
+            engine="jevi",
+            preset="chrome-latest",
+            duration_ms=3000,
+        ))
+        router = _make_router(fetcher=f, solve=s, cache=DomainCache(), solvers=["jevi"])
+
+        result = await router.fetch("https://example.com/", domain="example.com")
+
+        assert result.blocked is False
+        assert s.calls[0]["solvers"] == ["jevi"]
+
+    @pytest.mark.asyncio
+    async def test_no_solvers_omits_allowlist(self):
+        f = FakeFetcher()
+        f.queue(_blocked_403())  # step 2a: light probe blocked
+        f.queue(_ok())           # step 4: post-solve replay
+        s = FakeSolveClient()
+        s.queue(SolveResult(
+            success=True,
+            cookies=[{"name": "cf_clearance", "value": "x"}],
+            user_agent="Mozilla/5.0 Test",
+            proxy_session_id="sess-1",
+            engine="jevi",
+            preset="chrome-latest",
+            duration_ms=3000,
+        ))
+        router = _make_router(fetcher=f, solve=s, cache=DomainCache())
+
+        await router.fetch("https://example.com/", domain="example.com")
+
+        assert s.calls[0]["solvers"] is None
 
     @pytest.mark.asyncio
     async def test_solve_retries_on_no_cookies(self):

@@ -34,7 +34,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from scrapy_calyprium.routing.block_detect import is_blocked
 from scrapy_calyprium.routing.domain_cache import DomainCache
@@ -74,6 +74,7 @@ class SpiderAutoRouter:
         solve_client: SolveClient,
         proxy_url: Optional[str] = None,
         provider: Optional[str] = None,
+        solvers: Optional[List[str]] = None,
         target_pool_size: int = 8,
         refill_interval: float = 1.0,
         cold_start_burst: int = 4,
@@ -86,6 +87,11 @@ class SpiderAutoRouter:
         self.solve_client = solve_client
         self.proxy_url = proxy_url
         self.provider = provider
+        # Ordered captcha-solver allowlist forwarded to Tessera /api/solve. When
+        # set (e.g. ["jevi"]), the solve never falls through to providers that
+        # can't handle the domain; failed solves return fast and the next pool
+        # refill retries with a fresh veil session (new IP).
+        self.solvers = solvers
         # Request tracer — if set, emits per-URL spans to ClickHouse.
         # Injected by MimicBrowserMiddleware when the CalypriumRequestTracer
         # extension is active.
@@ -235,7 +241,9 @@ class SpiderAutoRouter:
         and a transient failure should not affect spider throughput."""
         try:
             try:
-                solve = await self.solve_client.solve(domain=domain, provider=self.provider)
+                solve = await self.solve_client.solve(
+                    domain=domain, provider=self.provider, solvers=self.solvers,
+                )
             except SolveError as exc:
                 logger.info(
                     "AutoRouter: refill solve failed for %s: %s", domain, exc,
@@ -566,6 +574,7 @@ class SpiderAutoRouter:
         try:
             solve = await self.solve_client.solve(
                 domain=domain, target_url=url, provider=self.provider,
+                solvers=self.solvers,
             )
         except SolveError as exc:
             logger.debug("AutoRouter: solve attempt failed for %s: %s", domain, exc)

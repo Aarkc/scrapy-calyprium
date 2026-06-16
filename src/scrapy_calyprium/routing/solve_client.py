@@ -95,6 +95,7 @@ class SolveClient:
         engine_hint: Optional[str] = None,
         proxy_session_id: Optional[str] = None,
         provider: Optional[str] = None,
+        solvers: Optional[List[str]] = None,
     ) -> SolveResult:
         """Call /api/solve and return the cookies (or a structured failure)."""
         client = await self._get_client()
@@ -107,6 +108,11 @@ class SolveClient:
             body["proxy_session_id"] = proxy_session_id
         if provider:
             body["provider"] = provider
+        # Ordered captcha-solver allowlist (e.g. ["jevi"]). Keeps the solve off
+        # providers that can't handle this domain (whose long failure timeouts
+        # would blow our read budget); we drive retries with fresh IPs instead.
+        if solvers:
+            body["solvers"] = solvers
 
         url = f"{self.service_url}/api/solve"
         try:
