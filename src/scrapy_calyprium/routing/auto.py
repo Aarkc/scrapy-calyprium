@@ -501,72 +501,64 @@ class SpiderAutoRouter:
         else:
             result = None  # known cookies/heavy domain, skip light probe
 
-        # Step 4: solve for cookies with parallel attempts.
+        # Step 4: solve for cookies.
         #
-        # Fire solve_parallel_solves concurrent solve requests, each with a
-        # different session_id → different IP.  First one to succeed populates
-        # the cache; the rest are bonus slots for the pool.  Concurrent spider
-        # requests that arrive while a solve batch is in flight wait on the
-        # per-domain lock briefly, then coalesce on the winner's cookies.
+        # Hold the lock WHILE solving so concurrent requests coalesce: the
+        # first to acquire the lock solves once (1 Tessera/browser call),
+        # stores a slot, then releases.  The next waiter re-checks the cache
+        # at the top of the loop and free-rides on the fresh slot without
+        # triggering another solve.
+        #
+        # The old design fired N parallel solve tasks *outside* the lock. With
+        # a cloud solver (Tessera) as the backend this caused every one of the
+        # 180 concurrent spider requests to fire 6 parallel calls the moment
+        # the pool emptied, flooding the solver with 1 000+ simultaneous
+        # requests. The solver rejected most immediately (blank transport
+        # error), and only the staggered retry sleeps happened to drain the
+        # queue enough for round 5 to get through — adding 20 s overhead per
+        # page. Pool-filling parallelism is now handled exclusively by the
+        # background _ensure_refill_task / _refill_one path.
         block_status = result.status_code if result else 403
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d), solving",
             domain, block_status,
         )
 
-        for attempt in range(1, self.solve_max_retries + 1):
-            # Quick lock to check cache — release immediately so concurrent
-            # requests can coalesce on a slot if one just appeared.
+        winning_slot = None
+        for attempt in range(1, 3):  # at most 2 attempts (transient error retry)
             async with self._solve_lock(domain):
+                # Re-check: a concurrent waiter may have solved while we queued.
+                # Only coalesce on pristine (fail_count==0) slots — those were
+                # just minted by another request.  Slots with failures are the
+                # ones step 2b already tried; replaying them again just burns
+                # another fail_count tick without benefit.
                 entry = self.cache.get(domain)
-                if entry and entry.level == "cookies" and entry.live_slots():
-                    slot = entry.next_slot()
-                    logger.debug(
-                        "AutoRouter: %s solve coalesced — reusing fresh slot",
-                        domain,
-                    )
-                    return await self._replay_with_slot(url, domain, slot, result)
+                if entry and entry.level == "cookies":
+                    pristine = [s for s in entry.live_slots() if s.fail_count == 0]
+                    if pristine:
+                        slot = min(pristine, key=lambda s: s.requests_per_minute())
+                        logger.debug(
+                            "AutoRouter: %s solve coalesced — reusing pristine slot",
+                            domain,
+                        )
+                        return await self._replay_with_slot(url, domain, slot, result)
 
-            # No slot available — fire parallel solves outside the lock so
-            # other requests aren't blocked during the ~15s solve duration.
-            n = min(self.solve_parallel_solves, self.solve_max_retries - attempt + 1)
-            tasks = [
-                asyncio.create_task(self._try_one_solve(domain, url))
-                for _ in range(n)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Find the first successful solve
-            winning_slot = None
-            last_error = None
-            for r in results:
-                if isinstance(r, Exception):
-                    last_error = str(r)
-                elif r is not None:
-                    winning_slot = winning_slot or r  # keep first winner
+                # We hold the lock — one solve, no parallel fan-out.
+                winning_slot = await self._try_one_solve(domain, url)
 
             if winning_slot is not None:
                 return await self._replay_with_slot(url, domain, winning_slot, result)
 
-            # All parallel attempts failed — brief pause before next round
-            logger.info(
-                "AutoRouter: solve round %d/%d: %d parallel attempts all failed "
-                "for %s, retrying",
-                attempt, self.solve_max_retries, n, domain,
-            )
-            await asyncio.sleep(min(attempt * 2, 10))
+            if attempt < 2:
+                await asyncio.sleep(2)
 
-        # All retries exhausted
-        logger.warning(
-            "AutoRouter: all solve attempts exhausted for %s: %s",
-            domain, last_error,
-        )
+        logger.warning("AutoRouter: all solve attempts exhausted for %s", domain)
         return RouteResult(
             fetch=result,
             routing_method="solve_then_replay",
             blocked=True,
             domain_level="cookies",
-            error=last_error,
+            error="solve failed",
         )
 
     async def _try_one_solve(self, domain: str, url: str):

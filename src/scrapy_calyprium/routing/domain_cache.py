@@ -30,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Cookie pool tunables — match server-side defaults so behavior is consistent.
 TTL_LIGHT = 3600
-TTL_COOKIES = 1800
+# 0 = no proactive expiry. Slots die only when fail_count reaches MAX_SLOT_FAILURES
+# (i.e. the upstream WAF actually blocks them). Proactive TTL causes synchronized
+# mass-expiry when the pool was filled in a cold-start burst, collapsing throughput
+# for the full TTL window every ~TTL seconds. Lazy expiry avoids this entirely:
+# a stale cf_clearance earns a 403 → record_slot_failure → is_live=False → evicted.
+TTL_COOKIES = 0
 TTL_HEAVY = 21600
 # Tolerate 3 failures per slot before declaring it dead. Tested
 # MAX_SLOT_FAILURES=1 in production — block rate WORSENED from 72%
@@ -65,9 +70,9 @@ def configure(max_slots: int = None, rpm_cap: float = None,
     next_slot()/set_cookies_from_solve()/CookieSlot.is_expired() read these
     module globals at call time, so updating them before the crawl starts takes
     effect. Used to scale the cookie pool for higher throughput (more slots),
-    keep the per-slot RPM cap that protects cf_clearance lifetime, and extend
-    how long a solved clearance is reused (cookie_ttl) when the domain's
-    clearance outlives the default — more pages per solve.
+    keep the per-slot RPM cap that protects cf_clearance lifetime, and optionally
+    set cookie_ttl (seconds) when a hard expiry is desired. Pass cookie_ttl=0
+    (or leave it None) for lazy expiry — slots live until the WAF blocks them.
     """
     global MAX_SLOTS_PER_DOMAIN, SLOT_RPM_HARD_CAP, TTL_COOKIES
     if max_slots is not None:
@@ -75,7 +80,7 @@ def configure(max_slots: int = None, rpm_cap: float = None,
     if rpm_cap is not None:
         SLOT_RPM_HARD_CAP = float(rpm_cap)
     if cookie_ttl is not None:
-        TTL_COOKIES = float(cookie_ttl)
+        TTL_COOKIES = float(cookie_ttl)  # 0.0 → lazy expiry (no proactive TTL)
 
 # AAR-14 circuit breaker tunables
 PROMOTION_COOLDOWN_SECONDS = 300
@@ -118,7 +123,7 @@ class CookieSlot:
 
     @property
     def is_expired(self) -> bool:
-        return (_now() - self.created_at) > TTL_COOKIES
+        return TTL_COOKIES > 0 and (_now() - self.created_at) > TTL_COOKIES
 
     @property
     def is_live(self) -> bool:
