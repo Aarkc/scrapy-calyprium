@@ -1,3 +1,10 @@
+## [1.26.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.0...v1.26.1) (2026-06-18)
+
+
+### Bug Fixes
+
+* **local:** evict dead cookie slots first, never healthy long-lived ones ([e12cca3](https://github.com/Aarkc/scrapy-calyprium/commit/e12cca32246c7942acc8a0bcfaee6bdd4e9c5b15))
+
 # [1.26.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.25.0...v1.26.0) (2026-06-18)
 
 
