@@ -366,3 +366,38 @@ class TestCapRecovery:
         entry._last_cap_raise_time = 0  # never raised
         entry.maybe_raise_cap()
         assert entry.learned_rpm_cap == pytest.approx(55.0, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Slot eviction preserves healthy cookies
+# ---------------------------------------------------------------------------
+
+
+class TestSlotEvictionKeepsLiveCookies:
+    def test_cap_evicts_dead_not_healthy_old(self):
+        # When the pool is over the cap, a DEAD slot must be evicted before any
+        # healthy one — the old recency cap (slots[-MAX:]) dropped the oldest
+        # (most-used, still-healthy) cookie, forcing ~10x more solves.
+        import scrapy_calyprium.routing.domain_cache as dc
+
+        orig = dc.MAX_SLOTS_PER_DOMAIN
+        dc.MAX_SLOTS_PER_DOMAIN = 3
+        try:
+            cache = dc.DomainCache()
+            for sid in ("OLD", "MID", "NEWERDEAD"):
+                cache.set_cookies_from_solve(
+                    "d.com", cookies=[{"name": "c", "value": "1"}],
+                    user_agent="UA", proxy_session_id=sid,
+                )
+            entry = cache.get("d.com")
+            entry.slots[2].fail_count = dc.MAX_SLOT_FAILURES  # newest one dies
+            cache.set_cookies_from_solve(
+                "d.com", cookies=[{"name": "c", "value": "1"}],
+                user_agent="UA", proxy_session_id="NEW",
+            )
+            ids = [s.proxy_session_id for s in entry.slots]
+            assert "OLD" in ids          # healthy oldest retained
+            assert "NEWERDEAD" not in ids  # dead one evicted
+            assert all(s.is_live for s in entry.slots)
+        finally:
+            dc.MAX_SLOTS_PER_DOMAIN = orig

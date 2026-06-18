@@ -387,7 +387,18 @@ class DomainCache:
         )
         entry.slots.append(slot)
         if len(entry.slots) > MAX_SLOTS_PER_DOMAIN:
-            entry.slots = entry.slots[-MAX_SLOTS_PER_DOMAIN:]
+            # Evict DEAD slots first; never discard a healthy long-lived cookie
+            # just because it's old. The previous recency cap (slots[-MAX:])
+            # dropped the OLDEST slot — which is the one that has served the
+            # most requests and still has most of its ~190-request budget left.
+            # As dead slots (fail_count>=MAX_SLOT_FAILURES) piled up, live count
+            # fell below target, the refill kept firing, and each refill evicted
+            # another healthy cookie — ~10x more solves than attrition needs.
+            live = [s for s in entry.slots if s.is_live]
+            if len(live) > MAX_SLOTS_PER_DOMAIN:
+                entry.slots = live[-MAX_SLOTS_PER_DOMAIN:]
+            else:
+                entry.slots = live  # drop the dead slots, keep every live one
         entry.updated_at = _now()
         logger.debug(
             "DomainCache: added slot for %s (slots=%d, session=%s, egress_ip=%s)",
