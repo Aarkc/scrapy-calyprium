@@ -191,6 +191,41 @@ class TestNextSlotRespectsRateCap:
         chosen = entry.next_slot()
         assert chosen.proxy_session_id == "B"
 
+    def test_prefers_idle_slot_over_busy(self):
+        # A cookie with an in-flight request is skipped for an idle one even
+        # when the idle one has higher recent RPM — concurrent requests on one
+        # cf_clearance get it flagged, so spread to one-request-per-cookie.
+        cache = DomainCache()
+        cache.set_cookies_from_solve(
+            "example.com", cookies=[{"name": "c", "value": "1"}],
+            user_agent="UA", proxy_session_id="BUSY",
+        )
+        cache.set_cookies_from_solve(
+            "example.com", cookies=[{"name": "c", "value": "2"}],
+            user_agent="UA", proxy_session_id="IDLE",
+        )
+        entry = cache.get("example.com")
+        busy, idle = entry.slots[0], entry.slots[1]
+        busy.in_flight = 1
+        for _ in range(3):
+            idle.record_request()  # higher RPM, but idle
+        assert entry.next_slot().proxy_session_id == "IDLE"
+
+    def test_all_busy_picks_least_in_flight(self):
+        cache = DomainCache()
+        cache.set_cookies_from_solve(
+            "example.com", cookies=[{"name": "c", "value": "1"}],
+            user_agent="UA", proxy_session_id="A",
+        )
+        cache.set_cookies_from_solve(
+            "example.com", cookies=[{"name": "c", "value": "2"}],
+            user_agent="UA", proxy_session_id="B",
+        )
+        entry = cache.get("example.com")
+        entry.slots[0].in_flight = 2
+        entry.slots[1].in_flight = 1
+        assert entry.next_slot().proxy_session_id == "B"
+
     def test_falls_back_to_least_loaded_when_all_over_cap(self):
         cache = DomainCache()
         cache.set_cookies_from_solve(

@@ -458,8 +458,10 @@ class SpiderAutoRouter:
                         slot = entry.next_slot() or slot
 
                 # Record the request BEFORE sending so concurrent peers see
-                # an updated RPM and pick a different slot.
+                # an updated RPM and pick a different slot. Mark the cookie
+                # busy so next_slot() routes concurrent peers to idle cookies.
                 self.cache.record_request(domain, slot.slot_id)
+                slot.in_flight += 1
 
                 try:
                     result = await self.fetcher.fetch(
@@ -502,6 +504,8 @@ class SpiderAutoRouter:
                         domain=domain, slot=slot, outcome="blocked",
                         status_code=result.status_code,
                     )
+                finally:
+                    slot.in_flight -= 1
 
         # Step 3: try httpcloak without cookies (light path).
         # Step 3: light path already tried in Step 2a above. If we're here,
@@ -605,16 +609,20 @@ class SpiderAutoRouter:
     async def _replay_with_slot(self, url, domain, slot, original_result):
         """Replay a URL with a cookie slot. Returns RouteResult."""
         self.cache.record_request(domain, slot.slot_id)
+        slot.in_flight += 1  # busy until the fetch completes (see CookieSlot)
         try:
-            replay = await self.fetcher.fetch(
-                url=url,
-                cookies=slot.cookies,
-                user_agent=slot.user_agent,
-                proxy_url=self.proxy_url,
-                proxy_session_id=slot.proxy_session_id,
-                provider=slot.provider,
-                preset=slot.preset,
-            )
+            try:
+                replay = await self.fetcher.fetch(
+                    url=url,
+                    cookies=slot.cookies,
+                    user_agent=slot.user_agent,
+                    proxy_url=self.proxy_url,
+                    proxy_session_id=slot.proxy_session_id,
+                    provider=slot.provider,
+                    preset=slot.preset,
+                )
+            finally:
+                slot.in_flight -= 1
         except LocalFetchError as exc:
             logger.warning(
                 "AutoRouter: replay error for %s: %s", domain, exc,

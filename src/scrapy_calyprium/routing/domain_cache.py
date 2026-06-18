@@ -119,6 +119,12 @@ class CookieSlot:
     # Veil provider used for the solve — replay must route through the same
     # provider so cookies stay valid for the upstream IP.
     provider: Optional[str] = None
+    # Number of replay requests currently in flight on this cookie. Cloudflare
+    # flags a cf_clearance that issues concurrent requests as bot-like and
+    # blocks it early (an isolated cookie sustains ~170+ requests; one hit by
+    # 2-3 concurrent dies in ~18). next_slot() prefers idle (in_flight==0)
+    # cookies so we spread load to one-request-per-cookie whenever possible.
+    in_flight: int = 0
     _request_times: List[float] = field(default_factory=list)
 
     @property
@@ -202,24 +208,26 @@ class DomainEntry:
         live = self.live_slots()
         if not live:
             return None
-        if len(live) == 1:
-            return live[0]
-
-        # Sort by current per-slot RPM (ascending — least loaded first)
-        sorted_slots = sorted(live, key=lambda s: s.requests_per_minute())
 
         # Effective cap = min(learned, hard_cap)
         cap = SLOT_RPM_HARD_CAP
         if self.learned_rpm_cap is not None:
             cap = min(cap, self.learned_rpm_cap)
 
-        under_cap = [
-            s for s in sorted_slots if s.requests_per_minute() < cap
+        # Prefer an IDLE cookie (no in-flight request) that's under the rate
+        # cap. Stacking a 2nd concurrent request on a busy cf_clearance reads
+        # as bot-like to Cloudflare and gets the cookie flagged early; with
+        # enough slots this keeps us at ~one-request-per-cookie, which is what
+        # lets each cookie sustain ~170+ requests instead of dying at ~18.
+        idle = [
+            s for s in live if s.in_flight == 0 and s.requests_per_minute() < cap
         ]
-        if under_cap:
-            return under_cap[0]
+        if idle:
+            return min(idle, key=lambda s: s.requests_per_minute())
 
-        return sorted_slots[0]
+        # All cookies busy or capped — fall back to the least-loaded by
+        # (in_flight, rpm) so concurrent overflow still spreads evenly.
+        return min(live, key=lambda s: (s.in_flight, s.requests_per_minute()))
 
     def record_block_rpm(self, slot: CookieSlot) -> None:
         """Record the RPM the slot was running at when it got blocked.
