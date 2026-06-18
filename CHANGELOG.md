@@ -1,3 +1,10 @@
+# [1.26.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.25.0...v1.26.0) (2026-06-18)
+
+
+### Features
+
+* **local:** in-flight-aware slot selection — one request per cookie ([6b1a5d0](https://github.com/Aarkc/scrapy-calyprium/commit/6b1a5d0a32acbc3f0bc3300d12679a4ea935bcc9))
+
 # [1.25.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.24.1...v1.25.0) (2026-06-16)
 
 
