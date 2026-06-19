@@ -110,7 +110,27 @@ class PrismSitemapSpider(scrapy.Spider):
 
     @property
     def _pending_count(self) -> int:
-        return self._urls_yielded - self._urls_responded
+        """Requests still queued in the scheduler — the signal that gates lazy
+        refill of the next URL batch.
+
+        Reads the engine's real scheduler depth, which cannot leak. The old
+        estimate (``_urls_yielded - _urls_responded``) undercounted responses
+        whenever a request failed in a downstream middleware without reaching
+        the spider callback OR errback — e.g. httpcloak "cookie replay infra
+        error" drops, which never fire either. Those requests inflated the
+        estimate permanently, pinning it above ``_REFILL_THRESHOLD`` so refill
+        never fired again: every run stalled after the ~200k startup burst with
+        millions of targets still pending. The scheduler depth reflects actual
+        queued work regardless of how a request resolves, so refill keeps firing
+        until the source is genuinely exhausted.
+
+        Falls back to the bookkeeping estimate only if the engine/scheduler is
+        not reachable (e.g. before the engine is fully started, or a custom
+        scheduler without ``__len__``)."""
+        try:
+            return len(self.crawler.engine.slot.scheduler)
+        except Exception:
+            return self._urls_yielded - self._urls_responded
 
     def start_requests(self):
         if not self.url_source:
@@ -244,16 +264,15 @@ class PrismSitemapSpider(scrapy.Spider):
         return urls
 
     def _maybe_refill_targets(self):
-        """Fetch the next batch of targets when the in-flight queue runs low.
+        """Fetch the next batch of targets when the scheduler queue runs low.
 
-        Yields the new Requests (possibly none). Shared by the success callback
-        AND the errback: a request that fails leaves the queue just like one
-        that succeeds, so it must drive refill too. Otherwise failed requests
-        (which never reach the callback) inflate _pending_count without bound —
-        once cumulative failures exceed _REFILL_THRESHOLD the gate below can
-        never open again, refill stops, the queue drains, and the crawl ends
-        early with millions of targets still pending (AAR: a run died at ~25k of
-        8.5M after 5,837 errback'd requests pinned _pending_count at ~5.8k)."""
+        Yields the new Requests (possibly none). Driven from the success
+        callback AND the errback so refill keeps getting a chance to fire as
+        the queue drains. The leak that previously stalled refill (failed
+        requests bypassing both callback and errback) is now neutralised at the
+        source: ``_pending_count`` reads the real scheduler depth, so it can't
+        be pinned above ``_REFILL_THRESHOLD`` by un-acked failures (see the
+        property docstring; AAR: runs died at ~25k then ~200k of 8.5M)."""
         if (self._targets_exhausted
                 or self._refill_in_flight
                 or self._pending_count >= _REFILL_THRESHOLD):

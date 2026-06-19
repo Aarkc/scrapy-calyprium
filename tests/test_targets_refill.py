@@ -121,8 +121,58 @@ def test_errback_drives_refill_when_queue_drains():
 
 def test_refill_noop_while_queue_full_but_still_counts():
     s = _make_refill_spider(yielded=10_000, responded=0)  # pending >> threshold
+    s.crawler = _FakeCrawler(_FakeScheduler(10_000))
     with mock.patch.object(s, "_fetch_targets_batch", return_value=["x"]) as m:
         out = list(s._targets_errback(None))
     assert out == []          # no refill while the queue is full
     assert m.call_count == 0
     assert s._urls_responded == 1  # ...but the failure is still counted
+
+
+# ---------------------------------------------------------------------------
+# The real fix: _pending_count reads the engine's scheduler depth, which can't
+# leak. Failures that bypass BOTH callback and errback (httpcloak "cookie replay
+# infra error" drops) inflated the old yielded-minus-responded estimate without
+# bound, pinning it above _REFILL_THRESHOLD so refill never fired again — every
+# run stalled after the ~200k startup burst with millions of targets pending.
+# ---------------------------------------------------------------------------
+
+
+class _FakeScheduler:
+    def __init__(self, depth):
+        self._depth = depth
+
+    def __len__(self):
+        return self._depth
+
+
+class _FakeCrawler:
+    def __init__(self, scheduler):
+        self.engine = mock.Mock()
+        self.engine.slot.scheduler = scheduler
+
+
+def test_pending_count_prefers_scheduler_depth():
+    # Bookkeeping would read 200k (leaked); the real queue holds 42.
+    s = _make_refill_spider(yielded=200_000, responded=0)
+    s.crawler = _FakeCrawler(_FakeScheduler(42))
+    assert s._pending_count == 42
+
+
+def test_pending_count_falls_back_without_engine():
+    # No crawler/engine reachable -> fall back to the bookkeeping estimate.
+    s = _make_refill_spider(yielded=5000, responded=2000)
+    assert s._pending_count == 3000
+
+
+def test_refill_resumes_despite_leaked_bookkeeping():
+    # Production bug: 15,653 requests failed without acking, so
+    # yielded-minus-responded is pinned at 15,653 (>> threshold). With the
+    # scheduler actually drained, refill MUST still fire.
+    s = _make_refill_spider(yielded=215_653, responded=200_000)  # estimate=15,653
+    s.crawler = _FakeCrawler(_FakeScheduler(10))  # real queue near-empty
+    assert s._pending_count == 10
+    batch = [f"http://x/{i}" for i in range(5000)]
+    with mock.patch.object(s, "_fetch_targets_batch", return_value=batch):
+        out = list(s._maybe_refill_targets())
+    assert len(out) == 5000  # refill fired despite the leaked estimate
