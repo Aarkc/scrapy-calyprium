@@ -1,3 +1,10 @@
+## [1.26.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.1...v1.26.2) (2026-06-19)
+
+
+### Bug Fixes
+
+* **spiders:** drive targets/recrawl/prism refill off real scheduler depth ([215a96a](https://github.com/Aarkc/scrapy-calyprium/commit/215a96a424aefcc21da9f7d505977f37cc80c907))
+
 ## [1.26.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.0...v1.26.1) (2026-06-18)
 
 
