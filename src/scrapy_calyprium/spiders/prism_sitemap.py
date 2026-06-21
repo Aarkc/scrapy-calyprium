@@ -192,7 +192,12 @@ class PrismSitemapSpider(scrapy.Spider):
         self._targets_spider_slug = spider_slug
         self._targets_type = target_type
         self._targets_exhausted = False
-        self._targets_offset = 0
+        # Keyset cursor (last id seen) — NOT an offset. Offset pagination skips
+        # rows and terminates early as the pending set shrinks under concurrent
+        # mark-crawled (a run died at ~737k of millions that way). `id > cursor`
+        # only moves forward through still-pending rows, so one run drains the
+        # whole backlog. 0 = first page.
+        self._targets_cursor = 0
         self._targets_fetch_failures = 0
 
         urls = self._fetch_targets_batch()
@@ -215,7 +220,9 @@ class PrismSitemapSpider(scrapy.Spider):
         import requests as req
 
         limit = min(self.batch_size, 50000)
-        api_params = {"limit": limit, "offset": self._targets_offset}
+        # Keyset pagination: ask for rows with id strictly greater than the last
+        # one we saw. Stable while mark-crawled shrinks the pending set.
+        api_params = {"limit": limit, "after_id": self._targets_cursor}
         if self._targets_type:
             api_params["target_type"] = self._targets_type
 
@@ -236,28 +243,38 @@ class PrismSitemapSpider(scrapy.Spider):
             if self._targets_fetch_failures >= _TARGETS_MAX_FETCH_FAILURES:
                 logger.error(
                     f"Targets: {self._targets_fetch_failures} consecutive fetch "
-                    f"failures (offset={self._targets_offset:,}), stopping refill: {e}")
+                    f"failures (cursor={self._targets_cursor:,}), stopping refill: {e}")
                 self._targets_exhausted = True
             else:
                 logger.warning(
                     f"Targets: transient fetch failure "
                     f"{self._targets_fetch_failures}/{_TARGETS_MAX_FETCH_FAILURES} "
-                    f"(offset={self._targets_offset:,}), will retry: {e}")
+                    f"(cursor={self._targets_cursor:,}), will retry: {e}")
             return []
 
         # A successful fetch clears the consecutive-failure run.
         self._targets_fetch_failures = 0
 
         urls = data.get("urls", [])
-        total = data.get("total_pending", 0)
+        total = data.get("total_pending")  # None in keyset mode (COUNT skipped)
 
         if not urls:
-            logger.info(f"Targets: no more pending targets (total={total})")
+            logger.info(f"Targets: no more pending targets (cursor={self._targets_cursor:,})")
             self._targets_exhausted = True
             return []
 
-        logger.info(f"Targets: got {len(urls):,} pending (offset={self._targets_offset:,}, total={total:,})")
-        self._targets_offset += len(urls)
+        # Advance the keyset cursor to the last id in this batch. The server
+        # returns next_cursor; fall back to the old offset bump only if a legacy
+        # server omits it (so we never silently re-fetch the same page forever).
+        next_cursor = data.get("next_cursor")
+        total_str = f", total={total:,}" if isinstance(total, int) else ""
+        logger.info(
+            f"Targets: got {len(urls):,} pending "
+            f"(cursor={self._targets_cursor:,}{total_str})")
+        if next_cursor is not None:
+            self._targets_cursor = next_cursor
+        else:
+            self._targets_cursor += len(urls)
         if len(urls) < limit:
             self._targets_exhausted = True
 

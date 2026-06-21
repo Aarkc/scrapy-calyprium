@@ -25,7 +25,7 @@ def _make_targets_spider():
     spider._targets_api_key = "secret"
     spider._targets_user_id = "user"
     spider._targets_type = "product"
-    spider._targets_offset = 10_000
+    spider._targets_cursor = 10_000
     spider._targets_exhausted = False
     spider._targets_fetch_failures = 0
     return spider
@@ -163,6 +163,60 @@ def test_pending_count_falls_back_without_engine():
     # No crawler/engine reachable -> fall back to the bookkeeping estimate.
     s = _make_refill_spider(yielded=5000, responded=2000)
     assert s._pending_count == 3000
+
+
+def _mk_resp(urls, next_cursor=None, total=None):
+    r = mock.Mock()
+    r.raise_for_status = mock.Mock()
+    body = {"urls": list(urls)}
+    if next_cursor is not None:
+        body["next_cursor"] = next_cursor
+    if total is not None:
+        body["total_pending"] = total
+    r.json = mock.Mock(return_value=body)
+    return r
+
+
+def test_keyset_sends_after_id_cursor():
+    # The fetch must page by `after_id` (keyset), not `offset` — offset over a
+    # shrinking pending set skips rows and ends the run early at ~one window.
+    s = _make_targets_spider()
+    s._targets_cursor = 12345
+    captured = {}
+    def fake_get(url, params=None, **kw):
+        captured.update(params or {})
+        return _mk_resp([f"http://x/{i}" for i in range(5000)], next_cursor=99999)
+    with mock.patch("requests.get", side_effect=fake_get):
+        urls = s._fetch_targets_batch()
+    assert captured.get("after_id") == 12345   # cursor sent
+    assert "offset" not in captured             # NOT offset pagination
+    assert len(urls) == 5000
+
+
+def test_keyset_advances_cursor_to_next_cursor():
+    s = _make_targets_spider()
+    s._targets_cursor = 0
+    with mock.patch("requests.get", return_value=_mk_resp(["http://x/%d" % i for i in range(5000)], next_cursor=88888)):
+        s._fetch_targets_batch()
+    assert s._targets_cursor == 88888           # advanced to server cursor, not +len
+    assert s._targets_exhausted is False
+
+
+def test_keyset_short_batch_exhausts():
+    s = _make_targets_spider()
+    with mock.patch("requests.get", return_value=_mk_resp(["http://x/1"], next_cursor=5)):
+        urls = s._fetch_targets_batch()
+    assert len(urls) == 1
+    assert s._targets_exhausted is True         # short page => end of backlog
+
+
+def test_keyset_fallback_when_server_omits_next_cursor():
+    # Legacy server (no next_cursor) must not pin the cursor and re-fetch forever.
+    s = _make_targets_spider()
+    s._targets_cursor = 100
+    with mock.patch("requests.get", return_value=_mk_resp(["http://x/%d" % i for i in range(5000)])):
+        s._fetch_targets_batch()
+    assert s._targets_cursor == 5100            # fell back to += len(urls)
 
 
 def test_refill_resumes_despite_leaked_bookkeeping():
