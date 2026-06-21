@@ -1,3 +1,10 @@
+## [1.26.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.2...v1.26.3) (2026-06-21)
+
+
+### Bug Fixes
+
+* **spiders:** keyset (cursor) pagination for targets:// — drain the whole backlog ([1664815](https://github.com/Aarkc/scrapy-calyprium/commit/1664815b449f7bb37260adb045390bafcb7e3788))
+
 ## [1.26.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.1...v1.26.2) (2026-06-19)
 
 
