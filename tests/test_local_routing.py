@@ -425,3 +425,75 @@ class TestHeavyDomainBehavior:
 
         assert result.blocked is False
         assert result.domain_level == "light"
+
+
+# ---------------------------------------------------------------------------
+# Regression: cookie-pool must survive a light-path flicker, and a solve on a
+# "light" domain must promote it to "cookies". Together these caused DigiKey
+# throughput to collapse to ~1 page/solve (pool capped at ~1-2 slots) because
+# a ~8%-of-the-time cookieless 200 on a warm IP both (a) wiped the pool via
+# set_light and (b) trapped the domain at "light" so the replay path was never
+# used and every page re-solved.
+# ---------------------------------------------------------------------------
+
+
+class TestPoolPreservedOnLightFlicker:
+    @pytest.mark.asyncio
+    async def test_light_200_does_not_wipe_existing_cookie_pool(self):
+        cache = DomainCache()
+        cache.set_cookies_from_solve(
+            "example.com",
+            [{"name": "cf_clearance", "value": "x"}],
+            "Mozilla/5.0 Test",
+            "sess-1",
+            preset="chrome-143",
+        )
+        assert len(cache.get("example.com").live_slots()) == 1
+
+        f = FakeFetcher()
+        f.queue(_ok())  # cookieless light fetch returns 200 (warm-IP fluke)
+        router = _make_router(fetcher=f, cache=cache)
+
+        result = await router.fetch("https://example.com/", domain="example.com")
+
+        assert result.blocked is False
+        entry = cache.get("example.com")
+        assert entry is not None
+        # The healthy cf_clearance pool must NOT be wiped or demoted.
+        assert entry.level == "cookies"
+        assert len(entry.live_slots()) == 1
+        assert result.domain_level == "cookies"
+
+
+class TestSolvePromotesLightToCookies:
+    def test_solve_on_light_domain_promotes_to_cookies(self):
+        cache = DomainCache()
+        cache.set_light("example.com")
+        assert cache.get_level("example.com") == "light"
+
+        cache.set_cookies_from_solve(
+            "example.com",
+            [{"name": "cf_clearance", "value": "x"}],
+            "Mozilla/5.0 Test",
+            "sess-1",
+            preset="chrome-143",
+        )
+
+        entry = cache.get("example.com")
+        assert entry.level == "cookies"  # promoted, not stuck at "light"
+        assert len(entry.live_slots()) == 1
+
+    def test_pool_grows_across_solves_on_promoted_domain(self):
+        cache = DomainCache()
+        cache.set_light("example.com")
+        for i in range(3):
+            cache.set_cookies_from_solve(
+                "example.com",
+                [{"name": "cf_clearance", "value": f"v{i}"}],
+                "Mozilla/5.0 Test",
+                f"sess-{i}",
+                preset="chrome-143",
+            )
+        entry = cache.get("example.com")
+        assert entry.level == "cookies"
+        assert len(entry.live_slots()) == 3

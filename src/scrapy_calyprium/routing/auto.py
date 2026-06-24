@@ -426,12 +426,23 @@ class SpiderAutoRouter:
         except LocalFetchError:
             light_result = None
         if light_result and not is_blocked(light_result.status_code, light_result.body):
-            self.cache.set_light(domain)
+            # A cookieless 200 here is often a warm-IP fluke: hard domains like
+            # DigiKey serve ~8% of cookieless requests on Evomi IPs that recently
+            # passed a challenge. set_light() REPLACES the entry and discards
+            # every cookie slot, so a single fluke would nuke a healthy
+            # cf_clearance pool — capping the pool at ~1-2 slots and throughput at
+            # a fraction of target. Re-read the entry (a concurrent peer may have
+            # just built the pool) and only demote when there's no live cookie
+            # pool worth protecting.
+            entry = self.cache.get(domain)
+            has_pool = bool(entry and entry.level == "cookies" and entry.live_slots())
+            if not has_pool:
+                self.cache.set_light(domain)
             return RouteResult(
                 fetch=light_result,
                 routing_method="httpcloak_light",
                 blocked=False,
-                domain_level="light",
+                domain_level="cookies" if has_pool else "light",
             )
 
         # Step 2b: light path failed → try cookie replay if available.

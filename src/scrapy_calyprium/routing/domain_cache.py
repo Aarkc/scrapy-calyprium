@@ -366,13 +366,22 @@ class DomainCache:
     ) -> CookieSlot:
         """Add a new cookie slot from a Mimic /api/solve response."""
         entry = self._entries.get(domain)
-        if entry and entry.level == "light":
-            # Don't re-promote — the light path works without cookies.
-            # Stale concurrent solves may still arrive but their cookies
-            # aren't needed. Keep the entry so the slot gets cached but
-            # don't change the level.
-            pass
-        elif not entry or entry.level != "cookies":
+        if entry is None:
+            entry = DomainEntry(level="cookies", ttl=float(TTL_COOKIES))
+            self._entries[domain] = entry
+        elif entry.level == "light":
+            # We only reach a solve because the light path was BLOCKED — this
+            # domain genuinely needs cookies. Promote light->cookies IN PLACE
+            # (keeping any slots already cached) so the cookie-replay path
+            # (which gates on level=="cookies") actually uses what we mint.
+            # Previously this branch left the level at "light": a domain that
+            # ever flickered to "light" (e.g. an ~8%-of-the-time cookieless 200
+            # on a warm IP) stayed light forever, slots piled up unused, and
+            # every page re-solved (~1 page/solve instead of ~85).
+            entry.level = "cookies"
+        elif entry.level != "cookies":
+            # heavy (browser) — leave that to the heavy state machine; start a
+            # fresh cookies entry.
             entry = DomainEntry(level="cookies", ttl=float(TTL_COOKIES))
             self._entries[domain] = entry
 
