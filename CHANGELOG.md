@@ -1,3 +1,10 @@
+## [1.26.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.3...v1.26.4) (2026-06-24)
+
+
+### Bug Fixes
+
+* **local:** keep cookie pool on light-path flicker; promote light->cookies on solve ([7a740f1](https://github.com/Aarkc/scrapy-calyprium/commit/7a740f108de0c6ad9d0a81b56a441193cca6b466))
+
 ## [1.26.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.2...v1.26.3) (2026-06-21)
 
 
