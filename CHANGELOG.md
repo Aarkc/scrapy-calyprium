@@ -1,3 +1,10 @@
+## [1.26.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.4...v1.26.5) (2026-08-13)
+
+
+### Bug Fixes
+
+* **block-detect:** content-type gate + block-detection bypass ([4bfa694](https://github.com/Aarkc/scrapy-calyprium/commit/4bfa694dc22c56214379af39630c73b3219921ce))
+
 ## [1.26.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.3...v1.26.4) (2026-06-24)
 
 
