@@ -15,6 +15,10 @@ Settings:
     SPECTRE_DEVICE_TYPE: Filter by device type (optional)
     SPECTRE_BROWSER_FAMILY: Filter by browser (optional)
     SPECTRE_OS_FAMILY: Filter by OS (optional)
+    SPECTRE_BLOCK_DETECTION: Detect blocks and rotate the fingerprint on a hit
+        (default: True). Set False for spiders that hit clean JSON/XML APIs where
+        block-detection only causes false-positive fingerprint churn. Can also be
+        bypassed per-request with ``request.meta["spectre_skip_block_detection"]``.
 """
 
 import logging
@@ -50,6 +54,7 @@ class SpectreMiddleware:
         device_type: Optional[str] = None,
         browser_family: Optional[str] = None,
         os_family: Optional[str] = None,
+        block_detection: bool = True,
     ):
         self.service_url = service_url.rstrip("/")
         self.api_key = api_key
@@ -59,6 +64,7 @@ class SpectreMiddleware:
         self.device_type = device_type
         self.browser_family = browser_family
         self.os_family = os_family
+        self.block_detection = block_detection
 
         # Cached fingerprint for non-rotating mode
         self._cached_fingerprint: Optional[Dict] = None
@@ -99,6 +105,7 @@ class SpectreMiddleware:
             device_type=crawler.settings.get("SPECTRE_DEVICE_TYPE"),
             browser_family=crawler.settings.get("SPECTRE_BROWSER_FAMILY"),
             os_family=crawler.settings.get("SPECTRE_OS_FAMILY"),
+            block_detection=crawler.settings.getbool("SPECTRE_BLOCK_DETECTION", True),
         )
         crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
@@ -253,7 +260,14 @@ class SpectreMiddleware:
         fingerprint cache and forced a Spectre re-roll. Now uses the
         AAR-15 block_detect.is_blocked() helper which checks for real
         challenge markers.
+
+        Block-detection can be turned off entirely with SPECTRE_BLOCK_DETECTION
+        = False (for clean JSON/XML API spiders) or skipped per-request with
+        request.meta["spectre_skip_block_detection"].
         """
+        if not self.block_detection or request.meta.get("spectre_skip_block_detection"):
+            return response
+
         blocked = False
 
         if response.status in (403, 429, 503):
@@ -261,7 +275,12 @@ class SpectreMiddleware:
         elif hasattr(response, "body"):
             try:
                 from scrapy_calyprium.routing.block_detect import is_blocked
-                blocked = is_blocked(response.status, response.body)
+                content_type = response.headers.get("Content-Type", b"").decode(
+                    "latin-1", "ignore"
+                )
+                blocked = is_blocked(
+                    response.status, response.body, content_type=content_type
+                )
             except ImportError:
                 # Optional [local] extra not installed.
                 pass
