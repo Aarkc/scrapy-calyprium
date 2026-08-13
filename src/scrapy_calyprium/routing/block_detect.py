@@ -7,7 +7,7 @@ Decisions live in this single function so the SDK and the server-side router
 can stay in sync. AAR-15.
 """
 import re
-from typing import Union
+from typing import Optional, Union
 
 # Status codes that strongly indicate bot blocking
 BLOCKED_STATUS_CODES = {403, 429, 503}
@@ -102,7 +102,11 @@ def _is_binary_magic(prefix: bytes) -> bool:
     )
 
 
-def is_blocked(status_code: int, body: Union[bytes, str]) -> bool:
+def is_blocked(
+    status_code: int,
+    body: Union[bytes, str],
+    content_type: Optional[str] = None,
+) -> bool:
     """Detect if a response indicates bot blocking or a challenge page.
 
     Accepts either bytes or str. For binary content, the HTML challenge
@@ -113,7 +117,23 @@ def is_blocked(status_code: int, body: Union[bytes, str]) -> bool:
     For HTML responses, decodes a small prefix as latin-1 (which never fails)
     and runs the signature checks. Latin-1 is safe because all the signatures
     are pure ASCII.
+
+    ``content_type`` (the response Content-Type header, if known) suppresses
+    false positives on API responses: a non-error response whose content-type
+    is not HTML (application/json, text/xml, images, ...) is never a bot
+    challenge — challenge pages are always served as text/html. Without it, a
+    clean 200 JSON body that merely contains a phrase like "access denied" or
+    "automated access" (common in government/OData APIs) was mis-flagged,
+    churning the fingerprint cache. Error statuses (403/429/503) still fall
+    through to the status-based checks below regardless of content-type.
     """
+    if (
+        status_code not in BLOCKED_STATUS_CODES
+        and content_type
+        and "html" not in content_type.lower()
+    ):
+        return False
+
     is_binary = False
     body_len = len(body)
 

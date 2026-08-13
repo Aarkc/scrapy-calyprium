@@ -113,3 +113,46 @@ class TestRealPagePassthrough:
     def test_200_tiny_stub_blocked(self):
         body = "<html></html>"
         assert is_blocked(200, body) is True
+
+
+class TestContentTypeGate:
+    """A 2xx non-HTML response is never a challenge — the content-type gate
+    must suppress the HTML heuristics so API bodies aren't mis-flagged."""
+
+    # A clean JSON body that legitimately contains challenge-marker words
+    # (common in government/OData APIs). Without the content-type it false-fires.
+    JSON_WITH_MARKERS = (
+        '{"items":[{"note":"This portal provides automated access to records; '
+        'access denied to unauthenticated bots. recaptcha not required."}]}'
+    )
+
+    def test_json_marker_false_positive_without_content_type(self):
+        # Documents the pre-fix behavior: markers in a JSON body trip it.
+        assert is_blocked(200, self.JSON_WITH_MARKERS) is True
+
+    def test_json_marker_suppressed_with_json_content_type(self):
+        assert (
+            is_blocked(200, self.JSON_WITH_MARKERS, content_type="application/json")
+            is False
+        )
+
+    def test_large_json_with_marker_suppressed(self):
+        big = '{"x":"' + ("automated access " * 2000) + '"}'
+        assert is_blocked(200, big, content_type="application/json; charset=utf-8") is False
+
+    def test_xml_content_type_suppressed(self):
+        assert is_blocked(200, "<a>access denied</a>", content_type="text/xml") is False
+
+    def test_error_status_still_blocks_regardless_of_content_type(self):
+        # A 403 is a block by status — the gate must NOT rescue error statuses.
+        assert is_blocked(403, '{"error":"forbidden"}', content_type="application/json") is True
+        assert is_blocked(429, b"", content_type="application/json") is True
+
+    def test_html_content_type_still_runs_heuristics(self):
+        body = "<html><body>just a moment...</body></html>"
+        assert is_blocked(200, body, content_type="text/html") is True
+
+    def test_missing_content_type_preserves_old_behavior(self):
+        # Backward compatible: no content-type → unchanged heuristics.
+        assert is_blocked(200, '{"data":[1,2,3]}') is False
+        assert is_blocked(200, "<html></html>") is True
