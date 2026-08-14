@@ -1,3 +1,10 @@
+## [1.26.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.5...v1.26.6) (2026-08-14)
+
+
+### Bug Fixes
+
+* **mimic-middleware:** wrap /api/fetch envelope by Content-Type (AAR-12) ([fd73daf](https://github.com/Aarkc/scrapy-calyprium/commit/fd73daf68521a987195a7eff1c9743c577d8d4f0))
+
 ## [1.26.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.4...v1.26.5) (2026-08-13)
 
 
