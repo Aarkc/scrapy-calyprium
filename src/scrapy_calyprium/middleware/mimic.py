@@ -36,7 +36,38 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
-from scrapy.http import HtmlResponse, Response
+from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
+
+
+def _response_from_envelope(request, url, status, headers, body, content_type):
+    """Build the right Scrapy Response class from a Mimic /api/fetch envelope.
+
+    The envelope always carries the RAW inner body (AAR-12: bytes preserved); the
+    only choice is which Response wrapper gives the spider a usable parser:
+      * HTML/XHTML  -> HtmlResponse   (response.css / html xpath)
+      * XML         -> XmlResponse    (XML xpath — case-sensitive tags; an
+                                       HtmlResponse would lower-case them and a
+                                       TextResponse would HTML-parse them, so an
+                                       OData/Granicus XML feed yields 0 items)
+      * JSON / text -> TextResponse   (response.json() / response.text)
+      * anything else / unknown -> HtmlResponse (default) or raw Response (binary)
+    """
+    ct = (content_type or "").lower()
+    encoding = "utf-8"
+    if "charset=" in ct:
+        encoding = ct.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
+    if isinstance(body, str):
+        body = body.encode(encoding, "replace")
+    kw = dict(url=url, status=status, headers=headers, body=body or b"", request=request)
+    if "text/html" in ct or "xhtml" in ct:
+        return HtmlResponse(encoding=encoding, **kw)
+    if "xml" in ct:
+        return XmlResponse(encoding=encoding, **kw)
+    if "text/" in ct or "json" in ct or "javascript" in ct or "csv" in ct:
+        return TextResponse(encoding=encoding, **kw)
+    if not ct:
+        return HtmlResponse(encoding=encoding, **kw)  # legacy default
+    return Response(**kw)  # binary / unknown -> raw bytes
 
 # AAR-17: optional local-first routing components. Imported lazily so the
 # middleware still works for users who haven't installed scrapy-calyprium[local].
@@ -483,31 +514,14 @@ class MimicBrowserMiddleware:
             result.fetch.headers.get("content-type")
             or result.fetch.headers.get("Content-Type")
             or ""
-        ).lower()
-        body = result.fetch.body
-        url = result.fetch.final_url or request.url
-        status = result.fetch.status_code
-        headers = result.fetch.headers
-        if "text/html" in ct or "application/xhtml" in ct:
-            from scrapy.http import HtmlResponse
-            encoding = "utf-8"
-            if "charset=" in ct:
-                encoding = ct.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
-            return HtmlResponse(
-                url=url, status=status, headers=headers, body=body,
-                encoding=encoding, request=request,
-            )
-        if "text/" in ct or "json" in ct or "xml" in ct or "javascript" in ct:
-            from scrapy.http import TextResponse
-            encoding = "utf-8"
-            if "charset=" in ct:
-                encoding = ct.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
-            return TextResponse(
-                url=url, status=status, headers=headers, body=body,
-                encoding=encoding, request=request,
-            )
-        return Response(
-            url=url, status=status, headers=headers, body=body, request=request,
+        )
+        return _response_from_envelope(
+            request,
+            url=result.fetch.final_url or request.url,
+            status=result.fetch.status_code,
+            headers=result.fetch.headers,
+            body=result.fetch.body,
+            content_type=ct,
         )
 
     async def process_request(self, request, spider):
@@ -597,15 +611,20 @@ class MimicBrowserMiddleware:
 
         html = data.get("html") or data.get("content") or ""
         status = data.get("status_code", 200)
+        env_headers = data.get("headers") or {}
+        ct = env_headers.get("content-type") or env_headers.get("Content-Type") or ""
 
         self._consecutive_failures = 0
 
-        return HtmlResponse(
-            url=request.url,
+        # Wrap by Content-Type so an XML/JSON API body (e.g. Legistar OData) gets
+        # the right parser instead of being HTML-parsed into 0 items (AAR-12).
+        return _response_from_envelope(
+            request,
+            url=data.get("final_url") or request.url,
             status=status,
-            body=html.encode("utf-8") if isinstance(html, str) else html,
-            encoding="utf-8",
-            request=request,
+            headers={"Content-Type": ct} if ct else None,
+            body=html,
+            content_type=ct,
         )
 
     async def _fetch_browser(self, client, request, spider):
@@ -646,6 +665,8 @@ class MimicBrowserMiddleware:
 
         html = data.get("html") or data.get("content") or data.get("page_source", "")
         status = data.get("status_code", 200)
+        env = data.get("headers") or {}
+        final_url = data.get("final_url") or request.url
 
         if not html:
             # Fallback to /api/fetch
@@ -660,18 +681,22 @@ class MimicBrowserMiddleware:
                 timeout=60.0,
             )
             fetch_resp.raise_for_status()
-            fetch_data = fetch_resp.json()
-            html = fetch_data.get("html") or fetch_data.get("content") or ""
-            status = fetch_data.get("status_code", 200)
+            data = fetch_resp.json()
+            html = data.get("html") or data.get("content") or ""
+            status = data.get("status_code", 200)
+            env = data.get("headers") or {}
+            final_url = data.get("final_url") or request.url
 
+        ct = env.get("content-type") or env.get("Content-Type") or ""
         self._consecutive_failures = 0
 
-        return HtmlResponse(
-            url=request.url,
+        return _response_from_envelope(
+            request,
+            url=final_url,
             status=status,
-            body=html.encode("utf-8") if isinstance(html, str) else html,
-            encoding="utf-8",
-            request=request,
+            headers={"Content-Type": ct} if ct else None,
+            body=html,
+            content_type=ct,
         )
 
     async def process_response(self, request, response, spider):
