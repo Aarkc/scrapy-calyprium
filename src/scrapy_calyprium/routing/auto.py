@@ -425,7 +425,10 @@ class SpiderAutoRouter:
             )
         except LocalFetchError:
             light_result = None
-        if light_result and not is_blocked(light_result.status_code, light_result.body):
+        if light_result and not is_blocked(
+            light_result.status_code, light_result.body,
+            content_type=light_result.content_type, headers=light_result.headers,
+        ):
             # A cookieless 200 here is often a warm-IP fluke: hard domains like
             # DigiKey serve ~8% of cookieless requests on Evomi IPs that recently
             # passed a challenge. set_light() REPLACES the entry and discards
@@ -493,7 +496,10 @@ class SpiderAutoRouter:
                     # Infra failures are NOT reported to IP reputation —
                     # not the IP's fault.
                 else:
-                    if not is_blocked(result.status_code, result.body):
+                    if not is_blocked(
+                        result.status_code, result.body,
+                        content_type=result.content_type, headers=result.headers,
+                    ):
                         self.cache.record_slot_success(domain, slot.slot_id)
                         self._report_ip_outcome(
                             domain=domain, slot=slot, outcome="success",
@@ -646,7 +652,10 @@ class SpiderAutoRouter:
                 error=str(exc),
             )
 
-        if is_blocked(replay.status_code, replay.body):
+        if is_blocked(
+            replay.status_code, replay.body,
+            content_type=replay.content_type, headers=replay.headers,
+        ):
             self.cache.record_slot_failure(
                 domain, slot.slot_id, status_code=replay.status_code,
             )

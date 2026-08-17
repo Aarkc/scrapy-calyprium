@@ -156,3 +156,56 @@ class TestContentTypeGate:
         # Backward compatible: no content-type → unchanged heuristics.
         assert is_blocked(200, '{"data":[1,2,3]}') is False
         assert is_blocked(200, "<html></html>") is True
+
+
+class TestWafHeaderGate:
+    """A small-body 403/429/503 is only a *solvable* block when the headers
+    carry a WAF/anti-bot signal. A plain IIS/nginx rate-limit 403 with no such
+    signal must NOT be flagged (else the caller wastes a browser solve it can
+    never clear — webapi.legistar.com's burst rate-limit)."""
+
+    def test_iis_rate_limit_403_not_blocked(self):
+        # The Legistar case: Microsoft-IIS 403, small body, no anti-bot markers.
+        h = {"Server": "Microsoft-IIS/10.0", "Content-Type": "application/xml"}
+        assert is_blocked(403, b"rate limited", headers=h) is False
+
+    def test_nginx_429_not_blocked(self):
+        h = {"Server": "nginx", "Content-Type": "text/plain"}
+        assert is_blocked(429, b"too many requests", headers=h) is False
+
+    def test_akamai_server_403_blocked(self):
+        h = {"Server": "AkamaiGHost", "Content-Type": "text/html"}
+        assert is_blocked(403, b"<html></html>", headers=h) is True
+
+    def test_abck_set_cookie_403_blocked(self):
+        h = {"Server": "Microsoft-IIS/10.0", "Set-Cookie": "_abck=xyz~-1~...; Path=/"}
+        assert is_blocked(403, b"blocked", headers=h) is True
+
+    def test_cf_clearance_cookie_blocked(self):
+        h = {"Server": "cloudflare", "Set-Cookie": "cf_clearance=abc; Path=/"}
+        assert is_blocked(429, b"", headers=h) is True
+
+    def test_cf_mitigated_header_blocked(self):
+        h = {"Server": "cloudflare", "cf-mitigated": "challenge"}
+        assert is_blocked(403, b"<html>...</html>", headers=h) is True
+
+    def test_datadome_header_blocked(self):
+        h = {"Server": "nginx", "x-datadome": "protected"}
+        assert is_blocked(403, b"blocked", headers=h) is True
+
+    def test_body_challenge_signature_wins_over_headers(self):
+        # Even a non-WAF Server header can't rescue a body that IS a challenge.
+        h = {"Server": "Microsoft-IIS/10.0"}
+        assert is_blocked(403, b"<html>Just a moment...</html>", headers=h) is True
+
+    def test_no_headers_preserves_old_behavior(self):
+        # Absent headers, a small-body 403 stays blocked (no regression).
+        assert is_blocked(403, b"blocked") is True
+        assert is_blocked(429, b"") is True
+
+    def test_scrapy_style_list_of_bytes_headers(self):
+        # Scrapy's Headers yields {bytes: [bytes]} — must normalise cleanly.
+        h = {b"Server": [b"Microsoft-IIS/10.0"]}
+        assert is_blocked(403, b"rate limited", headers=h) is False
+        h2 = {b"Set-Cookie": [b"_abck=1~-1~2; Path=/"]}
+        assert is_blocked(403, b"blocked", headers=h2) is True

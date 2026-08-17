@@ -56,6 +56,61 @@ SOFT_BLOCK_SIGNATURES = (
 # Only applied to 200 responses that fail structural checks below.
 MIN_CONTENT_SIZE = 10_000
 
+# Positive WAF / anti-bot signals carried in response headers. Their presence
+# on a blocked-status response means a browser solve can actually clear it
+# (mint _abck / cf_clearance / a DataDome cookie). Their ABSENCE — a plain
+# Microsoft-IIS / nginx 403 with no anti-bot cookie or header — means a
+# rate-limit or application error that no solve can fix, so the caller should
+# back off and retry the cheap path instead of burning a solve. Matched
+# case-insensitively.
+_WAF_SERVER_MARKERS = ("akamaighost", "cloudflare", "ddos-guard", "incapsula", "imperva", "sucuri")
+_WAF_HEADER_NAMES = ("cf-mitigated", "x-datadome", "x-iinfo", "x-sucuri-id", "x-akamai-transformed")
+_WAF_COOKIE_MARKERS = (
+    "_abck", "bm_sz", "ak_bmsc",     # Akamai
+    "cf_clearance", "__cf_bm",       # Cloudflare
+    "datadome",                      # DataDome
+    "_px", "_pxhd", "_pxvid",        # PerimeterX / HUMAN
+    "incap_ses", "visid_incap",      # Imperva / Incapsula
+)
+
+
+def _looks_like_waf(headers: Optional[dict], html_lower: str) -> bool:
+    """True if the response carries a positive signal that it's a *solvable*
+    WAF / anti-bot challenge (as opposed to a plain rate-limit or app error).
+
+    Checks the response body for a known challenge signature and the response
+    headers for anti-bot markers (Server: AkamaiGHost / Cloudflare / ..., a
+    Set-Cookie like _abck / cf_clearance / datadome, or a dedicated header like
+    cf-mitigated / x-datadome). A Microsoft-IIS / nginx 403 with none of these
+    is a rate-limit, not a challenge.
+    """
+    for sig in CHALLENGE_SIGNATURES:
+        if sig in html_lower:
+            return True
+    if not headers:
+        return False
+    # Normalise header keys/values to lowercase strings (handles str, bytes,
+    # and Scrapy's list-of-bytes header values).
+    norm: dict = {}
+    for k, v in headers.items():
+        kl = (k.decode("latin-1", "ignore") if isinstance(k, bytes) else str(k)).lower()
+        if isinstance(v, (list, tuple)):
+            vs = " ".join(
+                x.decode("latin-1", "ignore") if isinstance(x, bytes) else str(x) for x in v
+            )
+        elif isinstance(v, bytes):
+            vs = v.decode("latin-1", "ignore")
+        else:
+            vs = str(v)
+        norm[kl] = vs.lower()
+    if any(name in norm for name in _WAF_HEADER_NAMES):
+        return True
+    if any(m in norm.get("server", "") for m in _WAF_SERVER_MARKERS):
+        return True
+    if any(m in norm.get("set-cookie", "") for m in _WAF_COOKIE_MARKERS):
+        return True
+    return False
+
 
 def _has_real_page_structure(html: str) -> bool:
     """Check if HTML looks like a real page rather than a challenge stub.
@@ -106,6 +161,7 @@ def is_blocked(
     status_code: int,
     body: Union[bytes, str],
     content_type: Optional[str] = None,
+    headers: Optional[dict] = None,
 ) -> bool:
     """Detect if a response indicates bot blocking or a challenge page.
 
@@ -162,9 +218,16 @@ def is_blocked(
                 if sig in html_lower:
                     return True
 
-    # Status-code based block: applies regardless of content type. A 403 with
-    # a small body — binary or HTML — is virtually always a CDN block stub.
+    # Status-code based block: a small-body 403/429/503 is usually a CDN block
+    # stub — BUT only if there's a positive WAF/anti-bot signal a solve can
+    # clear. When the caller passes headers and they show no such signal (a
+    # plain Microsoft-IIS / nginx / OData 403 like webapi.legistar.com's burst
+    # rate-limit), it's not a solvable challenge: return False so the caller
+    # backs off and retries the cheap path instead of wasting a browser solve
+    # and marking the domain heavy. Absent headers, preserve the old behavior.
     if status_code in BLOCKED_STATUS_CODES and body_len < 20_000:
+        if headers is not None and not _looks_like_waf(headers, html_lower):
+            return False
         return True
 
     # Binary content past the size guard is real. We don't need to look for

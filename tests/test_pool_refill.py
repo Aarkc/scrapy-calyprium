@@ -93,7 +93,7 @@ def _blocked():
         final_url="https://example.com/",
         status_code=403,
         headers={"content-type": "text/html"},
-        body=b"<html><body>blocked</body></html>",
+        body=b"<html><head><title>Just a moment...</title></head><body>Checking your browser before accessing.</body></html>",
         backend="httpcloak",
     )
 
