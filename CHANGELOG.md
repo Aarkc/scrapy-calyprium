@@ -1,3 +1,10 @@
+## [1.26.8](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.7...v1.26.8) (2026-08-17)
+
+
+### Bug Fixes
+
+* **middleware:** close the 403 gate gap in Mimic + Spectre middlewares ([1f9267b](https://github.com/Aarkc/scrapy-calyprium/commit/1f9267bdb8c082e708b82958981df5d2d16a002c))
+
 ## [1.26.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.6...v1.26.7) (2026-08-17)
 
 
