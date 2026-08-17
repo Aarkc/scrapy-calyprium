@@ -497,3 +497,42 @@ class TestSolvePromotesLightToCookies:
         entry = cache.get("example.com")
         assert entry.level == "cookies"
         assert len(entry.live_slots()) == 3
+
+
+class TestTransportErrorBackoff:
+    """A transport error (timeout / connection reset) must NOT escalate to a
+    solve — a solve can't fix a dead egress connection (usually a burned or
+    overloaded IP). The router backs off so the caller retries the cheap path."""
+
+    @pytest.mark.asyncio
+    async def test_light_transport_error_does_not_solve(self):
+        f = FakeFetcher()
+        f.queue(LocalFetchError("User timeout caused connection failure: 45.0s"))
+        s = FakeSolveClient()  # nothing queued — .solve() would AssertionError
+        router = _make_router(fetcher=f, solve=s, cache=DomainCache())
+
+        result = await router.fetch(
+            "https://webapi.legistar.com/v1/x/y.pdf", domain="webapi.legistar.com"
+        )
+
+        assert s.calls == []  # never escalated to a solve
+        assert result.blocked is False
+        assert result.fetch is None
+        assert result.routing_method == "transport_error"
+        assert "timeout" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_genuine_block_still_solves(self):
+        # A real challenge response (not a transport error) with no pool must
+        # still solve — the back-off only applies to transport errors.
+        f = FakeFetcher()
+        f.queue(_blocked_403(), _ok())  # light blocked → solve → replay OK
+        s = FakeSolveClient()
+        s.queue(_solve_ok())
+        router = _make_router(fetcher=f, solve=s, cache=DomainCache())
+
+        result = await router.fetch("https://example.com/", domain="example.com")
+
+        assert len(s.calls) == 1  # genuine block → solved
+        assert result.routing_method == "solve_then_replay"
+        assert result.blocked is False

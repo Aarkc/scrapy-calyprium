@@ -419,12 +419,22 @@ class SpiderAutoRouter:
         # entire spider.
         entry = self.cache.get(domain)
         level = entry.level if entry else None
+        # `result` is the response we eventually classify for the solve decision.
+        # Initialise it here: the cookie-replay branch below only binds it inside
+        # its try, so a replay transport error / no-slot path would otherwise hit
+        # an UnboundLocalError at the solve step.
+        result = None
+        transport_error = None
         try:
             light_result = await self.fetcher.fetch(
                 url=url, proxy_url=self.proxy_url,
             )
-        except LocalFetchError:
+        except LocalFetchError as exc:
             light_result = None
+            # A transport error (timeout / connection reset) is NOT a block — a
+            # solve can't fix a dead connection. Remember it so the solve step
+            # can back off instead of escalating.
+            transport_error = exc
         if light_result and not is_blocked(
             light_result.status_code, light_result.body,
             content_type=light_result.content_type, headers=light_result.headers,
@@ -447,6 +457,11 @@ class SpiderAutoRouter:
                 blocked=False,
                 domain_level="cookies" if has_pool else "light",
             )
+
+        # If a non-None light_result reached here it FAILED the is_blocked check
+        # above — i.e. it was a genuine block response, not a transport error.
+        # That distinction gates whether the solve step is worthwhile below.
+        light_blocked = light_result is not None
 
         # Step 2b: light path failed → try cookie replay if available.
         if entry and level == "cookies":
@@ -494,7 +509,9 @@ class SpiderAutoRouter:
                     )
                     self.cache.record_slot_failure(domain, slot.slot_id, status_code=None)
                     # Infra failures are NOT reported to IP reputation —
-                    # not the IP's fault.
+                    # not the IP's fault. Also a transport error, not a block:
+                    # let the solve step back off rather than escalate.
+                    transport_error = exc
                 else:
                     if not is_blocked(
                         result.status_code, result.body,
@@ -547,6 +564,26 @@ class SpiderAutoRouter:
         # queue enough for round 5 to get through — adding 20 s overhead per
         # page. Pool-filling parallelism is now handled exclusively by the
         # background _ensure_refill_task / _refill_one path.
+        # Transport error, not a block: the light path raised and no cookie
+        # replay produced a block response, so there's nothing to classify — and
+        # a solve can't fix a dead / timed-out egress connection (usually a burned
+        # or overloaded IP). Escalating would waste a solve on a domain that has
+        # no challenge. Back off (the middleware falls through and Scrapy retries
+        # the request) instead. When we DID see a genuine block (light_blocked, or
+        # a blocked cookie-replay response in `result`), fall through to solve.
+        if result is None and not light_blocked and transport_error is not None:
+            logger.info(
+                "AutoRouter: %s transport error (%s); backing off instead of "
+                "solving (no challenge to solve)", domain, transport_error,
+            )
+            return RouteResult(
+                fetch=None,
+                routing_method="transport_error",
+                blocked=False,
+                domain_level=level or "light",
+                error=str(transport_error),
+            )
+
         block_status = result.status_code if result else 403
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d), solving",
