@@ -1,3 +1,10 @@
+## [1.26.9](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.8...v1.26.9) (2026-08-17)
+
+
+### Bug Fixes
+
+* **auto-router:** back off on transport errors instead of escalating to solve ([e42e43d](https://github.com/Aarkc/scrapy-calyprium/commit/e42e43ddd8de24692bdb6e80172d3543f49d07cc))
+
 ## [1.26.8](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.7...v1.26.8) (2026-08-17)
 
 
