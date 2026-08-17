@@ -270,20 +270,25 @@ class SpectreMiddleware:
 
         blocked = False
 
-        if response.status in (403, 429, 503):
-            blocked = True
-        elif hasattr(response, "body"):
+        if hasattr(response, "body"):
             try:
                 from scrapy_calyprium.routing.block_detect import is_blocked
                 content_type = response.headers.get("Content-Type", b"").decode(
                     "latin-1", "ignore"
                 )
+                # Pass headers so a plain IIS/nginx rate-limit 403 (no WAF signal)
+                # isn't flagged as a block and churn the fingerprint. Block statuses
+                # go through the same gate as everything else — previously
+                # 403/429/503 were hard-coded as blocked, bypassing the gate.
                 blocked = is_blocked(
-                    response.status, response.body, content_type=content_type
+                    response.status, response.body,
+                    content_type=content_type, headers=dict(response.headers),
                 )
             except ImportError:
-                # Optional [local] extra not installed.
-                pass
+                # Optional [local] extra not installed — fall back to status only.
+                blocked = response.status in (403, 429, 503)
+        else:
+            blocked = response.status in (403, 429, 503)
 
         if blocked:
             fingerprint_id = request.meta.get("spectre_fingerprint_id")

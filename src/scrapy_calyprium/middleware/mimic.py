@@ -717,16 +717,25 @@ class MimicBrowserMiddleware:
             return response
 
         blocked = False
-        if response.status in (403, 429, 503):
-            blocked = True
-        elif hasattr(response, "body"):
+        if hasattr(response, "body"):
             try:
                 from scrapy_calyprium.routing.block_detect import is_blocked
-                blocked = is_blocked(response.status, response.body)
+                content_type = response.headers.get("Content-Type", b"").decode(
+                    "latin-1", "ignore"
+                )
+                # Route block statuses through the gate too (with headers), so a
+                # plain IIS/nginx rate-limit 403 with no WAF signal isn't treated
+                # as a solvable block. Previously 403/429/503 were hard-coded as
+                # blocked here, bypassing the gate entirely.
+                blocked = is_blocked(
+                    response.status, response.body,
+                    content_type=content_type, headers=dict(response.headers),
+                )
             except ImportError:
-                # Optional [local] extra not installed — skip detection.
-                # Pages will only be flagged on hard status codes above.
-                pass
+                # Optional [local] extra not installed — fall back to status only.
+                blocked = response.status in (403, 429, 503)
+        else:
+            blocked = response.status in (403, 429, 503)
 
         if blocked:
             logger.warning(
