@@ -1,3 +1,10 @@
+## [1.26.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.6...v1.26.7) (2026-08-17)
+
+
+### Bug Fixes
+
+* **block-detect:** don't flag non-WAF rate-limit 403s as solvable blocks ([b96f7e5](https://github.com/Aarkc/scrapy-calyprium/commit/b96f7e595ae2144cb1ac92d3c3e83c9111580208))
+
 ## [1.26.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.5...v1.26.6) (2026-08-14)
 
 
