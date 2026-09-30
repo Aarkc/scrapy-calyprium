@@ -12,7 +12,8 @@ Enabled via settings:
 
 Required settings:
     FORGE_API_URL         (e.g. "http://calyprium-backend:8000")
-    FORGE_SERVICE_SECRET  (service-to-service auth)
+    CALYPRIUM_API_KEY     (spider key, sent as Bearer; FORGE_SERVICE_SECRET is
+                           a legacy fallback used only without an API key)
     RECRAWL_SPIDER_SLUG   (Forge slug for this run)
     RECRAWL_USER_ID       (the owning user — used for ClickHouse partitioning)
     SCRAPY_JOB            (Scrapyd job id, auto-set by Scrapyd)
@@ -34,6 +35,8 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
+from scrapy_calyprium._forge import ForgeAuth
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,10 +50,12 @@ class CalypriumRunStats:
         scrapyd_job_id: str,
         run_number: Optional[int] = None,
         interval: float = 30.0,
+        api_key: Optional[str] = None,
     ):
         self.forge_url = forge_url.rstrip("/")
         self.service_secret = service_secret
         self.user_id = user_id
+        self.auth = ForgeAuth(api_key, service_secret, user_id)
         self.spider_slug = spider_slug
         self.scrapyd_job_id = scrapyd_job_id
         self.run_number = run_number
@@ -76,6 +81,7 @@ class CalypriumRunStats:
         settings = crawler.settings
         forge_url = settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
         secret = settings.get("FORGE_SERVICE_SECRET", "")
+        api_key = settings.get("CALYPRIUM_API_KEY") or os.getenv("CALYPRIUM_API_KEY", "")
         user_id = (
             settings.get("RECRAWL_USER_ID")
             or settings.get("SPIDER_USER_ID")
@@ -107,9 +113,10 @@ class CalypriumRunStats:
                 slug, run_number,
             )
             return cls(forge_url, secret, user_id, slug or "", job_id,
-                       run_number, interval)
+                       run_number, interval, api_key=api_key)
 
-        ext = cls(forge_url, secret, user_id, slug, job_id, run_number, interval)
+        ext = cls(forge_url, secret, user_id, slug, job_id, run_number, interval,
+                  api_key=api_key)
         crawler.signals.connect(ext.spider_opened, signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signals.spider_closed)
         crawler.signals.connect(ext.response_received, signals.response_received)
@@ -209,16 +216,9 @@ class CalypriumRunStats:
             f"{self.run_number}/stats"
         )
         try:
-            httpx.post(
-                url,
-                json=payload,
-                headers={
-                    "X-Service-Secret": self.service_secret,
-                    "X-User-Id": self.user_id,
-                    "Content-Type": "application/json",
-                },
-                timeout=10.0,
-            )
+            self.auth.call(lambda h: httpx.post(
+                url, json=payload, headers=h, timeout=10.0,
+            ))
         except Exception as exc:
             logger.debug("CalypriumRunStats POST failed: %s", exc)
 

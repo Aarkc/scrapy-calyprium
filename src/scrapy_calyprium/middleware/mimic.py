@@ -26,7 +26,9 @@ Settings:
         a challenge. Falls back to the existing /api/fetch + /api/session
         browser path on unrecoverable failure. Default: False.
     MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
-    MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional)
+    MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional). When
+        absent, derived from VEIL_GATEWAY_URL with ``calyprium:<CALYPRIUM_API_KEY>``
+        as the proxy credential.
 """
 
 import logging
@@ -37,6 +39,8 @@ import httpx
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
+
+from scrapy_calyprium._veil import resolve_local_proxy_url
 
 
 def _response_from_envelope(request, url, status, headers, body, content_type):
@@ -213,7 +217,9 @@ class MimicBrowserMiddleware:
             return
         try:
             preset = self.crawler.settings.get("MIMIC_LOCAL_PRESET", "chrome-143")
-            proxy_url = self.crawler.settings.get("MIMIC_LOCAL_PROXY_URL")
+            # MIMIC_LOCAL_PROXY_URL if injected, else built from
+            # VEIL_GATEWAY_URL + the run's own key (see scrapy_calyprium._veil).
+            proxy_url = resolve_local_proxy_url(self.crawler.settings)
             timeout = self.crawler.settings.getint("DOWNLOAD_TIMEOUT", 60)
             # Cookie-pool sizing (throughput ≈ pool_size × rpm_cap). Defaults
             # match the legacy 8 slots × 10 RPM. Raise the pool to scale up;

@@ -57,7 +57,7 @@ class SlotStatsReporter:
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
             h["X-API-Key"] = self.api_key
-        if self.service_secret:
+        elif self.service_secret:
             h["X-Service-Secret"] = self.service_secret
         if self.user_id:
             h["X-User-Id"] = self.user_id

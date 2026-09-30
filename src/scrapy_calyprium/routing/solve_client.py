@@ -70,7 +70,9 @@ class SolveClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
             headers["X-API-Key"] = self.api_key
-        if self.service_secret:
+        elif self.service_secret:
+            # Legacy: only without a spider key (AAR-32 — never ship the
+            # master secret alongside a key that already authenticates).
             headers["X-Service-Secret"] = self.service_secret
         if self.user_id:
             headers["X-User-Id"] = self.user_id

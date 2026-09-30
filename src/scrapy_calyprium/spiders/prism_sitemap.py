@@ -34,6 +34,8 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 import scrapy
 
+from scrapy_calyprium._forge import ForgeAuth
+
 logger = logging.getLogger(__name__)
 
 # Only fetch the next batch when pending requests drop below this
@@ -132,6 +134,19 @@ class PrismSitemapSpider(scrapy.Spider):
         except Exception:
             return self._urls_yielded - self._urls_responded
 
+    def _get_forge_auth(self) -> ForgeAuth:
+        """Forge credentials for the recrawl/targets/freshness endpoints:
+        Bearer CALYPRIUM_API_KEY, legacy FORGE_SERVICE_SECRET fallback."""
+        auth = getattr(self, "_forge_auth", None)
+        if auth is None:
+            try:
+                settings = self.settings
+            except AttributeError:
+                settings = None
+            auth = ForgeAuth.from_settings(settings)
+            self._forge_auth = auth
+        return auth
+
     def start_requests(self):
         if not self.url_source:
             logger.error("No url_source and no prism_domain set")
@@ -174,12 +189,8 @@ class PrismSitemapSpider(scrapy.Spider):
 
         try:
             forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
-            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
-            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
         except AttributeError:
             forge_url = "http://calyprium-backend:8000"
-            api_key = ""
-            user_id = "internal"
 
         try:
             max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
@@ -187,8 +198,6 @@ class PrismSitemapSpider(scrapy.Spider):
             max_urls_setting = 0
 
         self._targets_forge_url = forge_url
-        self._targets_api_key = api_key
-        self._targets_user_id = user_id
         self._targets_spider_slug = spider_slug
         self._targets_type = target_type
         self._targets_exhausted = False
@@ -227,12 +236,11 @@ class PrismSitemapSpider(scrapy.Spider):
             api_params["target_type"] = self._targets_type
 
         try:
-            resp = req.get(
+            resp = self._get_forge_auth().call(lambda h: req.get(
                 f"{self._targets_forge_url}/spiders/{self._targets_spider_slug}/targets/pending",
                 params=api_params,
-                headers={"X-Service-Secret": self._targets_api_key,
-                          "X-User-Id": self._targets_user_id},
-                timeout=120)
+                headers=h,
+                timeout=120))
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -338,14 +346,6 @@ class PrismSitemapSpider(scrapy.Spider):
         except AttributeError:
             self._recrawl_forge_url = "http://calyprium-backend:8000"
         try:
-            self._recrawl_api_key = self.settings.get("FORGE_SERVICE_SECRET", "") or self.settings.get("CALYPRIUM_API_KEY", "")
-        except AttributeError:
-            self._recrawl_api_key = ""
-        try:
-            self._recrawl_user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
-        except AttributeError:
-            self._recrawl_user_id = "internal"
-        try:
             self._recrawl_max_urls = self.settings.getint("RECRAWL_MAX_URLS", 0)
         except AttributeError:
             self._recrawl_max_urls = 0
@@ -382,18 +382,10 @@ class PrismSitemapSpider(scrapy.Spider):
             # re-walking the entire fresh prefix (~100s on a 1M-row freshness
             # table). The response includes `next_prism_offset` which we
             # adopt for the next batch.
-            resp = req.get(
-                api_url,
-                params={
-                    "limit": limit,
-                    "prism_offset": self._prism_next_offset,
-                },
-                headers={
-                    "X-Service-Secret": self._recrawl_api_key,
-                    "X-User-Id": self._recrawl_user_id,
-                },
-                timeout=300,
-            )
+            params = {"limit": limit, "prism_offset": self._prism_next_offset}
+            resp = self._get_forge_auth().call(lambda h: req.get(
+                api_url, params=params, headers=h, timeout=300,
+            ))
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -567,23 +559,22 @@ class PrismSitemapSpider(scrapy.Spider):
 
         try:
             forge_url = self.settings.get("FORGE_API_URL", "")
-            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
-            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
             spider_slug = self.settings.get("RECRAWL_SPIDER_SLUG", "") or self.name
         except AttributeError:
             return urls
 
-        if not forge_url or not api_key:
+        auth = self._get_forge_auth()
+        if not forge_url or not auth:
             return urls
 
         import requests as req
         try:
-            resp = req.post(
+            resp = auth.call(lambda h: req.post(
                 f"{forge_url}/spiders/{spider_slug}/recrawl/filter-stale",
                 json={"urls": urls},
-                headers={"X-Service-Secret": api_key, "X-User-Id": user_id},
+                headers=h,
                 timeout=30,
-            )
+            ))
             resp.raise_for_status()
             data = resp.json()
             stale = data.get("stale_urls", urls)

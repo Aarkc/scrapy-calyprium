@@ -108,7 +108,9 @@ def test_build_batch_includes_learned_cap():
     assert batch["entries"][0]["learned_rpm_cap"] == 47.5
 
 
-def test_headers_include_service_secret_and_user():
+def test_headers_prefer_api_key_over_service_secret():
+    # AAR-32: the master service secret must not ride along once the run has
+    # its own scoped key.
     reporter = SlotStatsReporter(
         cache=DomainCache(),
         service_url="http://mimic.test",
@@ -119,6 +121,18 @@ def test_headers_include_service_secret_and_user():
     h = reporter._headers()
     assert h["X-API-Key"] == "caly_key"
     assert h["Authorization"] == "Bearer caly_key"
-    assert h["X-Service-Secret"] == "topsecret"
+    assert "X-Service-Secret" not in h
     assert h["X-User-Id"] == "user-123"
     assert h["X-Service-Name"] == "scrapy-calyprium"
+
+
+def test_headers_fall_back_to_service_secret_without_key():
+    reporter = SlotStatsReporter(
+        cache=DomainCache(),
+        service_url="http://mimic.test",
+        service_secret="topsecret",
+        user_id="user-123",
+    )
+    h = reporter._headers()
+    assert "Authorization" not in h
+    assert h["X-Service-Secret"] == "topsecret"

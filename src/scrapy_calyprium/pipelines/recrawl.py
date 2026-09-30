@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 import scrapy
 from scrapy.exceptions import NotConfigured
 
+from scrapy_calyprium._forge import ForgeAuth
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,13 +35,16 @@ class RecrawlTrackingPipeline:
         api_key: str,
         run_number: int,
         batch_size: int = 100,
+        service_secret: Optional[str] = None,
+        user_id: str = "internal",
     ):
         self.forge_url = forge_url.rstrip("/")
         self.spider_slug = spider_slug
         self.api_key = api_key
         self.run_number = run_number
         self.batch_size = batch_size
-        self._user_id = "internal"
+        self._user_id = user_id
+        self.auth = ForgeAuth(api_key, service_secret, user_id)
         self._buffer: List[Dict] = []
         self._total_reported = 0
 
@@ -52,25 +57,26 @@ class RecrawlTrackingPipeline:
             "FORGE_API_URL", "http://calyprium-backend:8000"
         )
         spider_slug = crawler.settings.get("RECRAWL_SPIDER_SLUG", "")
-        api_key = crawler.settings.get("FORGE_SERVICE_SECRET", "") or crawler.settings.get("CALYPRIUM_API_KEY", "")
+        api_key = crawler.settings.get("CALYPRIUM_API_KEY", "")
+        service_secret = crawler.settings.get("FORGE_SERVICE_SECRET", "")
         run_number = crawler.settings.getint("SPIDER_RUN_NUMBER", 0)
         batch_size = crawler.settings.getint("RECRAWL_BATCH_SIZE", 100)
         user_id = crawler.settings.get("RECRAWL_USER_ID", "") or crawler.settings.get("SPIDER_USER_ID", "internal")
 
-        if not api_key:
+        if not api_key and not service_secret:
             raise NotConfigured(
                 "RecrawlTrackingPipeline requires CALYPRIUM_API_KEY"
             )
 
-        pipeline = cls(
+        return cls(
             forge_url=forge_url,
             spider_slug=spider_slug,
             api_key=api_key,
             run_number=run_number,
             batch_size=batch_size,
+            service_secret=service_secret,
+            user_id=user_id,
         )
-        pipeline._user_id = user_id
-        return pipeline
 
     def open_spider(self, spider):
         if not self.spider_slug:
@@ -112,18 +118,10 @@ class RecrawlTrackingPipeline:
         )
 
         try:
-            response = httpx.post(
-                endpoint,
-                json={
-                    "urls": self._buffer,
-                    "run_number": self.run_number,
-                },
-                headers={
-                    "X-Service-Secret": self.api_key,
-                    "X-User-Id": self._user_id,
-                },
-                timeout=30.0,
-            )
+            payload = {"urls": self._buffer, "run_number": self.run_number}
+            response = self.auth.call(lambda h: httpx.post(
+                endpoint, json=payload, headers=h, timeout=30.0,
+            ))
             if response.status_code == 200:
                 self._total_reported += len(self._buffer)
                 logger.debug(
