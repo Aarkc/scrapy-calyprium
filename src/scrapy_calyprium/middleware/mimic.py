@@ -40,6 +40,7 @@ from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
+from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 
 
@@ -126,6 +127,8 @@ class MimicBrowserMiddleware:
         self.spectre_browser_family = spectre_browser_family
         self.target_domain = target_domain
 
+        # Profile policy (AAR-62) — spider_id, paid-solve, engine allow-list.
+        self.policy: RunPolicy = RunPolicy()
         self.render_all: bool = False
         self.session_id: Optional[str] = None
         self.ws_endpoint: Optional[str] = None
@@ -177,6 +180,7 @@ class MimicBrowserMiddleware:
             target_domain=crawler.settings.get("MIMIC_TARGET_DOMAIN"),
         )
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
+        middleware.policy = RunPolicy.from_settings(crawler.settings)
         middleware.crawler = crawler
 
         # AAR-17: local-first routing opt-in
@@ -199,6 +203,16 @@ class MimicBrowserMiddleware:
         crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
 
         return middleware
+
+    def _fetch_policy_fields(self) -> dict:
+        """Profile policy fields for Mimic ``/api/fetch`` (FetchRequest)."""
+        fields = self.policy.mimic_fetch_fields()
+        if self.proxy_country and "proxy_country" not in fields:
+            fields["proxy_country"] = self.proxy_country
+        engine = self.policy.clamp_engine(self.browser_engine)
+        if engine:
+            fields["browser_engine"] = engine
+        return fields
 
     def _get_headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -262,12 +276,12 @@ class MimicBrowserMiddleware:
             # Solve via Tessera when configured (Jevi/2Captcha API solving with a
             # mimic-browser fallback); otherwise fall back to mimic's /api/solve.
             # Same request/response contract, so SolveClient is unchanged.
-            solve_service_url = (
-                self.crawler.settings.get("TESSERA_SERVICE_URL") or self.service_url
-            )
-            self._solve_backend = (
-                "tessera" if self.crawler.settings.get("TESSERA_SERVICE_URL") else "mimic"
-            )
+            # A profile that forbids paid solving keeps solves on mimic's
+            # (free) browser: Tessera's primary solvers are paid APIs.
+            tessera_url = self.crawler.settings.get("TESSERA_SERVICE_URL")
+            use_tessera = bool(tessera_url) and not self.policy.paid_solve_denied
+            solve_service_url = tessera_url if use_tessera else self.service_url
+            self._solve_backend = "tessera" if use_tessera else "mimic"
             self._solve_client = SolveClient(
                 service_url=solve_service_url,
                 ip_health_url=self.service_url,  # IP reputation stays in mimic
@@ -277,6 +291,7 @@ class MimicBrowserMiddleware:
                 user_id=self.crawler.settings.get("FORGE_USER_ID")
                 or self.crawler.settings.get("MIMIC_USER_ID")
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
+                policy=self.policy,
             )
             # Look for CalypriumRequestTracer extension if active
             tracer = None
@@ -374,8 +389,10 @@ class MimicBrowserMiddleware:
                 "use_spectre": self.use_spectre,
             }
 
-            if self.browser_engine:
-                body["browser_engine"] = self.browser_engine
+            body.update(self.policy.mimic_session_fields())
+            engine = self.policy.clamp_engine(self.browser_engine)
+            if engine:
+                body["browser_engine"] = engine
             if self.proxy_country:
                 body["proxy_country"] = self.proxy_country
             if self.use_spectre:
@@ -604,6 +621,7 @@ class MimicBrowserMiddleware:
         fetch_payload = {
             "url": request.url,
             "stealth_level": self.stealth_level,
+            **self._fetch_policy_fields(),
         }
 
         resp = await client.post(
@@ -682,6 +700,7 @@ class MimicBrowserMiddleware:
                     "url": request.url,
                     "session_id": self.session_id,
                     "stealth_level": self.stealth_level,
+                    **self._fetch_policy_fields(),
                 },
                 headers=self._get_headers(),
                 timeout=60.0,

@@ -61,10 +61,12 @@ Each `CookieSlot` in the `DomainCache` has:
 |---------|---------|
 | `CALYPRIUM_API_KEY` | Master API key for all services |
 | `MIMIC_LOCAL_FETCH` | Enable local-first httpcloak routing (bool) |
-| `MIMIC_LOCAL_PROXY_URL` | Proxy URL with embedded auth for httpcloak (required for local-first on Cloudflare sites) |
+| `MIMIC_LOCAL_PROXY_URL` | Proxy URL with embedded auth for httpcloak; derived from `VEIL_GATEWAY_URL` as `calyprium:<CALYPRIUM_API_KEY>` when absent |
 | `VEIL_PROVIDER` | Upstream proxy provider (e.g. `webshare_rotating`) |
 | `VEIL_GATEWAY_URL` | Veil proxy gateway URL |
 | `RECRAWL_TRACKING_ENABLED` | Filter out recently-crawled URLs via Forge freshness API |
+| `SPIDER_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
+| `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
 
 ## Code Conventions
 

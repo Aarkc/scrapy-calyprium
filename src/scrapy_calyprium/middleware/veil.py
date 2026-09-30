@@ -11,6 +11,8 @@ Settings:
     VEIL_PROFILE: Optional profile ID for custom routing rules
     VEIL_PROVIDER: Optional provider name (e.g. webshare_rotating, webshare_static)
     VEIL_PROXY_TYPE: Optional proxy type (datacenter, residential, residential_rotating)
+    SPIDER_ID / VEIL_ALLOWED_PROVIDERS / VEIL_COUNTRY: profile policy, encoded
+        as -spider_<id> / -ap_<a.b> / -country_<cc> username params (AAR-62)
 """
 
 import base64
@@ -19,6 +21,8 @@ from typing import Optional
 
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
+
+from scrapy_calyprium._policy import RunPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +58,10 @@ class VeilProxyMiddleware:
         profile: Optional[str] = None,
         proxy_type: Optional[str] = None,
         provider: Optional[str] = None,
+        policy: Optional[RunPolicy] = None,
     ):
         self.gateway_url = gateway_url
+        self.policy = policy or RunPolicy()
         self.api_key = api_key
         self.user_id = user_id
         self.profile = profile
@@ -89,6 +95,7 @@ class VeilProxyMiddleware:
             profile=crawler.settings.get("VEIL_PROFILE"),
             proxy_type=crawler.settings.get("VEIL_PROXY_TYPE"),
             provider=crawler.settings.get("VEIL_PROVIDER"),
+            policy=RunPolicy.from_settings(crawler.settings),
         )
         crawler.signals.connect(
             middleware.spider_opened, signal=signals.spider_opened
@@ -115,6 +122,7 @@ class VeilProxyMiddleware:
             username = f"{username}-p_{self.provider}"
         if self.proxy_type and self.proxy_type in self.PROXY_TYPE_MAP:
             username = f"{username}-type_{self.PROXY_TYPE_MAP[self.proxy_type]}"
+        username = self.policy.veil_username(username)
 
         request.headers["Proxy-Authorization"] = basic_auth_header(
             username, self.api_key
