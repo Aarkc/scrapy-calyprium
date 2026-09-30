@@ -25,14 +25,29 @@ Settings:
         domain cache. Mimic /api/solve is called only when local fetch hits
         a challenge. Falls back to the existing /api/fetch + /api/session
         browser path on unrecoverable failure. Default: False.
+    MIMIC_ESCALATION_TTL: seconds a domain stays escalated to ``maximum``
+        stealth after a blocked Mimic response (default: 600)
+    MIMIC_TRANSPORT_RETRIES: retries for transport errors (timeouts,
+        connection resets) when Scrapy's RetryMiddleware is disabled, as the
+        platform does (default: 2)
+
+    Browser sessions are created lazily, on the first request that needs one
+    (AAR-64): with MIMIC_ALL_REQUESTS / local-first only /api/fetch or
+    /api/solve are used, so an eager session sat idle for the whole run.
+    A failure never tears down the shared HTTP client or the run-wide stealth
+    level: it falls back per request, a dead session is dropped and re-created
+    lazily, and a blocked domain is escalated on its own, with decay.
+
     MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
     MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional). When
         absent, derived from VEIL_GATEWAY_URL with ``calyprium:<CALYPRIUM_API_KEY>``
         as the proxy credential.
 """
 
+import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Dict, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -93,6 +108,48 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _transport_errors() -> tuple:
+    from twisted.internet import error as tx
+    from twisted.web.client import ResponseFailed
+
+    errors = [
+        tx.TimeoutError, tx.DNSLookupError, tx.ConnectionRefusedError,
+        tx.ConnectionDone, tx.ConnectError, tx.ConnectionLost, tx.TCPTimedOutError,
+        ResponseFailed, IOError, httpx.TransportError,
+    ]
+    try:
+        from scrapy.core.downloader.handlers.http11 import TunnelError
+        errors.append(TunnelError)
+    except ImportError:  # pragma: no cover
+        pass
+    try:
+        from twisted.web._newclient import ResponseNeverReceived
+        errors.append(ResponseNeverReceived)
+    except ImportError:  # pragma: no cover
+        pass
+    return tuple(errors)
+
+
+#: Exceptions treated as transient transport failures (mirrors Scrapy's
+#: RetryMiddleware.EXCEPTIONS_TO_RETRY).
+_TRANSPORT_ERRORS = _transport_errors()
+
+
+def _builtin_retry_active(settings) -> bool:
+    """True if Scrapy's own RetryMiddleware will retry transport errors."""
+    if not settings.getbool("RETRY_ENABLED", True):
+        return False
+    try:
+        mws = settings.getwithbase("DOWNLOADER_MIDDLEWARES")
+    except AttributeError:
+        mws = settings.getdict("DOWNLOADER_MIDDLEWARES")
+    for path, order in dict(mws).items():
+        name = path if isinstance(path, str) else getattr(path, "__name__", "")
+        if name.rsplit(".", 1)[-1] == "RetryMiddleware":
+            return order is not None
+    return False
+
+
 class MimicBrowserMiddleware:
     """
     Scrapy middleware that routes requests through Mimic's browser
@@ -130,6 +187,13 @@ class MimicBrowserMiddleware:
         # Profile policy (AAR-62) — spider_id, paid-solve, engine allow-list.
         self.policy: RunPolicy = RunPolicy()
         self.render_all: bool = False
+        # AAR-64: per-domain stealth escalation (domain -> expiry, monotonic)
+        # instead of a permanent run-wide switch to "maximum".
+        self.escalation_ttl: float = 600.0
+        self._escalated: Dict[str, float] = {}
+        self.transport_retries: int = 2
+        self._session_lock: Optional[asyncio.Lock] = None
+        self._consecutive_failures = 0
         self.session_id: Optional[str] = None
         self.ws_endpoint: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
@@ -181,6 +245,11 @@ class MimicBrowserMiddleware:
         )
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
         middleware.policy = RunPolicy.from_settings(crawler.settings)
+        middleware.escalation_ttl = crawler.settings.getfloat("MIMIC_ESCALATION_TTL", 600.0)
+        middleware.transport_retries = (
+            0 if _builtin_retry_active(crawler.settings)
+            else crawler.settings.getint("MIMIC_TRANSPORT_RETRIES", 2)
+        )
         middleware.crawler = crawler
 
         # AAR-17: local-first routing opt-in
@@ -369,10 +438,22 @@ class MimicBrowserMiddleware:
             self._local_enabled = False
 
     async def spider_opened(self, spider):
-        """Create browser session when spider opens."""
+        """Stand up local routing. Browser sessions are created lazily."""
         # AAR-17: stand up the local-first router (no-op if disabled)
         self._init_local_router(spider)
 
+    async def _ensure_session(self, spider) -> Optional[str]:
+        """Create the browser session on first use (one creator at a time)."""
+        if self.session_id:
+            return self.session_id
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if not self.session_id:
+                await self._create_session(spider)
+        return self.session_id
+
+    async def _create_session(self, spider) -> None:
         logger.info(
             f"MimicMiddleware: Creating session "
             f"(engine: {self.browser_engine or 'auto'}, "
@@ -424,13 +505,37 @@ class MimicBrowserMiddleware:
                 f"worker: {self.ws_endpoint})"
             )
 
-            spider.mimic_session_id = self.session_id
-            spider.mimic_ws_endpoint = self.ws_endpoint
+            if spider is not None:
+                spider.mimic_session_id = self.session_id
+                spider.mimic_ws_endpoint = self.ws_endpoint
 
         except httpx.HTTPStatusError as e:
             logger.error(f"MimicMiddleware: Session create failed: {e.response.text}")
         except Exception as e:
             logger.error(f"MimicMiddleware: Error creating session: {e}")
+
+    async def _drop_session(self) -> None:
+        """Forget a (presumably dead) session; best-effort DELETE. The shared
+        HTTP client stays open for other in-flight requests."""
+        session_id, self.session_id = self.session_id, None
+        if not session_id:
+            return
+        try:
+            client = await self._get_client()
+            await client.delete(
+                f"{self.service_url}/api/session/{session_id}",
+                headers=self._get_headers(),
+            )
+        except Exception as e:
+            logger.debug(f"MimicMiddleware: Error dropping session {session_id}: {e}")
+
+    def _stealth_for(self, domain: str) -> str:
+        expires = self._escalated.get(domain)
+        if expires is not None:
+            if time.monotonic() < expires:
+                return "maximum"
+            self._escalated.pop(domain, None)
+        return self.stealth_level
 
     async def spider_closed(self, spider):
         """Close browser session when spider closes."""
@@ -465,10 +570,11 @@ class MimicBrowserMiddleware:
                 )
             except Exception as e:
                 logger.error(f"MimicMiddleware: Error closing session: {e}")
+        if self._client:
+            try:
+                await self._client.aclose()
             finally:
-                if self._client:
-                    await self._client.aclose()
-                    self._client = None
+                self._client = None
 
     _SKIP_PATTERNS = (".xml", "/robots.txt", "/sitemap")
 
@@ -600,19 +706,19 @@ class MimicBrowserMiddleware:
             return await self._fetch_browser(client, request, spider)
 
         except Exception as e:
+            # Per-request fallback: this request continues as a plain download.
+            # Never tear down the shared client or local router here — other
+            # coroutines are using them (AAR-64).
             logger.error(f"MimicMiddleware: Failed {request.url}: {e}")
-
-            # Recreate session after consecutive failures (dead browser)
-            self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
-            if self._consecutive_failures >= 3:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3 and self.session_id:
                 logger.warning(
                     f"MimicMiddleware: {self._consecutive_failures} consecutive "
-                    f"failures, recreating session"
+                    f"failures, dropping session {self.session_id} "
+                    f"(re-created on next use)"
                 )
-                await self.spider_closed(spider)
-                self.session_id = None
                 self._consecutive_failures = 0
-                await self.spider_opened(spider)
+                await self._drop_session()
 
             return None
 
@@ -620,7 +726,7 @@ class MimicBrowserMiddleware:
         """Fetch via /api/fetch with auto-routing (httpcloak → browser)."""
         fetch_payload = {
             "url": request.url,
-            "stealth_level": self.stealth_level,
+            "stealth_level": self._stealth_for(self._domain_for(request)),
             **self._fetch_policy_fields(),
         }
 
@@ -653,8 +759,7 @@ class MimicBrowserMiddleware:
 
     async def _fetch_browser(self, client, request, spider):
         """Fetch via browser session for full JS rendering."""
-        if not self.session_id:
-            await self.spider_opened(spider)
+        await self._ensure_session(spider)
 
         if not self.session_id:
             logger.warning("MimicMiddleware: No session, falling back")
@@ -699,7 +804,7 @@ class MimicBrowserMiddleware:
                 json={
                     "url": request.url,
                     "session_id": self.session_id,
-                    "stealth_level": self.stealth_level,
+                    "stealth_level": self._stealth_for(self._domain_for(request)),
                     **self._fetch_policy_fields(),
                 },
                 headers=self._get_headers(),
@@ -767,16 +872,40 @@ class MimicBrowserMiddleware:
                 f"MimicMiddleware: Possible block at {request.url} "
                 f"(status: {response.status})"
             )
-            if self.stealth_level != "maximum":
-                logger.info("MimicMiddleware: Upgrading to maximum stealth")
-                self.stealth_level = "maximum"
-                await self.spider_closed(spider)
-                self.session_id = None
-                await self.spider_opened(spider)
+            domain = self._domain_for(request)
+            if domain and self.stealth_level != "maximum":
+                if domain not in self._escalated:
+                    logger.info(
+                        f"MimicMiddleware: escalating {domain} to maximum stealth "
+                        f"for {self.escalation_ttl:.0f}s"
+                    )
+                self._escalated[domain] = time.monotonic() + self.escalation_ttl
 
         return response
 
     async def process_exception(self, request, exception, spider):
+        """Capped retry of transport errors (timeouts, resets, DNS).
+
+        The platform disables Scrapy's RetryMiddleware, so without this a
+        single timeout dropped the URL for good (AAR-64). Only active when
+        RetryMiddleware isn't, so retries never double up.
+        """
         if request.meta.get("mimic_browser"):
             logger.error(f"MimicMiddleware: Exception for {request.url}: {exception}")
-        return None
+        if not self.transport_retries or not isinstance(exception, _TRANSPORT_ERRORS):
+            return None
+        retries = request.meta.get("mimic_transport_retries", 0)
+        stats = getattr(self.crawler, "stats", None)
+        if retries >= self.transport_retries:
+            if stats is not None:
+                stats.inc_value("mimic/transport_retry/max_reached")
+            return None
+        if stats is not None:
+            stats.inc_value("mimic/transport_retry/count")
+        logger.info(
+            f"MimicMiddleware: retrying {request.url} after transport error "
+            f"({retries + 1}/{self.transport_retries}): {exception!r}"
+        )
+        retry = request.replace(dont_filter=True, priority=request.priority - 1)
+        retry.meta["mimic_transport_retries"] = retries + 1
+        return retry

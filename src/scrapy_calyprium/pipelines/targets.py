@@ -7,13 +7,43 @@ TargetCompletionPipeline: Marks targets as crawled after processing.
 import logging
 from typing import Dict, List
 from scrapy.exceptions import NotConfigured
+from twisted.internet import defer
+from twisted.internet.threads import deferToThread
 
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
 
 
-class TargetDiscoveryPipeline:
+class _OffReactorFlush:
+    """Buffered POSTs run in a thread (AAR-64): a slow Forge must not stall
+    every in-flight request. close_spider waits for outstanding POSTs."""
+
+    #: Runs a blocking callable off the reactor; overridable in tests.
+    _run_blocking = staticmethod(deferToThread)
+
+    def _flush(self):
+        if not self._buffer:
+            return None
+        batch, self._buffer = self._buffer, []
+        d = self._run_blocking(self._post, batch)
+        d.addErrback(lambda f: logger.warning(
+            f"{type(self).__name__}: flush failed: {f.value}"))
+        self._in_flight.append(d)
+
+        def _untrack(result):
+            if d in self._in_flight:
+                self._in_flight.remove(d)
+            return result
+
+        d.addBoth(_untrack)
+        return d
+
+    def _wait_in_flight(self):
+        return defer.DeferredList(list(self._in_flight))
+
+
+class TargetDiscoveryPipeline(_OffReactorFlush):
     def __init__(self, forge_url, api_key, user_id, target_slug, source_slug,
                  url_fields, nested_fields, batch_size=50, service_secret=None):
         self.forge_url = forge_url.rstrip("/")
@@ -27,6 +57,7 @@ class TargetDiscoveryPipeline:
         self.batch_size = batch_size
         self._buffer = []
         self._total = 0
+        self._in_flight = []
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -82,30 +113,28 @@ class TargetDiscoveryPipeline:
         return item
 
     def close_spider(self, spider):
-        if self._buffer:
-            self._flush()
-        logger.info(f"TargetDiscovery: submitted {self._total} targets for {self.target_slug}")
+        self._flush()
+        d = self._wait_in_flight()
+        d.addCallback(lambda _: logger.info(
+            f"TargetDiscovery: submitted {self._total} targets for {self.target_slug}"))
+        return d
 
-    def _flush(self):
+    def _post(self, batch):
         import httpx
-        if not self._buffer:
-            return
         try:
-            payload = {"targets": self._buffer, "source_spider_slug": self.source_slug}
+            payload = {"targets": batch, "source_spider_slug": self.source_slug}
             resp = self.auth.call(lambda h: httpx.post(
                 f"{self.forge_url}/spiders/{self.target_slug}/targets/submit",
                 json=payload, headers=h, timeout=30.0))
             if resp.status_code == 200:
-                self._total += len(self._buffer)
+                self._total += len(batch)
             else:
                 logger.warning(f"TargetDiscovery: submit failed ({resp.status_code})")
         except Exception as e:
             logger.warning(f"TargetDiscovery: flush failed: {e}")
-        finally:
-            self._buffer = []
 
 
-class TargetCompletionPipeline:
+class TargetCompletionPipeline(_OffReactorFlush):
     def __init__(self, forge_url, api_key, user_id, spider_slug, batch_size=50,
                  service_secret=None):
         self.forge_url = forge_url.rstrip("/")
@@ -116,6 +145,7 @@ class TargetCompletionPipeline:
         self.batch_size = batch_size
         self._buffer = []
         self._total = 0
+        self._in_flight = []
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -146,22 +176,20 @@ class TargetCompletionPipeline:
         return item
 
     def close_spider(self, spider):
-        if self._buffer:
-            self._flush()
-        logger.info(f"TargetCompletion: marked {self._total} targets for {self.spider_slug}")
+        self._flush()
+        d = self._wait_in_flight()
+        d.addCallback(lambda _: logger.info(
+            f"TargetCompletion: marked {self._total} targets for {self.spider_slug}"))
+        return d
 
-    def _flush(self):
+    def _post(self, batch):
         import httpx
-        if not self._buffer:
-            return
         try:
-            payload = {"urls": self._buffer}
+            payload = {"urls": batch}
             resp = self.auth.call(lambda h: httpx.post(
                 f"{self.forge_url}/spiders/{self.spider_slug}/targets/mark-crawled",
                 json=payload, headers=h, timeout=30.0))
             if resp.status_code == 200:
-                self._total += len(self._buffer)
+                self._total += len(batch)
         except Exception as e:
             logger.warning(f"TargetCompletion: flush failed: {e}")
-        finally:
-            self._buffer = []

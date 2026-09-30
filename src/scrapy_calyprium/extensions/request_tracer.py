@@ -61,6 +61,9 @@ class CalypriumRequestTracer:
         self._buffer: List[Dict] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Set when the buffer fills, so the flush thread POSTs early. The POST
+        # never happens on the caller's (reactor) thread (AAR-64).
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     @classmethod
@@ -146,14 +149,11 @@ class CalypriumRequestTracer:
             "response_bytes": response_bytes,
             "error_message": error_message,
         }
-        batch = None
         with self._lock:
             self._buffer.append(span)
-            if len(self._buffer) >= BATCH_SIZE:
-                batch = self._buffer[:]
-                self._buffer.clear()
-        if batch:
-            self._post_batch(batch)
+            full = len(self._buffer) >= BATCH_SIZE
+        if full:
+            self._wake.set()
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -172,13 +172,18 @@ class CalypriumRequestTracer:
 
     def spider_closed(self, spider, reason):
         self._stop.set()
-        self._flush()
+        self._wake.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=15)  # the loop does the final flush
+        else:
+            self._flush()
 
     def _flush_loop(self):
-        while not self._stop.wait(FLUSH_INTERVAL):
+        while not self._stop.is_set():
+            self._wake.wait(FLUSH_INTERVAL)
+            self._wake.clear()
             self._flush()
+        self._flush()
 
     def _flush(self):
         with self._lock:
