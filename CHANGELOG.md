@@ -1,3 +1,14 @@
+## [1.26.10](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.9...v1.26.10) (2026-09-30)
+
+
+### Bug Fixes
+
+* **auth:** authenticate Forge calls with the run's spider key (AAR-47, AAR-32) ([2745d09](https://github.com/Aarkc/scrapy-calyprium/commit/2745d09cdee92646984146f48399f76604c24d3c))
+* **middleware:** keep requests flowing when Spectre/Mimic/Forge misbehave (AAR-64) ([2fdeb05](https://github.com/Aarkc/scrapy-calyprium/commit/2fdeb0542e932ff7ca378c1bff4a58c89d41f5b1))
+* **policy:** forward profile policy settings to Veil and Mimic (AAR-62) ([d5ba551](https://github.com/Aarkc/scrapy-calyprium/commit/d5ba551a51e260136e54b951cc99c08e0f0f696d))
+* **prism:** checkpoint the lowest completed offset and wrap at the end (AAR-65) ([d6de884](https://github.com/Aarkc/scrapy-calyprium/commit/d6de8847dd2a73d2c57901705520cd4c5b979302))
+* **s3-batch:** never wedge on odd items or silently lose batches (AAR-59) ([0f4a59f](https://github.com/Aarkc/scrapy-calyprium/commit/0f4a59fae0748ce3002a94083efafff4352e3122))
+
 ## [1.26.9](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.8...v1.26.9) (2026-08-17)
 
 
