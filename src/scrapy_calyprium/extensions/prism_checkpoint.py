@@ -5,14 +5,21 @@ walks back through the freshness-cached prefix (hundreds of thousands of
 URLs) before reaching the actual work region. That's ~30 min of wasted
 warmup on every restart.
 
-This extension persists ``spider._prism_next_offset`` to Forge between
-runs:
+This extension persists the spider's *completed* offset to Forge between
+runs (AAR-65): ``spider._prism_checkpoint_offset`` — the start of the lowest
+Prism page that still has URLs in flight — falling back to
+``_prism_next_offset`` for spiders that don't track completion. Saving the
+fetch frontier instead skipped every queued-but-uncrawled URL on a kill.
+
   * On ``spider_opened`` it GETs the last saved offset and assigns it to
     the spider *before* ``start_requests`` reads it, so the first Prism
     fetch starts at the resumed offset.
   * A background thread POSTs the current offset every
     ``PRISM_CHECKPOINT_INTERVAL`` seconds while the spider is alive.
   * On ``spider_closed`` it flushes one final POST.
+  * When the offset goes *backwards* (the spider wrapped to 0 after
+    exhausting the corpus) it DELETEs the checkpoint first, because Forge
+    only accepts forward-moving offsets.
 
 Enabled via settings::
 
@@ -33,9 +40,11 @@ Optional settings:
 Forge contract:
     GET  /spiders/{slug}/checkpoint                → {"offset": int} or 404
     POST /spiders/{slug}/checkpoint  {"offset": int} → 200 OK
+    DELETE /spiders/{slug}/checkpoint              → 2xx (reset; optional —
+        an older Forge without it keeps the old offset, and the next run
+        wraps to 0 itself when it finds the corpus exhausted)
 
-The spider attribute checkpointed is ``_prism_next_offset``; the extension
-silently no-ops on spiders that don't expose it (e.g. non-PrismSitemap
+The extension silently no-ops on spiders that don't expose it (e.g. non-PrismSitemap
 subclasses).
 """
 from __future__ import annotations
@@ -158,11 +167,44 @@ class PrismOffsetCheckpoint:
             )
             return False
 
+    def _reset_offset(self, slug: str) -> bool:
+        """DELETE the saved checkpoint so a lower offset can be stored."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = self.auth.call(
+                    lambda h: client.delete(self._checkpoint_url(slug), headers=h)
+                )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "PrismOffsetCheckpoint: failed to reset checkpoint for %s: %s",
+                slug, exc,
+            )
+            return False
+
+    def _persist(self, slug: str, offset: int) -> bool:
+        """Save ``offset``; reset first if it moved backwards (corpus wrap)."""
+        if self._last_saved is not None and offset < self._last_saved:
+            logger.info(
+                "PrismOffsetCheckpoint: offset for %s wrapped %d -> %d; resetting",
+                slug, self._last_saved, offset,
+            )
+            self._reset_offset(slug)
+        if self._save_offset(slug, offset):
+            self._last_saved = offset
+            return True
+        return False
+
     def _current_offset(self) -> Optional[int]:
         spider = self._spider
         if spider is None:
             return None
-        offset = getattr(spider, "_prism_next_offset", None)
+        # Completed offset (AAR-65); the fetch frontier only for spiders that
+        # don't track completion (or before the Prism pass has started).
+        offset = getattr(spider, "_prism_checkpoint_offset", None)
+        if offset is None:
+            offset = getattr(spider, "_prism_next_offset", None)
         if isinstance(offset, int) and offset >= 0:
             return offset
         return None
@@ -226,7 +268,7 @@ class PrismOffsetCheckpoint:
         offset = self._current_offset()
         slug = self.spider_slug or getattr(spider, "name", "")
         if offset is not None and slug and offset != self._last_saved:
-            if self._save_offset(slug, offset):
+            if self._persist(slug, offset):
                 logger.info(
                     "PrismOffsetCheckpoint: final save offset=%d for %s "
                     "(reason=%s)",
@@ -244,5 +286,4 @@ class PrismOffsetCheckpoint:
             if offset == self._last_saved:
                 # No advance — skip to avoid churning the endpoint.
                 continue
-            if self._save_offset(slug, offset):
-                self._last_saved = offset
+            self._persist(slug, offset)
