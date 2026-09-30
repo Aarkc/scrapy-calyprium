@@ -124,9 +124,8 @@ class TestPipelinesUseBearer:
             "RECRAWL_SPIDER_SLUG": "slug",
         })
         p = RecrawlTrackingPipeline.from_crawler(crawler)
-        p._buffer = [{"url": "http://a", "status": 200}]
         with mock.patch("httpx.post", return_value=_resp()) as post:
-            p._flush(None)
+            p._post([{"url": "http://a", "status": 200}])
         headers = post.call_args.kwargs["headers"]
         assert headers == {"Authorization": "Bearer clp_k"}
 
