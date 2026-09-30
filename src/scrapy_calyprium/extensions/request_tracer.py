@@ -14,7 +14,8 @@ Enabled via settings:
     }
 
 Required settings (same as CalypriumRunStats):
-    FORGE_API_URL, FORGE_SERVICE_SECRET, RECRAWL_SPIDER_SLUG,
+    FORGE_API_URL, CALYPRIUM_API_KEY (or legacy FORGE_SERVICE_SECRET),
+    RECRAWL_SPIDER_SLUG,
     RECRAWL_USER_ID, SPIDER_RUN_NUMBER
 """
 from __future__ import annotations
@@ -31,6 +32,8 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
+from scrapy_calyprium._forge import ForgeAuth
+
 logger = logging.getLogger(__name__)
 
 # Max spans to buffer before forcing a flush
@@ -46,16 +49,21 @@ class CalypriumRequestTracer:
         user_id: str,
         spider_slug: str,
         run_number: Optional[int],
+        api_key: Optional[str] = None,
     ):
         self.forge_url = forge_url.rstrip("/")
         self.service_secret = service_secret
         self.user_id = user_id
+        self.auth = ForgeAuth(api_key, service_secret, user_id)
         self.spider_slug = spider_slug
         self.run_number = run_number
 
         self._buffer: List[Dict] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # Set when the buffer fills, so the flush thread POSTs early. The POST
+        # never happens on the caller's (reactor) thread (AAR-64).
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     @classmethod
@@ -63,6 +71,7 @@ class CalypriumRequestTracer:
         settings = crawler.settings
         forge_url = settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
         secret = settings.get("FORGE_SERVICE_SECRET", "")
+        api_key = settings.get("CALYPRIUM_API_KEY") or os.getenv("CALYPRIUM_API_KEY", "")
         user_id = (
             settings.get("RECRAWL_USER_ID")
             or settings.get("SPIDER_USER_ID")
@@ -82,7 +91,7 @@ class CalypriumRequestTracer:
         except (TypeError, ValueError):
             run_number = None
 
-        ext = cls(forge_url, secret, user_id, slug or "", run_number)
+        ext = cls(forge_url, secret, user_id, slug or "", run_number, api_key=api_key)
 
         if not slug or not run_number:
             logger.info(
@@ -140,14 +149,11 @@ class CalypriumRequestTracer:
             "response_bytes": response_bytes,
             "error_message": error_message,
         }
-        batch = None
         with self._lock:
             self._buffer.append(span)
-            if len(self._buffer) >= BATCH_SIZE:
-                batch = self._buffer[:]
-                self._buffer.clear()
-        if batch:
-            self._post_batch(batch)
+            full = len(self._buffer) >= BATCH_SIZE
+        if full:
+            self._wake.set()
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -166,13 +172,18 @@ class CalypriumRequestTracer:
 
     def spider_closed(self, spider, reason):
         self._stop.set()
-        self._flush()
+        self._wake.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=15)  # the loop does the final flush
+        else:
+            self._flush()
 
     def _flush_loop(self):
-        while not self._stop.wait(FLUSH_INTERVAL):
+        while not self._stop.is_set():
+            self._wake.wait(FLUSH_INTERVAL)
+            self._wake.clear()
             self._flush()
+        self._flush()
 
     def _flush(self):
         with self._lock:
@@ -190,15 +201,8 @@ class CalypriumRequestTracer:
             f"runs/{self.run_number}/traces"
         )
         try:
-            httpx.post(
-                url,
-                json={"spans": batch},
-                headers={
-                    "X-Service-Secret": self.service_secret,
-                    "X-User-Id": self.user_id,
-                    "Content-Type": "application/json",
-                },
-                timeout=10.0,
-            )
+            self.auth.call(lambda h: httpx.post(
+                url, json={"spans": batch}, headers=h, timeout=10.0,
+            ))
         except Exception as exc:
             logger.debug("CalypriumRequestTracer POST failed: %s", exc)

@@ -5,14 +5,21 @@ walks back through the freshness-cached prefix (hundreds of thousands of
 URLs) before reaching the actual work region. That's ~30 min of wasted
 warmup on every restart.
 
-This extension persists ``spider._prism_next_offset`` to Forge between
-runs:
+This extension persists the spider's *completed* offset to Forge between
+runs (AAR-65): ``spider._prism_checkpoint_offset`` — the start of the lowest
+Prism page that still has URLs in flight — falling back to
+``_prism_next_offset`` for spiders that don't track completion. Saving the
+fetch frontier instead skipped every queued-but-uncrawled URL on a kill.
+
   * On ``spider_opened`` it GETs the last saved offset and assigns it to
     the spider *before* ``start_requests`` reads it, so the first Prism
     fetch starts at the resumed offset.
   * A background thread POSTs the current offset every
     ``PRISM_CHECKPOINT_INTERVAL`` seconds while the spider is alive.
   * On ``spider_closed`` it flushes one final POST.
+  * When the offset goes *backwards* (the spider wrapped to 0 after
+    exhausting the corpus) it DELETEs the checkpoint first, because Forge
+    only accepts forward-moving offsets.
 
 Enabled via settings::
 
@@ -23,7 +30,7 @@ Enabled via settings::
 
 Required settings (same as other Forge-aware extensions):
     FORGE_API_URL        backend base URL (e.g. http://calyprium-backend:8000)
-    FORGE_SERVICE_SECRET service-to-service auth
+    CALYPRIUM_API_KEY    spider key (Bearer); FORGE_SERVICE_SECRET is a legacy fallback
     RECRAWL_SPIDER_SLUG  Forge slug for this spider (or it falls back to spider.name)
     RECRAWL_USER_ID      owning user
 
@@ -33,9 +40,11 @@ Optional settings:
 Forge contract:
     GET  /spiders/{slug}/checkpoint                → {"offset": int} or 404
     POST /spiders/{slug}/checkpoint  {"offset": int} → 200 OK
+    DELETE /spiders/{slug}/checkpoint              → 2xx (reset; optional —
+        an older Forge without it keeps the old offset, and the next run
+        wraps to 0 itself when it finds the corpus exhausted)
 
-The spider attribute checkpointed is ``_prism_next_offset``; the extension
-silently no-ops on spiders that don't expose it (e.g. non-PrismSitemap
+The extension silently no-ops on spiders that don't expose it (e.g. non-PrismSitemap
 subclasses).
 """
 from __future__ import annotations
@@ -50,6 +59,8 @@ from scrapy import signals
 from scrapy.crawler import Crawler
 from scrapy.exceptions import NotConfigured
 
+from scrapy_calyprium._forge import ForgeAuth
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,10 +72,12 @@ class PrismOffsetCheckpoint:
         user_id: str,
         spider_slug: str,
         interval: float = 30.0,
+        api_key: Optional[str] = None,
     ):
         self.forge_url = forge_url.rstrip("/")
         self.service_secret = service_secret
         self.user_id = user_id
+        self.auth = ForgeAuth(api_key, service_secret, user_id)
         self.spider_slug = spider_slug
         self.interval = interval
 
@@ -84,9 +97,11 @@ class PrismOffsetCheckpoint:
 
         forge_url = settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
         secret = settings.get("FORGE_SERVICE_SECRET") or os.getenv("FORGE_SERVICE_SECRET", "")
-        if not secret:
+        api_key = settings.get("CALYPRIUM_API_KEY") or os.getenv("CALYPRIUM_API_KEY", "")
+        if not secret and not api_key:
             raise NotConfigured(
-                "PrismOffsetCheckpoint requires FORGE_SERVICE_SECRET to authenticate"
+                "PrismOffsetCheckpoint requires CALYPRIUM_API_KEY (or legacy "
+                "FORGE_SERVICE_SECRET) to authenticate"
             )
 
         user_id = (
@@ -97,7 +112,7 @@ class PrismOffsetCheckpoint:
         slug = settings.get("RECRAWL_SPIDER_SLUG", "")
         interval = settings.getfloat("PRISM_CHECKPOINT_INTERVAL", 30.0)
 
-        ext = cls(forge_url, secret, user_id, slug, interval)
+        ext = cls(forge_url, secret, user_id, slug, interval, api_key=api_key)
         crawler.signals.connect(ext.spider_opened, signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signals.spider_closed)
         return ext
@@ -105,10 +120,7 @@ class PrismOffsetCheckpoint:
     # -- HTTP helpers ----------------------------------------------------
 
     def _headers(self) -> dict:
-        return {
-            "X-Service-Secret": self.service_secret,
-            "X-User-Id": self.user_id,
-        }
+        return self.auth.headers()
 
     def _checkpoint_url(self, slug: str) -> str:
         return f"{self.forge_url}/spiders/{slug}/checkpoint"
@@ -117,7 +129,9 @@ class PrismOffsetCheckpoint:
         """GET the last saved offset for this spider. Returns None on miss."""
         try:
             with httpx.Client(timeout=10.0) as client:
-                resp = client.get(self._checkpoint_url(slug), headers=self._headers())
+                resp = self.auth.call(
+                    lambda h: client.get(self._checkpoint_url(slug), headers=h)
+                )
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -141,11 +155,9 @@ class PrismOffsetCheckpoint:
         """POST the current offset. Returns True on success."""
         try:
             with httpx.Client(timeout=10.0) as client:
-                resp = client.post(
-                    self._checkpoint_url(slug),
-                    headers=self._headers(),
-                    json={"offset": offset},
-                )
+                resp = self.auth.call(lambda h: client.post(
+                    self._checkpoint_url(slug), headers=h, json={"offset": offset},
+                ))
             resp.raise_for_status()
             return True
         except Exception as exc:
@@ -155,11 +167,44 @@ class PrismOffsetCheckpoint:
             )
             return False
 
+    def _reset_offset(self, slug: str) -> bool:
+        """DELETE the saved checkpoint so a lower offset can be stored."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = self.auth.call(
+                    lambda h: client.delete(self._checkpoint_url(slug), headers=h)
+                )
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "PrismOffsetCheckpoint: failed to reset checkpoint for %s: %s",
+                slug, exc,
+            )
+            return False
+
+    def _persist(self, slug: str, offset: int) -> bool:
+        """Save ``offset``; reset first if it moved backwards (corpus wrap)."""
+        if self._last_saved is not None and offset < self._last_saved:
+            logger.info(
+                "PrismOffsetCheckpoint: offset for %s wrapped %d -> %d; resetting",
+                slug, self._last_saved, offset,
+            )
+            self._reset_offset(slug)
+        if self._save_offset(slug, offset):
+            self._last_saved = offset
+            return True
+        return False
+
     def _current_offset(self) -> Optional[int]:
         spider = self._spider
         if spider is None:
             return None
-        offset = getattr(spider, "_prism_next_offset", None)
+        # Completed offset (AAR-65); the fetch frontier only for spiders that
+        # don't track completion (or before the Prism pass has started).
+        offset = getattr(spider, "_prism_checkpoint_offset", None)
+        if offset is None:
+            offset = getattr(spider, "_prism_next_offset", None)
         if isinstance(offset, int) and offset >= 0:
             return offset
         return None
@@ -223,7 +268,7 @@ class PrismOffsetCheckpoint:
         offset = self._current_offset()
         slug = self.spider_slug or getattr(spider, "name", "")
         if offset is not None and slug and offset != self._last_saved:
-            if self._save_offset(slug, offset):
+            if self._persist(slug, offset):
                 logger.info(
                     "PrismOffsetCheckpoint: final save offset=%d for %s "
                     "(reason=%s)",
@@ -241,5 +286,4 @@ class PrismOffsetCheckpoint:
             if offset == self._last_saved:
                 # No advance — skip to avoid churning the endpoint.
                 continue
-            if self._save_offset(slug, offset):
-                self._last_saved = offset
+            self._persist(slug, offset)

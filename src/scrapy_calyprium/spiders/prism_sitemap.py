@@ -26,13 +26,25 @@ Spider arguments (passed via ``-a`` or Scrapyd settings):
     prism_url: Override Prism API base URL
     batch_size: URLs per API page (default: 5000)
     max_urls: Stop after N URLs (default: 0 = unlimited)
+
+Checkpointing (``prism://``, AAR-65): ``_prism_checkpoint_offset`` is the start
+of the lowest Prism page that still has URLs in flight (or the fetch frontier
+when none are), i.e. everything below it is fully crawled. The
+``PrismOffsetCheckpoint`` extension persists that, never the fetch frontier, so
+a killed run doesn't skip queued-but-uncrawled URLs. When a run that resumed
+at offset R reaches the end of the corpus it wraps to 0 and continues up to R
+(``PRISM_WRAP_ON_EXHAUST``, default True), so an exhausted checkpoint never
+pins later runs at 0 URLs.
 """
 
 import logging
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import urlparse, parse_qs, urlencode
 
 import scrapy
+from scrapy import signals
+
+from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +56,12 @@ _REFILL_THRESHOLD = 1000
 # single hiccup. Tolerate this many *consecutive* failures (retrying on each
 # refill) before giving up.
 _TARGETS_MAX_FETCH_FAILURES = 5
+
+# A fully-fresh Prism page (every URL filtered as recently crawled) doubles the
+# next page's size up to this cap, so a long fresh prefix is walked in few
+# hops. Every URL is still examined; the old fixed 50k *skip* jumped over
+# URLs that were never checked, and the checkpoint then made that permanent.
+_FRESH_PAGE_MAX = 50000
 
 
 class PrismSitemapSpider(scrapy.Spider):
@@ -84,6 +102,13 @@ class PrismSitemapSpider(scrapy.Spider):
         self._refill_in_flight = False  # True while a Prism fetch is pending
         self._prism_parsed = None  # stored for refill
         self._prism_next_offset = 0
+        # AAR-65 checkpoint bookkeeping (prism:// only).
+        self._prism_open_pages: Dict[int, int] = {}  # page start -> in-flight
+        self._prism_checkpoint_offset: Optional[int] = None
+        self._prism_cycle_start = 0
+        self._prism_stop_at: Optional[int] = None
+        self._prism_wrapped = False
+        self._prism_page_limit = min(self.batch_size, 100000)
 
         # Build url_source from class attributes if not provided
         if url_source:
@@ -132,6 +157,26 @@ class PrismSitemapSpider(scrapy.Spider):
         except Exception:
             return self._urls_yielded - self._urls_responded
 
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        # Dupe-filtered requests never reach a callback or errback.
+        crawler.signals.connect(spider._on_request_dropped, signal=signals.request_dropped)
+        return spider
+
+    def _get_forge_auth(self) -> ForgeAuth:
+        """Forge credentials for the recrawl/targets/freshness endpoints:
+        Bearer CALYPRIUM_API_KEY, legacy FORGE_SERVICE_SECRET fallback."""
+        auth = getattr(self, "_forge_auth", None)
+        if auth is None:
+            try:
+                settings = self.settings
+            except AttributeError:
+                settings = None
+            auth = ForgeAuth.from_settings(settings)
+            self._forge_auth = auth
+        return auth
+
     def start_requests(self):
         if not self.url_source:
             logger.error("No url_source and no prism_domain set")
@@ -145,9 +190,11 @@ class PrismSitemapSpider(scrapy.Spider):
             yield from self._start_from_recrawl(parsed)
         elif parsed.scheme == "prism":
             self._prism_parsed = parsed
-            # Preserve start_offset if set by spider subclass
+            # Preserve start_offset if set by spider subclass / checkpoint
             if not self._prism_next_offset:
                 self._prism_next_offset = 0
+            self._prism_cycle_start = self._prism_next_offset
+            self._prism_checkpoint_offset = self._prism_next_offset
             yield self._make_refill_request()
         elif parsed.scheme == "file":
             yield from self._start_from_file(parsed.path)
@@ -174,12 +221,8 @@ class PrismSitemapSpider(scrapy.Spider):
 
         try:
             forge_url = self.settings.get("FORGE_API_URL", "http://calyprium-backend:8000")
-            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
-            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
         except AttributeError:
             forge_url = "http://calyprium-backend:8000"
-            api_key = ""
-            user_id = "internal"
 
         try:
             max_urls_setting = self.settings.getint("RECRAWL_MAX_URLS", 0)
@@ -187,8 +230,6 @@ class PrismSitemapSpider(scrapy.Spider):
             max_urls_setting = 0
 
         self._targets_forge_url = forge_url
-        self._targets_api_key = api_key
-        self._targets_user_id = user_id
         self._targets_spider_slug = spider_slug
         self._targets_type = target_type
         self._targets_exhausted = False
@@ -227,12 +268,11 @@ class PrismSitemapSpider(scrapy.Spider):
             api_params["target_type"] = self._targets_type
 
         try:
-            resp = req.get(
+            resp = self._get_forge_auth().call(lambda h: req.get(
                 f"{self._targets_forge_url}/spiders/{self._targets_spider_slug}/targets/pending",
                 params=api_params,
-                headers={"X-Service-Secret": self._targets_api_key,
-                          "X-User-Id": self._targets_user_id},
-                timeout=120)
+                headers=h,
+                timeout=120))
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -338,14 +378,6 @@ class PrismSitemapSpider(scrapy.Spider):
         except AttributeError:
             self._recrawl_forge_url = "http://calyprium-backend:8000"
         try:
-            self._recrawl_api_key = self.settings.get("FORGE_SERVICE_SECRET", "") or self.settings.get("CALYPRIUM_API_KEY", "")
-        except AttributeError:
-            self._recrawl_api_key = ""
-        try:
-            self._recrawl_user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
-        except AttributeError:
-            self._recrawl_user_id = "internal"
-        try:
             self._recrawl_max_urls = self.settings.getint("RECRAWL_MAX_URLS", 0)
         except AttributeError:
             self._recrawl_max_urls = 0
@@ -382,18 +414,10 @@ class PrismSitemapSpider(scrapy.Spider):
             # re-walking the entire fresh prefix (~100s on a 1M-row freshness
             # table). The response includes `next_prism_offset` which we
             # adopt for the next batch.
-            resp = req.get(
-                api_url,
-                params={
-                    "limit": limit,
-                    "prism_offset": self._prism_next_offset,
-                },
-                headers={
-                    "X-Service-Secret": self._recrawl_api_key,
-                    "X-User-Id": self._recrawl_user_id,
-                },
-                timeout=300,
-            )
+            params = {"limit": limit, "prism_offset": self._prism_next_offset}
+            resp = self._get_forge_auth().call(lambda h: req.get(
+                api_url, params=params, headers=h, timeout=300,
+            ))
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -475,13 +499,13 @@ class PrismSitemapSpider(scrapy.Spider):
         }
         return f"{forge_url}/spiders/{spider_slug}/recrawl/stale-urls?{urlencode(api_params)}"
 
-    def _build_prism_api_url(self, parsed, offset: int) -> str:
+    def _build_prism_api_url(self, parsed, offset: int, limit: Optional[int] = None) -> str:
         """Build the Prism API URL for a page of URLs."""
         domain = parsed.netloc or parsed.path
         params = parse_qs(parsed.query)
 
         api_params = {
-            "limit": min(self.batch_size, 100000),
+            "limit": limit or min(self.batch_size, 100000),
             "offset": offset,
             "format": "json",
         }
@@ -494,6 +518,57 @@ class PrismSitemapSpider(scrapy.Spider):
 
         return f"{self.prism_url}/api/domains/{domain}/urls?{urlencode(api_params)}"
 
+    # -- prism:// checkpoint bookkeeping (AAR-65) ---------------------------
+
+    def _prism_track(self, page_start: int, delta: int) -> None:
+        n = self._prism_open_pages.get(page_start, 0) + delta
+        if n > 0:
+            self._prism_open_pages[page_start] = n
+        else:
+            self._prism_open_pages.pop(page_start, None)
+        self._update_prism_checkpoint()
+
+    def _update_prism_checkpoint(self) -> None:
+        """Lowest page start with URLs in flight, else the fetch frontier.
+
+        Assigned as a plain int so the checkpoint thread reads it atomically.
+        """
+        if self._prism_checkpoint_offset is None:
+            return
+        if self._prism_open_pages:
+            self._prism_checkpoint_offset = min(self._prism_open_pages)
+        else:
+            self._prism_checkpoint_offset = self._prism_next_offset
+
+    def _prism_request_done(self, request) -> None:
+        page = (getattr(request, "meta", None) or {}).get("_prism_page")
+        if page is not None:
+            self._prism_track(page, -1)
+
+    def _on_request_dropped(self, request, spider=None, **kwargs) -> None:
+        self._prism_request_done(request)
+
+    def _wrap_enabled(self) -> bool:
+        try:
+            return self.settings.getbool("PRISM_WRAP_ON_EXHAUST", True)
+        except AttributeError:
+            return True
+
+    def _maybe_wrap(self) -> bool:
+        """At the end of the corpus, wrap to 0 and crawl up to where this run
+        started. Returns True if wrapped."""
+        if self._prism_wrapped or not self._prism_cycle_start or not self._wrap_enabled():
+            return False
+        self._prism_wrapped = True
+        self._prism_stop_at = self._prism_cycle_start
+        self._prism_next_offset = 0
+        self._prism_page_limit = min(self.batch_size, 100000)
+        logger.info(
+            f"Prism: reached the end of the corpus; wrapping to offset 0 "
+            f"(will stop at {self._prism_stop_at:,})"
+        )
+        return True
+
     def _handle_prism_page(self, response):
         """Process one page of Prism URLs."""
         self._refill_in_flight = False
@@ -501,11 +576,24 @@ class PrismSitemapSpider(scrapy.Spider):
         data = response.json()
         raw_urls = data.get("urls", [])
         total = data.get("total", 0) or data.get("total_stale", 0)
+        page_start = response.meta.get("_prism_offset", self._prism_next_offset)
+        limit = response.meta.get("_prism_limit") or min(self.batch_size, 100000)
+
+        # After a wrap, stop where this run's pass began.
+        end_of_cycle = False
+        if self._prism_stop_at is not None and page_start + len(raw_urls) >= self._prism_stop_at:
+            raw_urls = raw_urls[: max(0, self._prism_stop_at - page_start)]
+            end_of_cycle = True
         raw_count = len(raw_urls)
 
         if not raw_urls:
+            if not end_of_cycle and self._maybe_wrap():
+                self._update_prism_checkpoint()
+                yield self._make_refill_request()
+                return
             logger.info(f"No more URLs from Prism (total={total})")
             self._prism_exhausted = True
+            self._update_prism_checkpoint()
             return
 
         # Filter out fresh URLs if recrawl tracking is enabled.
@@ -514,37 +602,53 @@ class PrismSitemapSpider(scrapy.Spider):
 
         logger.info(
             f"Prism: got {len(urls):,} stale / {raw_count:,} total URLs "
-            f"(offset={self._prism_next_offset:,}, total={total:,}, "
+            f"(offset={page_start:,}, total={total:,}, "
             f"pending={self._pending_count:,})"
         )
 
-        # Advance offset by the RAW batch size (not filtered)
-        self._prism_next_offset += raw_count
-
-        for url in urls:
-            if self.max_urls and self._urls_yielded >= self.max_urls:
+        # Decide everything before yielding: the generator is consumed lazily,
+        # and refill checks must already see the advanced frontier.
+        page_end = page_start + raw_count
+        if self.max_urls:
+            remaining = max(0, self.max_urls - self._urls_yielded)
+            if len(urls) >= remaining:
+                if len(urls) > remaining:
+                    # Checkpoint up to the first URL we won't crawl, not the
+                    # whole page.
+                    page_end = page_start + raw_urls.index(urls[remaining])
+                urls = urls[:remaining]
                 logger.info(f"Reached max_urls limit ({self.max_urls:,})")
                 self._prism_exhausted = True
-                return
-            self._urls_yielded += 1
-            yield scrapy.Request(url, callback=self._parse_and_maybe_refill)
 
-        # Prism is exhausted only if the RAW batch was smaller than requested
-        if raw_count < min(self.batch_size, 100000):
-            self._prism_exhausted = True
-        # If filtering removed all URLs but Prism has more, skip forward
-        # aggressively. With ~1.15M already-fresh URLs at the start of the
-        # Prism corpus, the spider needs to advance past them quickly
-        # instead of fetching 5k at a time (230+ empty batches). Jump by
-        # 50k per hop to clear the fresh prefix in ~23 hops (~30s) instead
-        # of ~230 hops (~5 min). Once we hit batches with stale URLs, the
-        # normal 5k cadence resumes.
-        elif not urls and not self._prism_exhausted:
-            skip_stride = 50000
-            self._prism_next_offset += skip_stride - raw_count
+        at_end = end_of_cycle or raw_count < limit
+        self._prism_next_offset = page_end
+        if urls:
+            self._prism_open_pages[page_start] = (
+                self._prism_open_pages.get(page_start, 0) + len(urls)
+            )
+            self._urls_yielded += len(urls)
+            self._prism_page_limit = min(self.batch_size, 100000)
+        elif not at_end and not self._prism_exhausted:
+            # Fully fresh: widen the next page instead of skipping ahead.
+            self._prism_page_limit = min(max(limit, 1) * 2, max(limit, _FRESH_PAGE_MAX))
+
+        if at_end and not self._prism_exhausted:
+            if end_of_cycle or not self._maybe_wrap():
+                self._prism_exhausted = True
+        self._update_prism_checkpoint()
+
+        for url in urls:
+            yield scrapy.Request(
+                url,
+                callback=self._parse_and_maybe_refill,
+                errback=self._prism_errback,
+                meta={"_prism_page": page_start},
+            )
+
+        if not urls and not self._prism_exhausted:
             logger.info(
-                f"Batch fully fresh, skipping ahead to offset "
-                f"{self._prism_next_offset:,} (stride={skip_stride:,})"
+                f"Batch fully fresh, continuing at offset "
+                f"{self._prism_next_offset:,} (next page={self._prism_page_limit:,})"
             )
             yield self._make_refill_request()
 
@@ -567,23 +671,22 @@ class PrismSitemapSpider(scrapy.Spider):
 
         try:
             forge_url = self.settings.get("FORGE_API_URL", "")
-            api_key = self.settings.get("FORGE_SERVICE_SECRET", "")
-            user_id = self.settings.get("RECRAWL_USER_ID", "") or self.settings.get("SPIDER_USER_ID", "internal")
             spider_slug = self.settings.get("RECRAWL_SPIDER_SLUG", "") or self.name
         except AttributeError:
             return urls
 
-        if not forge_url or not api_key:
+        auth = self._get_forge_auth()
+        if not forge_url or not auth:
             return urls
 
         import requests as req
         try:
-            resp = req.post(
+            resp = auth.call(lambda h: req.post(
                 f"{forge_url}/spiders/{spider_slug}/recrawl/filter-stale",
                 json={"urls": urls},
-                headers={"X-Service-Secret": api_key, "X-User-Id": user_id},
+                headers=h,
                 timeout=30,
-            )
+            ))
             resp.raise_for_status()
             data = resp.json()
             stale = data.get("stale_urls", urls)
@@ -602,9 +705,22 @@ class PrismSitemapSpider(scrapy.Spider):
         """Wrapper around parse_item that triggers refill when queue is low."""
         self._urls_responded += 1
 
-        # Yield parse results
-        yield from self.parse_item(response)
+        # Yield parse results; the page counts as done for this URL only once
+        # its callback has finished (AAR-65).
+        try:
+            yield from self.parse_item(response)
+        finally:
+            self._prism_request_done(response.request or response)
 
+        yield from self._maybe_prism_refill()
+
+    def _prism_errback(self, failure):
+        """A failed URL still completes its page, and must keep refill going."""
+        self._urls_responded += 1
+        self._prism_request_done(getattr(failure, "request", None))
+        yield from self._maybe_prism_refill()
+
+    def _maybe_prism_refill(self):
         # Check if we should fetch the next batch
         if (
             not self._prism_exhausted
@@ -622,16 +738,20 @@ class PrismSitemapSpider(scrapy.Spider):
         refill at the same offset.
         """
         self._refill_in_flight = True
+        offset = self._prism_next_offset
+        limit = self._prism_page_limit
         logger.info(
-            f"Prism: refilling from offset {self._prism_next_offset:,} "
+            f"Prism: refilling from offset {offset:,} "
             f"(pending={self._pending_count:,})"
         )
         return scrapy.Request(
-            self._build_prism_api_url(self._prism_parsed, offset=self._prism_next_offset),
+            self._build_prism_api_url(self._prism_parsed, offset=offset, limit=limit),
             callback=self._handle_prism_page,
             errback=self._handle_prism_error,
             meta={
                 "_internal": True,
+                "_prism_offset": offset,
+                "_prism_limit": limit,
                 "download_timeout": 120,
                 # Use a separate download slot so Prism API calls don't
                 # compete with proxy-routed scrape requests. Without this,

@@ -19,15 +19,29 @@ Settings:
         (default: True). Set False for spiders that hit clean JSON/XML APIs where
         block-detection only causes false-positive fingerprint churn. Can also be
         bypassed per-request with ``request.meta["spectre_skip_block_detection"]``.
+    SPECTRE_FALLBACK_USER_AGENT: User-Agent applied while no fingerprint is
+        available (Spectre down/slow). Default: a current desktop Chrome UA.
+
+Fingerprints are resolved off the reactor thread (AAR-64): the first one in
+``spider_opened``, later ones in the background. ``process_request`` never
+blocks on Spectre; a request with no fingerprint yet gets the fallback
+User-Agent (the platform disables Scrapy's UserAgentMiddleware, so without it
+requests went out with no UA at all). Failures back off exponentially instead
+of retrying a 10s call on every request. With ``SPECTRE_ROTATE_PER_REQUEST`` a
+new fingerprint is fetched in the background per request and applied as soon
+as it arrives.
 """
 
 import logging
+import time
 from typing import Dict, Optional
 from urllib.parse import urlparse
 
 import httpx
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
+from scrapy.utils.defer import maybe_deferred_to_future
+from twisted.internet.threads import deferToThread
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +69,7 @@ class SpectreMiddleware:
         browser_family: Optional[str] = None,
         os_family: Optional[str] = None,
         block_detection: bool = True,
+        fallback_user_agent: Optional[str] = None,
     ):
         self.service_url = service_url.rstrip("/")
         self.api_key = api_key
@@ -74,6 +89,21 @@ class SpectreMiddleware:
         self._domain_fingerprints: Dict[str, Dict] = {}
 
         self._client: Optional[httpx.Client] = None
+
+        from scrapy_calyprium._config import CalypriumConfig
+
+        self.fallback_user_agent = fallback_user_agent or CalypriumConfig.user_agent
+        # Background resolution state (reactor thread only).
+        self._refresh_in_flight = False
+        self._retry_at = 0.0
+        self._backoff = self.MIN_BACKOFF
+
+    MIN_BACKOFF = 5.0
+    MAX_BACKOFF = 300.0
+
+    #: Runs a blocking callable off the reactor; overridable in tests.
+    _run_blocking = staticmethod(deferToThread)
+    _now = staticmethod(time.monotonic)
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -106,6 +136,7 @@ class SpectreMiddleware:
             browser_family=crawler.settings.get("SPECTRE_BROWSER_FAMILY"),
             os_family=crawler.settings.get("SPECTRE_OS_FAMILY"),
             block_detection=crawler.settings.getbool("SPECTRE_BLOCK_DETECTION", True),
+            fallback_user_agent=crawler.settings.get("SPECTRE_FALLBACK_USER_AGENT"),
         )
         crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
@@ -122,26 +153,53 @@ class SpectreMiddleware:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-    def spider_opened(self, spider):
-        """Pre-fetch fingerprint when spider starts."""
+    async def spider_opened(self, spider):
+        """Pre-fetch a fingerprint (off the reactor) when the spider starts."""
         logger.info(
             f"SpectreMiddleware: service={self.service_url}, "
             f"profile={self.profile_id or 'default'}, "
             f"rotate_per_request={self.rotate_per_request}, "
             f"sticky_session={self.sticky_session}"
         )
+        d = self._refresh()
+        if d is not None:
+            await maybe_deferred_to_future(d)
+        fp = (self._cached_fingerprint or {}).get("fingerprint", {})
+        if self._cached_fingerprint:
+            logger.info(
+                f"SpectreMiddleware: Using fingerprint "
+                f"'{fp.get('name')}' (ID: {fp.get('id')})"
+            )
 
-        # Pre-fetch fingerprint if not rotating per request
-        if not self.rotate_per_request:
-            try:
-                self._cached_fingerprint = self._resolve_fingerprint()
-                fp = self._cached_fingerprint.get("fingerprint", {})
-                logger.info(
-                    f"SpectreMiddleware: Using fingerprint "
-                    f"'{fp.get('name')}' (ID: {fp.get('id')})"
-                )
-            except Exception as e:
-                logger.warning(f"SpectreMiddleware: Failed to pre-fetch fingerprint: {e}")
+    def _refresh(self, domain: Optional[str] = None):
+        """Resolve a fingerprint in a thread unless one is already in flight
+        or we're backing off after a failure. Returns the Deferred or None."""
+        if self._refresh_in_flight or self._now() < self._retry_at:
+            return None
+        self._refresh_in_flight = True
+        d = self._run_blocking(self._resolve_fingerprint, domain)
+
+        def _ok(result):
+            self._cached_fingerprint = result
+            if domain:
+                self._domain_fingerprints[domain] = result
+            self._backoff = self.MIN_BACKOFF
+            self._retry_at = 0.0
+
+        def _err(failure):
+            self._retry_at = self._now() + self._backoff
+            logger.warning(
+                f"SpectreMiddleware: fingerprint resolve failed ({failure.value}); "
+                f"using fallback User-Agent, retrying in {self._backoff:.0f}s"
+            )
+            self._backoff = min(self._backoff * 2, self.MAX_BACKOFF)
+
+        def _done(_):
+            self._refresh_in_flight = False
+
+        d.addCallbacks(_ok, _err)
+        d.addBoth(_done)
+        return d
 
     def spider_closed(self, spider):
         """Clean up HTTP client."""
@@ -190,37 +248,24 @@ class SpectreMiddleware:
 
         return result
 
-    def _get_fingerprint_for_request(self, request) -> Dict:
+    def _get_fingerprint_for_request(self, request) -> Optional[Dict]:
         """
-        Get the appropriate fingerprint for a request.
+        Get the fingerprint for a request without blocking.
 
         Handles caching, per-request rotation, and per-domain fingerprints.
+        Returns None when nothing is cached yet (a background resolve is
+        started, subject to failure backoff).
         """
-        parsed = urlparse(request.url)
-        domain = parsed.netloc
+        domain = urlparse(request.url).netloc
 
-        # Per-request rotation — always fetch a new fingerprint
         if self.rotate_per_request:
-            try:
-                return self._resolve_fingerprint(domain)
-            except Exception as e:
-                logger.warning(f"SpectreMiddleware: Failed to resolve fingerprint for {domain}: {e}")
-                if self._cached_fingerprint:
-                    return self._cached_fingerprint
-                raise
-
-        # Per-domain caching
-        if domain in self._domain_fingerprints:
-            return self._domain_fingerprints[domain]
-
-        # Use cached fingerprint if available
-        if self._cached_fingerprint:
+            # Start the next fingerprint now; apply the latest one we have.
+            self._refresh(domain)
             return self._cached_fingerprint
 
-        # Fetch new fingerprint
-        fingerprint = self._resolve_fingerprint(domain)
-        self._cached_fingerprint = fingerprint
-        self._domain_fingerprints[domain] = fingerprint
+        fingerprint = self._domain_fingerprints.get(domain) or self._cached_fingerprint
+        if fingerprint is None:
+            self._refresh(domain)
         return fingerprint
 
     def process_request(self, request, spider):
@@ -228,16 +273,19 @@ class SpectreMiddleware:
         if request.meta.get("_internal"):
             return None
 
-        try:
-            fingerprint_data = self._get_fingerprint_for_request(request)
-        except Exception as e:
-            logger.error(f"SpectreMiddleware: Failed to get fingerprint: {e}")
-            return None  # Allow request to proceed without fingerprint
+        fingerprint_data = self._get_fingerprint_for_request(request)
+        if not fingerprint_data:
+            # Spectre down/slow: never send a request without a User-Agent.
+            request.headers.setdefault("User-Agent", self.fallback_user_agent)
+            request.meta["spectre_fallback_ua"] = True
+            return None
 
         # Apply headers from fingerprint
         headers = fingerprint_data.get("headers", {})
         for header_name, header_value in headers.items():
             request.headers[header_name] = header_value
+
+        request.headers.setdefault("User-Agent", self.fallback_user_agent)
 
         # Store fingerprint info in request meta for tracking/debugging
         fingerprint = fingerprint_data.get("fingerprint", {})
@@ -296,9 +344,10 @@ class SpectreMiddleware:
                 f"SpectreMiddleware: Possible block at {request.url} "
                 f"(status: {response.status}, fingerprint: {fingerprint_id})"
             )
-            # Clear cache to force rotation on next request
-            self._cached_fingerprint = None
+            # Rotate: resolve a fresh identity in the background; it replaces
+            # the cached one as soon as it arrives (never blocks the reactor).
             domain = urlparse(request.url).netloc
             self._domain_fingerprints.pop(domain, None)
+            self._refresh(domain)
 
         return response

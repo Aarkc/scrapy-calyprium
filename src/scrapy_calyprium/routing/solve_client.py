@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from scrapy_calyprium._policy import RunPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +56,11 @@ class SolveClient:
         user_id: Optional[str] = None,
         timeout: float = 90.0,
         ip_health_url: Optional[str] = None,
+        policy: Optional[RunPolicy] = None,
     ):
+        # Profile policy (AAR-62): spider_id / country ride on every solve and
+        # engine_hint is clamped to the allow-list.
+        self.policy = policy or RunPolicy()
         self.service_url = service_url.rstrip("/")
         # IP-health reputation lives in mimic; when /api/solve is pointed at a
         # separate solver service (Tessera), reports still go to mimic.
@@ -70,7 +76,9 @@ class SolveClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
             headers["X-API-Key"] = self.api_key
-        if self.service_secret:
+        elif self.service_secret:
+            # Legacy: only without a spider key (AAR-32 — never ship the
+            # master secret alongside a key that already authenticates).
             headers["X-Service-Secret"] = self.service_secret
         if self.user_id:
             headers["X-User-Id"] = self.user_id
@@ -99,9 +107,10 @@ class SolveClient:
     ) -> SolveResult:
         """Call /api/solve and return the cookies (or a structured failure)."""
         client = await self._get_client()
-        body = {"domain": domain}
+        body = {"domain": domain, **self.policy.solve_fields()}
         if target_url:
             body["target_url"] = target_url
+        engine_hint = self.policy.clamp_engine(engine_hint)
         if engine_hint:
             body["engine_hint"] = engine_hint
         if proxy_session_id:
