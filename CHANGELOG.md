@@ -1,3 +1,10 @@
+# [1.27.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.10...v1.27.0) (2026-10-04)
+
+
+### Features
+
+* **extensions:** snapshot recorder for run health ([ddac577](https://github.com/Aarkc/scrapy-calyprium/commit/ddac5776740716a1b843dd4721f09573452778bd))
+
 ## [1.26.10](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.9...v1.26.10) (2026-09-30)
 
 
