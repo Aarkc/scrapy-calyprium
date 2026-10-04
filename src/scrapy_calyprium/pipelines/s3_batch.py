@@ -81,6 +81,85 @@ def on_items_persisted(crawler: Any, callback: Callable[..., Any]) -> None:
         setattr(crawler, _LISTENERS_ATTR, listeners)
     listeners.append(callback)
 
+DEFAULT_BATCH_PATH = "{user_id}/{spider}/runs/{run_number}/batch_{batch_id}.jl"
+
+
+@dataclass
+class S3Config:
+    """Where (and as whom) a run writes to object storage. Shared by
+    ``S3BatchPipeline`` and the ``SnapshotRecorder`` extension so both land
+    under the same run prefix through the same forge ``/s3`` gateway."""
+
+    endpoint_url: str
+    access_key: str
+    secret_key: str
+    region_name: str
+    bucket: str
+    path_template: str
+    user_id: str
+    spider_name: str
+    run_number: str
+
+    def batch_key(self, batch_id: Any) -> str:
+        return self.path_template.format(
+            user_id=self.user_id,
+            spider=self.spider_name,
+            run_number=self.run_number,
+            batch_id=batch_id,
+        )
+
+    def run_prefix(self) -> str:
+        """The run's directory: the batch key minus its file name, e.g.
+        ``{user}/{storage_id}/runs/{n}`` (empty for a flat template)."""
+        key = self.batch_key(0)
+        return key.rsplit("/", 1)[0] if "/" in key else ""
+
+
+def resolve_s3_config(settings: Any) -> S3Config:
+    """Crawler settings > env vars > ``CALYPRIUM_API_KEY`` fallback."""
+    api_key = settings.get("CALYPRIUM_API_KEY", os.getenv("CALYPRIUM_API_KEY", ""))
+    return S3Config(
+        endpoint_url=(
+            settings.get("AWS_ENDPOINT_URL")
+            or os.getenv("AWS_ENDPOINT_URL")
+            or "https://forge.calyprium.com/s3"
+        ),
+        access_key=(
+            settings.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID") or api_key
+        ),
+        secret_key=(
+            settings.get("AWS_SECRET_ACCESS_KEY")
+            or os.getenv("AWS_SECRET_ACCESS_KEY")
+            or api_key
+        ),
+        region_name=settings.get("AWS_REGION_NAME", os.getenv("AWS_REGION_NAME", "us-east-1")),
+        bucket=settings.get("S3_BUCKET", os.getenv("S3_BUCKET", "calyprium")),
+        path_template=settings.get("S3_BATCH_PATH", DEFAULT_BATCH_PATH),
+        user_id=settings.get("SPIDER_USER_ID", os.getenv("SPIDER_USER_ID", "default")),
+        spider_name=settings.get("SPIDER_NAME", os.getenv("SPIDER_NAME", "unknown")),
+        run_number=settings.get("SPIDER_RUN_NUMBER", os.getenv("SPIDER_RUN_NUMBER", "0")),
+    )
+
+
+def make_s3_client(
+    endpoint_url: str,
+    access_key: str,
+    secret_key: str,
+    region_name: str,
+    config: Any = None,
+):
+    import boto3
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region_name,
+        config=config,
+    )
+
+
 #: Process exit code used when items were lost (see ``_exit_nonzero_at_exit``).
 LOST_ITEMS_EXIT_CODE = 3
 
@@ -187,59 +266,25 @@ class S3BatchPipeline:
 
     @classmethod
     def from_crawler(cls, crawler):
-        # Resolve credentials: crawler settings > env vars > CALYPRIUM_API_KEY fallback
-        api_key = crawler.settings.get(
-            "CALYPRIUM_API_KEY", os.getenv("CALYPRIUM_API_KEY", "")
-        )
-
-        access_key = (
-            crawler.settings.get("AWS_ACCESS_KEY_ID")
-            or os.getenv("AWS_ACCESS_KEY_ID")
-            or api_key
-        )
-        secret_key = (
-            crawler.settings.get("AWS_SECRET_ACCESS_KEY")
-            or os.getenv("AWS_SECRET_ACCESS_KEY")
-            or api_key
-        )
-
-        if not access_key or not secret_key:
+        cfg = resolve_s3_config(crawler.settings)
+        if not cfg.access_key or not cfg.secret_key:
             raise NotConfigured(
                 "S3BatchPipeline requires S3 credentials. Set AWS_ACCESS_KEY_ID "
                 "and AWS_SECRET_ACCESS_KEY, or use scrapy_calyprium.configure() "
                 "with an API key."
             )
 
-        endpoint_url = (
-            crawler.settings.get("AWS_ENDPOINT_URL")
-            or os.getenv("AWS_ENDPOINT_URL")
-            or "https://forge.calyprium.com/s3"
-        )
-
         pipeline = cls(
-            endpoint_url=endpoint_url,
-            access_key=access_key,
-            secret_key=secret_key,
-            region_name=crawler.settings.get(
-                "AWS_REGION_NAME", os.getenv("AWS_REGION_NAME", "us-east-1")
-            ),
-            bucket=crawler.settings.get(
-                "S3_BUCKET", os.getenv("S3_BUCKET", "calyprium")
-            ),
+            endpoint_url=cfg.endpoint_url,
+            access_key=cfg.access_key,
+            secret_key=cfg.secret_key,
+            region_name=cfg.region_name,
+            bucket=cfg.bucket,
             batch_size=crawler.settings.getint("S3_BATCH_SIZE", 100),
-            path_template=crawler.settings.get(
-                "S3_BATCH_PATH",
-                "{user_id}/{spider}/runs/{run_number}/batch_{batch_id}.jl",
-            ),
-            user_id=crawler.settings.get(
-                "SPIDER_USER_ID", os.getenv("SPIDER_USER_ID", "default")
-            ),
-            spider_name=crawler.settings.get(
-                "SPIDER_NAME", os.getenv("SPIDER_NAME", "unknown")
-            ),
-            run_number=crawler.settings.get(
-                "SPIDER_RUN_NUMBER", os.getenv("SPIDER_RUN_NUMBER", "0")
-            ),
+            path_template=cfg.path_template,
+            user_id=cfg.user_id,
+            spider_name=cfg.spider_name,
+            run_number=cfg.run_number,
             upload_attempts=crawler.settings.getint("S3_BATCH_UPLOAD_ATTEMPTS", 5),
             retry_backoff=crawler.settings.getfloat("S3_BATCH_RETRY_BACKOFF", 1.0),
             spill_dir=crawler.settings.get("S3_BATCH_SPILL_DIR"),
@@ -257,14 +302,8 @@ class S3BatchPipeline:
 
     def _get_client(self):
         if self._client is None:
-            import boto3
-
-            self._client = boto3.client(
-                "s3",
-                endpoint_url=self.endpoint_url,
-                aws_access_key_id=self.access_key,
-                aws_secret_access_key=self.secret_key,
-                region_name=self.region_name,
+            self._client = make_s3_client(
+                self.endpoint_url, self.access_key, self.secret_key, self.region_name,
             )
         return self._client
 

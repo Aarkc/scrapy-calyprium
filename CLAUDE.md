@@ -67,6 +67,7 @@ Each `CookieSlot` in the `DomainCache` has:
 | `RECRAWL_TRACKING_ENABLED` | Filter out recently-crawled URLs via Forge freshness API |
 | `SPIDER_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
+| `SNAPSHOTS_ENABLED`, `SNAPSHOTS_SAMPLE`, `SNAPSHOTS_ERRORS`, `SNAPSHOTS_MAX_BYTES` | `SnapshotRecorder` extension: gzipped sample/error/blocked pages uploaded to `{run prefix}/snapshots/{sha256}.html.gz` and reported to forge `POST /jobs/spiders/{slug}/runs/{n}/snapshots` at close |
 
 ## Code Conventions
 
