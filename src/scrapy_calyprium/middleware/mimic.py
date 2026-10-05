@@ -198,6 +198,8 @@ class MimicBrowserMiddleware:
         self.ws_endpoint: Optional[str] = None
         self._client: Optional[httpx.AsyncClient] = None
         self.crawler = None  # Set in from_crawler
+        # CalypriumRequestTracer extension (found lazily; None if not installed).
+        self._tracer = None
 
         # AAR-17: local-first routing state — initialized in spider_opened
         # if MIMIC_LOCAL_FETCH=True and the [local] extra is installed.
@@ -294,6 +296,16 @@ class MimicBrowserMiddleware:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client
 
+    def _find_tracer(self):
+        """The active CalypriumRequestTracer extension, if any (cached)."""
+        if self._tracer is None:
+            extensions = getattr(self.crawler, "extensions", None)
+            for ext in getattr(extensions, "middlewares", None) or ():
+                if hasattr(ext, "record_span"):
+                    self._tracer = ext
+                    break
+        return self._tracer
+
     def _init_local_router(self, spider):
         """AAR-17: stand up the local-first routing components."""
         if not self._local_enabled or self._local_router is not None:
@@ -362,13 +374,7 @@ class MimicBrowserMiddleware:
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
                 policy=self.policy,
             )
-            # Look for CalypriumRequestTracer extension if active
-            tracer = None
-            if hasattr(self.crawler, 'extensions') and self.crawler.extensions:
-                for ext in self.crawler.extensions.middlewares:
-                    if hasattr(ext, 'record_span'):
-                        tracer = ext
-                        break
+            tracer = self._find_tracer()
 
             self._local_router = SpiderAutoRouter(
                 fetcher=fetcher,
@@ -630,6 +636,9 @@ class MimicBrowserMiddleware:
             self._local_stats["local_success"] += 1
 
         request.meta["mimic_local_route"] = result.routing_method
+        if result.trace_id:
+            # The router already recorded this attempt's span.
+            request.meta["calyprium_trace_id"] = result.trace_id
         request.meta["mimic_domain_level"] = result.domain_level
         request.meta["mimic_slot_id"] = result.slot_id
         request.meta["mimic_domain"] = domain
@@ -670,6 +679,13 @@ class MimicBrowserMiddleware:
         """
         if request.meta.get("_internal"):
             return None
+
+        # Per-attempt trace state (a retried/replaced request copies meta, so
+        # drop the previous attempt's): start time, routing and the marker that
+        # SpiderAutoRouter already traced it. See CalypriumRequestTracer.
+        request.meta.pop("calyprium_trace_id", None)
+        request.meta.pop("calyprium_routing", None)
+        request.meta["_calyprium_t0"] = time.monotonic()
 
         # AAR-17: local-first fast path
         if self._local_enabled:
@@ -722,6 +738,21 @@ class MimicBrowserMiddleware:
 
             return None
 
+    @staticmethod
+    def _routing_from_fetch(data: dict) -> dict:
+        """How mimic served a ``/api/fetch`` (its ``routing`` object: method,
+        engine, network, tier, escalation), for the request tracer. Older
+        mimic builds return no ``routing``; fall back to the engine used."""
+        routing = data.get("routing")
+        if isinstance(routing, dict) and routing:
+            return dict(routing)
+        engine = str(data.get("browser_engine") or "")
+        http = engine.lower() in ("", "httpcloak", "http", "curl_cffi")
+        return {
+            "routing_method": "httpcloak" if http else "browser",
+            "engine": engine,
+        }
+
     async def _fetch_auto(self, client, request):
         """Fetch via /api/fetch with auto-routing (httpcloak → browser)."""
         fetch_payload = {
@@ -745,6 +776,7 @@ class MimicBrowserMiddleware:
         ct = env_headers.get("content-type") or env_headers.get("Content-Type") or ""
 
         self._consecutive_failures = 0
+        request.meta["calyprium_routing"] = self._routing_from_fetch(data)
 
         # Wrap by Content-Type so an XML/JSON API body (e.g. Legistar OData) gets
         # the right parser instead of being HTML-parsed into 0 items (AAR-12).
@@ -796,6 +828,12 @@ class MimicBrowserMiddleware:
         status = data.get("status_code", 200)
         env = data.get("headers") or {}
         final_url = data.get("final_url") or request.url
+        # A session navigate is always a browser render.
+        routing = {
+            "routing_method": "browser_direct",
+            "engine": data.get("browser_engine") or self.browser_engine or "browser",
+            "tier": "browser",
+        }
 
         if not html:
             # Fallback to /api/fetch
@@ -816,9 +854,11 @@ class MimicBrowserMiddleware:
             status = data.get("status_code", 200)
             env = data.get("headers") or {}
             final_url = data.get("final_url") or request.url
+            routing = self._routing_from_fetch(data)
 
         ct = env.get("content-type") or env.get("Content-Type") or ""
         self._consecutive_failures = 0
+        request.meta["calyprium_routing"] = routing
 
         return _response_from_envelope(
             request,
@@ -892,6 +932,11 @@ class MimicBrowserMiddleware:
         """
         if request.meta.get("mimic_browser"):
             logger.error(f"MimicMiddleware: Exception for {request.url}: {exception}")
+        if isinstance(exception, _TRANSPORT_ERRORS):
+            # Every failed attempt went out on the wire: one span each.
+            tracer = self._find_tracer()
+            if tracer is not None and hasattr(tracer, "trace_exception"):
+                tracer.trace_exception(request, exception)
         if not self.transport_retries or not isinstance(exception, _TRANSPORT_ERRORS):
             return None
         retries = request.meta.get("mimic_transport_retries", 0)
