@@ -160,3 +160,96 @@ _RUN_SETTINGS = (
 def test_policy_settings_match_forge_build_run_settings():
     emitted = set(re.findall(r'f?"([A-Z][A-Z0-9_]+)=', _RUN_SETTINGS.read_text()))
     assert set(POLICY_SETTINGS) <= emitted, set(POLICY_SETTINGS) - emitted
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: RUN_ID (forge spider_runs.id) for per-run cost attribution.
+# ---------------------------------------------------------------------------
+
+RUN = {**POLICY, "RUN_ID": "9001"}
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("9001", "9001"), (9001, "9001"), (" 77 ", "77"), ("007", "7"),
+    ("", None), ("0", None), ("-5", None), ("12a", None), ("1-run_2", None),
+    ("1.5", None), ("١٢", None), (None, None),
+])
+def test_run_id_is_digits_only(raw, expected):
+    settings = {} if raw is None else {"RUN_ID": raw}
+    assert RunPolicy.from_settings(make_crawler(settings).settings).run_id == expected
+
+
+def test_run_id_from_env(monkeypatch):
+    monkeypatch.setenv("RUN_ID", "31")
+    assert RunPolicy.from_settings(make_crawler({}).settings).run_id == "31"
+
+
+def test_veil_middleware_encodes_run_id():
+    crawler = make_crawler({
+        **RUN, "CALYPRIUM_API_KEY": "clp_k", "VEIL_USER_ID": "user-1",
+        "VEIL_GATEWAY_URL": "http://gw:8080",
+    })
+    mw = VeilProxyMiddleware.from_crawler(crawler)
+    req = Request("https://example.com")
+    mw.process_request(req, None)
+    creds = base64.b64decode(req.headers["Proxy-Authorization"][6:]).decode()
+    assert creds == (
+        "user-1-spider_42-run_9001-ap_webshare_static.evomi-country_us:clp_k"
+    )
+
+
+def test_invalid_run_id_is_not_forwarded():
+    crawler = make_crawler({
+        "SPIDER_ID": "42", "RUN_ID": "abc", "CALYPRIUM_API_KEY": "clp_k",
+        "VEIL_USER_ID": "user-1", "VEIL_GATEWAY_URL": "http://gw:8080",
+    })
+    mw = VeilProxyMiddleware.from_crawler(crawler)
+    req = Request("https://example.com")
+    mw.process_request(req, None)
+    creds = base64.b64decode(req.headers["Proxy-Authorization"][6:]).decode()
+    assert creds == "user-1-spider_42:clp_k"
+    policy = RunPolicy.from_settings(crawler.settings)
+    assert "run_id" not in policy.mimic_fetch_fields()
+    assert "run_id" not in policy.solve_fields()
+
+
+def test_local_proxy_url_carries_run_id():
+    crawler = make_crawler({
+        "SPIDER_ID": "42", "RUN_ID": "9001", "CALYPRIUM_API_KEY": "clp_k",
+        "VEIL_GATEWAY_URL": "http://gw:8080",
+    })
+    assert resolve_local_proxy_url(crawler.settings) == (
+        "http://calyprium-spider_42-run_9001:clp_k@gw:8080"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mimic_fetch_and_session_payloads_carry_run_id():
+    mw = MimicBrowserMiddleware.from_crawler(make_crawler({
+        **RUN, "MIMIC_SERVICE_URL": "http://mimic", "CALYPRIUM_API_KEY": "clp_k",
+    }))
+    resp = mock.Mock()
+    resp.json.return_value = {"html": "<html></html>", "status_code": 200}
+    resp.raise_for_status = mock.Mock()
+    client = mock.AsyncMock()
+    client.post.return_value = resp
+    await mw._fetch_auto(client, Request("https://example.com"))
+    payload = client.post.call_args.kwargs["json"]
+    assert payload["run_id"] == "9001"
+    assert payload["spider_id"] == "42"
+    assert mw.policy.mimic_session_fields()["run_id"] == "9001"
+
+
+@pytest.mark.asyncio
+async def test_solve_client_forwards_run_id():
+    policy = RunPolicy.from_settings(make_crawler(RUN).settings)
+    client = SolveClient("http://tessera", api_key="clp_k", policy=policy)
+    resp = mock.Mock(status_code=200)
+    resp.json.return_value = {"success": True, "cookies": []}
+    fake = mock.AsyncMock()
+    fake.post.return_value = resp
+    client._client = fake
+    await client.solve(domain="example.com")
+    body = fake.post.call_args.kwargs["json"]
+    assert body["run_id"] == "9001"
+    assert body["spider_id"] == "42"

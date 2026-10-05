@@ -64,6 +64,9 @@ class RouteResult:
     # useful data — a silent block. Without this signal the rate cap never
     # learns about Cloudflare interstitials served with status 200.
     slot_id: Optional[str] = None
+    # Set when the request tracer recorded a span for this fetch, so the
+    # middleware can keep the response from being traced a second time.
+    trace_id: Optional[str] = None
 
 
 class SpiderAutoRouter:
@@ -406,6 +409,7 @@ class SpiderAutoRouter:
                 response_bytes=len(result.fetch.body) if result.fetch and result.fetch.body else 0,
                 error_message=result.error or "",
             )
+            result.trace_id = trace_id
         return result
 
     async def _fetch_inner(self, url: str, *, domain: str) -> RouteResult:

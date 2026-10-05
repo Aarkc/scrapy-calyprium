@@ -11,8 +11,9 @@ Settings:
     VEIL_PROFILE: Optional profile ID for custom routing rules
     VEIL_PROVIDER: Optional provider name (e.g. webshare_rotating, webshare_static)
     VEIL_PROXY_TYPE: Optional proxy type (datacenter, residential, residential_rotating)
-    SPIDER_ID / VEIL_ALLOWED_PROVIDERS / VEIL_COUNTRY: profile policy, encoded
-        as -spider_<id> / -ap_<a.b> / -country_<cc> username params (AAR-62)
+    SPIDER_ID / RUN_ID / VEIL_ALLOWED_PROVIDERS / VEIL_COUNTRY: profile policy
+        and attribution, encoded as -spider_<id> / -run_<id> / -ap_<a.b> /
+        -country_<cc> username params (AAR-62, Phase 5)
 """
 
 import base64

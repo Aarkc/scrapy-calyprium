@@ -9,6 +9,9 @@ and Veil spend is never attributed to the spider.
 Setting                    Forwarded as
 =========================  ===============================================
 ``SPIDER_ID``              Veil ``-spider_<id>``; Mimic/Tessera ``spider_id``
+``RUN_ID``                 Veil ``-run_<id>``; Mimic/Tessera ``run_id`` (forge
+                           ``spider_runs.id``, per-run cost attribution;
+                           digits only, anything else is ignored)
 ``MIMIC_ALLOW_PAID_SOLVE`` Mimic ``allow_paid_solve``; ``False`` also keeps
                            local-first solves off Tessera's paid solvers
 ``MIMIC_PAID_SOLVE_MODE``  Mimic ``paid_solve_mode`` (off | token | all)
@@ -27,6 +30,7 @@ from typing import Any, Dict, List, Optional
 #: forge's ``build_run_settings`` so drift fails CI.
 POLICY_SETTINGS = (
     "SPIDER_ID",
+    "RUN_ID",
     "MIMIC_ALLOW_PAID_SOLVE",
     "MIMIC_PAID_SOLVE_MODE",
     "MIMIC_ALLOWED_ENGINES",
@@ -57,6 +61,19 @@ def _as_list(value: Any) -> List[str]:
     return [str(v).strip() for v in items if str(v).strip()]
 
 
+def _as_run_id(value: Any) -> Optional[str]:
+    """Forge's integer run id as a string; None unless it is a positive integer.
+
+    The value ends up in the Veil proxy username, so anything but digits is
+    dropped rather than forwarded."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text.isdigit() or not text.isascii() or int(text) <= 0:
+        return None
+    return str(int(text))
+
+
 def _as_bool(value: Any) -> Optional[bool]:
     if value is None:
         return None
@@ -68,6 +85,7 @@ def _as_bool(value: Any) -> Optional[bool]:
 @dataclass
 class RunPolicy:
     spider_id: Optional[str] = None
+    run_id: Optional[str] = None
     allow_paid_solve: Optional[bool] = None
     paid_solve_mode: Optional[str] = None
     allowed_engines: List[str] = field(default_factory=list)
@@ -80,6 +98,7 @@ class RunPolicy:
         country = _raw(settings, "VEIL_COUNTRY")
         return cls(
             spider_id=_raw(settings, "SPIDER_ID"),
+            run_id=_as_run_id(_raw(settings, "RUN_ID")),
             allow_paid_solve=_as_bool(_raw(settings, "MIMIC_ALLOW_PAID_SOLVE")),
             paid_solve_mode=mode.strip().lower() if mode else None,
             allowed_engines=_as_list(_raw(settings, "MIMIC_ALLOWED_ENGINES")),
@@ -100,6 +119,8 @@ class RunPolicy:
         params = []
         if self.spider_id:
             params.append(f"spider_{self.spider_id}")
+        if self.run_id:
+            params.append(f"run_{self.run_id}")
         if self.allowed_providers:
             params.append(f"ap_{'.'.join(self.allowed_providers)}")
         if self.country:
@@ -111,11 +132,18 @@ class RunPolicy:
 
     # -- Mimic -----------------------------------------------------------
 
-    def mimic_fetch_fields(self) -> Dict[str, Any]:
-        """Fields for Mimic ``FetchRequest`` (``/api/fetch``)."""
+    def _attribution(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         if self.spider_id:
             out["spider_id"] = self.spider_id
+        if self.run_id:
+            out["run_id"] = self.run_id
+        return out
+
+    def mimic_fetch_fields(self) -> Dict[str, Any]:
+        """Fields for Mimic ``FetchRequest`` (``/api/fetch``)."""
+        out: Dict[str, Any] = {}
+        out.update(self._attribution())
         if self.allow_paid_solve is not None:
             out["allow_paid_solve"] = self.allow_paid_solve
         if self.paid_solve_mode:
@@ -129,8 +157,7 @@ class RunPolicy:
     def mimic_session_fields(self) -> Dict[str, Any]:
         """Fields for Mimic ``SessionCreateRequest`` (``/api/session``)."""
         out: Dict[str, Any] = {}
-        if self.spider_id:
-            out["spider_id"] = self.spider_id
+        out.update(self._attribution())
         if self.allowed_engines:
             out["allowed_engines"] = list(self.allowed_engines)
         return out
@@ -138,8 +165,7 @@ class RunPolicy:
     def solve_fields(self) -> Dict[str, Any]:
         """Fields for Mimic/Tessera ``SolveRequest`` (``/api/solve``)."""
         out: Dict[str, Any] = {}
-        if self.spider_id:
-            out["spider_id"] = self.spider_id
+        out.update(self._attribution())
         if self.country:
             out["country"] = self.country
         return out

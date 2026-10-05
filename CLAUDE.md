@@ -65,7 +65,8 @@ Each `CookieSlot` in the `DomainCache` has:
 | `VEIL_PROVIDER` | Upstream proxy provider (e.g. `webshare_rotating`) |
 | `VEIL_GATEWAY_URL` | Veil proxy gateway URL |
 | `RECRAWL_TRACKING_ENABLED` | Filter out recently-crawled URLs via Forge freshness API |
-| `SPIDER_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
+| `SPIDER_ID`, `RUN_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
+| `VEIL_PROXY_TYPE` | Veil username `-type_`; also the tier (`fast` / `residential`) `CalypriumRequestTracer` puts on Veil-path spans |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
 | `SNAPSHOTS_ENABLED`, `SNAPSHOTS_SAMPLE`, `SNAPSHOTS_ERRORS`, `SNAPSHOTS_MAX_BYTES` | `SnapshotRecorder` extension: gzipped sample/error/blocked pages uploaded to `{run prefix}/snapshots/{sha256}.html.gz` and reported to forge `POST /jobs/spiders/{slug}/runs/{n}/snapshots` at close |
 
@@ -76,3 +77,4 @@ Each `CookieSlot` in the `DomainCache` has:
 - AAR-XX references in comments point to internal design docs (Anti-Anti-bot Research tickets)
 - `LocalFetcher` preserves response body as raw bytes — never decode to str (AAR-12 fix)
 - httpcloak is sync (Rust FFI); wrapped in `asyncio.to_thread()` for async compatibility
+- `CalypriumRequestTracer` must emit exactly one top-level span per download attempt (forge prices each into `usage_events`): `SpiderAutoRouter.fetch()` records its own and marks `meta["calyprium_trace_id"]`; everything else is traced from the `response_received` signal using `meta["calyprium_routing"]` (mimic's `routing` object) or the Veil/direct path; transport errors via `MimicBrowserMiddleware.process_exception`
