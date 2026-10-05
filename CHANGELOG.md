@@ -1,3 +1,11 @@
+# [1.28.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.27.0...v1.28.0) (2026-10-05)
+
+
+### Features
+
+* **policy:** forward RUN_ID for per-run cost attribution ([54f6865](https://github.com/Aarkc/scrapy-calyprium/commit/54f6865826eea9696c6cbf6a9c6e5052e6329ac9))
+* **tracer:** trace every download attempt with tier and network ([a508022](https://github.com/Aarkc/scrapy-calyprium/commit/a50802255adb8ccf46f32c7b99f1d139569cafe3))
+
 # [1.27.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.26.10...v1.27.0) (2026-10-04)
 
 
