@@ -7,7 +7,7 @@ parameters out of the username::
 
 Keys understood by the gateway's ``ConfigResolver.PARAM_MAPPING`` include
 ``p`` (provider), ``type``, ``session`` (sticky IP), ``spider`` (billing
-attribution), ``ap`` (allowed providers, dot-joined) and ``country``.
+attribution), ``run`` (per-run cost attribution), ``ap`` (allowed providers, dot-joined) and ``country``.
 
 Local-first proxy URL (``MIMIC_LOCAL_PROXY_URL``)
 -------------------------------------------------
@@ -17,7 +17,7 @@ from ``VEIL_GATEWAY_URL`` and the run's own spider key::
 
     http://calyprium:<url-quoted CALYPRIUM_API_KEY>@<gateway host>:<port>
 
-Profile policy params (``-spider_<id>``, ``-ap_<a.b>``, ``-country_<cc>``)
+Profile policy params (``-spider_<id>``, ``-run_<id>``, ``-ap_<a.b>``, ``-country_<cc>``)
 are appended to the username so gateway billing/allow-lists apply (AAR-62).
 The fetcher then appends ``-p_<provider>-session_<id>`` to the username per
 cookie slot, so replays stay pinned to the IP the clearance was solved on.
