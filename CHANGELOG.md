@@ -1,3 +1,10 @@
+# [1.31.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.30.0...v1.31.0) (2026-10-17)
+
+
+### Features
+
+* **tracing:** the request's span names the fingerprint it presented ([e8ffa3c](https://github.com/Aarkc/scrapy-calyprium/commit/e8ffa3cef2acb27973960f1dc9ae0796de38ebf9))
+
 # [1.30.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.29.0...v1.30.0) (2026-10-17)
 
 
