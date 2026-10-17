@@ -1,3 +1,10 @@
+# [1.29.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.28.0...v1.29.0) (2026-10-17)
+
+
+### Features
+
+* **routing:** name the vendor in each solve and replay derived chrome presets ([91ff58e](https://github.com/Aarkc/scrapy-calyprium/commit/91ff58e704a7a0506d69ddbb389c718089a09e6d))
+
 # [1.28.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.27.0...v1.28.0) (2026-10-05)
 
 
