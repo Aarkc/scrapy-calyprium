@@ -291,6 +291,9 @@ class SpectreMiddleware:
         fingerprint = fingerprint_data.get("fingerprint", {})
         request.meta["spectre_fingerprint_id"] = fingerprint.get("id")
         request.meta["spectre_fingerprint_name"] = fingerprint.get("name")
+        # how a trace names the fingerprint (Spectre keeps it under this hash); absent from older Spectre
+        if fingerprint_data.get("fingerprint_hash"):
+            request.meta["spectre_fingerprint_hash"] = fingerprint_data["fingerprint_hash"]
 
         logger.debug(
             f"SpectreMiddleware: Applied '{fingerprint.get('name')}' to {request.url}"
