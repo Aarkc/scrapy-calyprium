@@ -55,6 +55,7 @@ from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
+from scrapy_calyprium import _trace
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 
@@ -289,6 +290,8 @@ class MimicBrowserMiddleware:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        # the download attempt this call is made for (set in process_request): Mimic's spans join its trace
+        headers.update(_trace.headers())
         return headers
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -686,6 +689,10 @@ class MimicBrowserMiddleware:
         request.meta.pop("calyprium_trace_id", None)
         request.meta.pop("calyprium_routing", None)
         request.meta["_calyprium_t0"] = time.monotonic()
+        # The attempt CalypriumTraceMiddleware started, for the calls made below (this coroutine's own context).
+        ids = _trace.attempt_ids(request)
+        if ids:
+            _trace.ATTEMPT.set(ids)
 
         # AAR-17: local-first fast path
         if self._local_enabled:

@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from scrapy_calyprium import _trace
 from scrapy_calyprium._policy import RunPolicy
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,8 @@ class SolveClient:
         if self.user_id:
             headers["X-User-Id"] = self.user_id
             headers["X-Service-Name"] = "scrapy-calyprium"
+        # the download attempt that needed the solve: Mimic's and Tessera's spans join its trace
+        headers.update(_trace.headers())
         return headers
 
     async def _get_client(self) -> httpx.AsyncClient:
