@@ -71,7 +71,14 @@ _WAF_COOKIE_MARKERS = (
     "datadome",                      # DataDome
     "_px", "_pxhd", "_pxvid",        # PerimeterX / HUMAN
     "incap_ses", "visid_incap",      # Imperva / Incapsula
+    "kp_uidz",                       # Kasada
 )
+# Header-name prefixes of a vendor's own headers (Kasada's x-kpsdk-ct / -r / -c).
+_WAF_HEADER_PREFIXES = ("x-kpsdk",)
+# Body markers of a blocked page that names no vendor in words. Kasada's 429 is a
+# single script from its fixed path; on a normal page the same path loads its SDK,
+# so these count only on a blocked status (here), never as a challenge signature.
+_WAF_BODY_MARKERS = ("149e9513-01fa", "kpsdk")
 
 
 def _looks_like_waf(headers: Optional[dict], html_lower: str) -> bool:
@@ -87,12 +94,27 @@ def _looks_like_waf(headers: Optional[dict], html_lower: str) -> bool:
     for sig in CHALLENGE_SIGNATURES:
         if sig in html_lower:
             return True
+    if any(m in html_lower for m in _WAF_BODY_MARKERS):
+        return True
     if not headers:
         return False
-    # Normalise header keys/values to lowercase strings (handles str, bytes,
-    # and Scrapy's list-of-bytes header values).
+    norm = _normalise_headers(headers)
+    if any(name in norm for name in _WAF_HEADER_NAMES):
+        return True
+    if any(name.startswith(_WAF_HEADER_PREFIXES) for name in norm):
+        return True
+    if any(m in norm.get("server", "") for m in _WAF_SERVER_MARKERS):
+        return True
+    if any(m in norm.get("set-cookie", "") for m in _WAF_COOKIE_MARKERS):
+        return True
+    return False
+
+
+def _normalise_headers(headers: Optional[dict]) -> dict:
+    """Header names and values as lowercase strings (handles str, bytes, and
+    Scrapy's list-of-bytes header values)."""
     norm: dict = {}
-    for k, v in headers.items():
+    for k, v in (headers or {}).items():
         kl = (k.decode("latin-1", "ignore") if isinstance(k, bytes) else str(k)).lower()
         if isinstance(v, (list, tuple)):
             vs = " ".join(
@@ -103,13 +125,68 @@ def _looks_like_waf(headers: Optional[dict], html_lower: str) -> bool:
         else:
             vs = str(v)
         norm[kl] = vs.lower()
-    if any(name in norm for name in _WAF_HEADER_NAMES):
-        return True
-    if any(m in norm.get("server", "") for m in _WAF_SERVER_MARKERS):
-        return True
-    if any(m in norm.get("set-cookie", "") for m in _WAF_COOKIE_MARKERS):
-        return True
-    return False
+    return norm
+
+
+# Cloudflare's challenge page (mimic.routing.challenge keeps the same list).
+_CLOUDFLARE_MARKERS = (
+    "challenge-platform", "cf-turnstile", "cf_chl_opt", "challenges.cloudflare.com",
+    "just a moment", "turnstile/v0",
+)
+_PERIMETERX_MARKERS = ("px-captcha", "_pxappid", "human-challenge", "press & hold", "perimeterx")
+# Akamai's blocking SBSD page (served 200): its only script is
+# src="/<path>?v=<uuid>&t=<challenge id>"; the passive script on normal pages has no t=.
+_SBSD_CHALLENGE_RE = re.compile(
+    r'src="/[A-Za-z0-9/_\-.]+\?v=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    r'&(?:amp;)?t=[^"&]+"'
+)
+# Akamai's edge deny page: "Reference #18.x..." / "Reference-ID: #0.x...".
+_AKAMAI_REFERENCE_RE = re.compile(r"reference(?:-id)?\s*:?\s*#\d+\.[0-9a-f]+\.\d+\.[0-9a-f]+", re.I)
+
+
+def challenge_family(
+    status_code: int,
+    body: Union[bytes, str],
+    headers: Optional[dict] = None,
+) -> Optional[str]:
+    """The Tessera challenge type a blocked response shows, or None when it names no vendor.
+
+    A solve that names the vendor reaches that vendor's solvers; without one Tessera
+    assumes a Cloudflare challenge. Cloudflare first (the most common, and its markup
+    can sit beside others), then the sensor vendors; Kasada before Akamai, whose CDN it
+    often sits behind. Incapsula only for its legacy ___utmvc page: the reese84 sensor
+    has no solver, and a hard incident page nothing to solve.
+    """
+    if isinstance(body, bytes):
+        text = body[:20_000].decode("latin-1")
+    else:
+        text = (body or "")[:20_000]
+    low = text.lower()
+    head = low[:4000]
+    norm = _normalise_headers(headers)
+    cookies = norm.get("set-cookie", "")
+
+    if norm.get("cf-mitigated") == "challenge" or any(m in low for m in _CLOUDFLARE_MARKERS):
+        return "cloudflare_managed"
+    if "var dd=" in low or "geo.captcha-delivery.com" in low:
+        return "datadome"
+    if len(body) < 20_000 and _SBSD_CHALLENGE_RE.search(text):
+        return "akamai"
+    if status_code not in BLOCKED_STATUS_CODES:
+        return None
+    if (any(m in head for m in ("149e9513-01fa", "ips.js", "kpsdk"))
+            or any(name.startswith(_WAF_HEADER_PREFIXES) for name in norm) or "kp_uidz" in cookies):
+        return "kasada"
+    if status_code == 403 and "_incapsula_resource" in head and "swjiylwa" in head:
+        return "incapsula"
+    if any(m in low for m in _PERIMETERX_MARKERS) or any(m in cookies for m in ("_pxhd", "_pxvid", "_px3")):
+        return "perimeterx"
+    if "x-datadome" in norm or "datadome=" in cookies:
+        return "datadome"
+    if ("bmak" in low or "_abck" in low or "akamaighost" in norm.get("server", "")
+            or _AKAMAI_REFERENCE_RE.search(text) or any(m in cookies for m in ("_abck", "bm_sz", "ak_bmsc"))):
+        return "akamai"
+    return None
 
 
 def _has_real_page_structure(html: str) -> bool:
