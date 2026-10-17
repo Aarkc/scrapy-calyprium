@@ -1,3 +1,10 @@
+# [1.30.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.29.0...v1.30.0) (2026-10-17)
+
+
+### Features
+
+* **tracing:** one trace per request, from the queue to the parse callback ([dc1ddfb](https://github.com/Aarkc/scrapy-calyprium/commit/dc1ddfb006a67456cd8a572a6720e86b2cf0f62b))
+
 # [1.29.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.28.0...v1.29.0) (2026-10-17)
 
 
