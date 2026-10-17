@@ -32,6 +32,15 @@ Scrapy requests pass through a three-layer middleware stack in priority order:
    - **Local-first** (`MIMIC_LOCAL_FETCH=True`): Requests go through `SpiderAutoRouter` which does in-process TLS-fingerprinted HTTP via httpcloak/curl_cffi with cached cookies. Only calls Mimic `/api/solve` when blocked. This is the production path.
    - **Legacy**: Routes through Mimic's `/api/fetch` or `/api/session` for server-side browser rendering.
 
+### Request Traces
+
+`CalypriumTraceMiddleware` (`middleware/tracing.py`, downloader and spider middleware, priority 50) gives each
+request a W3C trace id and each download attempt a span id, kept in `request.meta` (`_trace.py`). The tracer
+(`extensions/request_tracer.py`) sends each attempt to Forge's `/traces` as before (that span is what Forge prices;
+its `trace_id` field stays a per-attempt id) with the trace ids added (`otel_*`), and the `spider.request` /
+`spider.parse` spans to Forge's `/spans`. Calls to Mimic and Tessera carry `traceparent` from `_trace.ATTEMPT`,
+which the Mimic middleware sets inside its own coroutine (never in a shared callback).
+
 ### Local-First Auto-Routing (`routing/`)
 
 This is the most complex subsystem. The flow per request:

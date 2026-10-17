@@ -27,6 +27,7 @@ from scrapy_calyprium._config import CalypriumConfig, configure, get_config
 from scrapy_calyprium.middleware.veil import VeilProxyMiddleware
 from scrapy_calyprium.middleware.spectre import SpectreMiddleware
 from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
+from scrapy_calyprium.middleware.tracing import CalypriumTraceMiddleware
 from scrapy_calyprium.pipelines.s3_batch import S3BatchPipeline
 
 # AAR-15/17: optional local-first routing surfaces. Importable only if
@@ -51,6 +52,7 @@ __all__ = [
     "VeilProxyMiddleware",
     "SpectreMiddleware",
     "MimicBrowserMiddleware",
+    "CalypriumTraceMiddleware",
     "S3BatchPipeline",
 ]
 if _HAS_LOCAL_ROUTING:

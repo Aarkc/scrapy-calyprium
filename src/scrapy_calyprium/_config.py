@@ -102,9 +102,14 @@ class CalypriumConfig:
         # Middleware stack — Veil handles proxy routing, Mimic handles
         # browser rendering with httpcloak and Spectre internally.
         settings["DOWNLOADER_MIDDLEWARES"] = {
+            # one trace per request: starts each download attempt, before the others
+            "scrapy_calyprium.middleware.tracing.CalypriumTraceMiddleware": 50,
             "scrapy_calyprium.middleware.veil.VeilProxyMiddleware": 100,
             "scrapy_calyprium.middleware.spectre.SpectreMiddleware": 150,
             "scrapy_calyprium.middleware.mimic.MimicBrowserMiddleware": 200,
+        }
+        settings["SPIDER_MIDDLEWARES"] = {
+            "scrapy_calyprium.middleware.tracing.CalypriumTraceMiddleware": 50,
         }
 
         settings["ITEM_PIPELINES"] = {

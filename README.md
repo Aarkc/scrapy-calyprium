@@ -49,6 +49,19 @@ CALYPRIUM_API_KEY = "clp_your_key_here"
 VEIL_USER_ID = "your-user-id"
 ```
 
+### Request Tracing
+
+`CalypriumTraceMiddleware` (added by `configure()`) gives every request one trace: the wait in Scrapy's queue,
+each download attempt, the challenge solve if there is one, and the callback that parses the page. The SDK's calls
+to Mimic and Tessera carry the trace (`traceparent`), so their steps join it. On the Calyprium platform the
+trace of every request of a run is shown with its run. To set it up by hand, register it as both a downloader and
+a spider middleware:
+
+```python
+DOWNLOADER_MIDDLEWARES = {"scrapy_calyprium.CalypriumTraceMiddleware": 50}
+SPIDER_MIDDLEWARES = {"scrapy_calyprium.CalypriumTraceMiddleware": 50}
+```
+
 ### Saving Output to Calyprium Storage
 
 Spider output is saved to Calyprium's S3-compatible storage using Scrapy's built-in feed export:

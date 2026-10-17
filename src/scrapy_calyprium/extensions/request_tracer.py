@@ -48,6 +48,7 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
+from scrapy_calyprium import _trace
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,11 @@ class CalypriumRequestTracer:
         self.run_number = run_number
 
         self._buffer: List[Dict] = []
+        # Spans of the request's trace that are not priced attempts (spider.request, spider.parse), POSTed to
+        # Forge's /spans; dropped for good once Forge says it has no such endpoint (an older Forge).
+        self._spans: List[Dict] = []
+        self.spans_dropped = 0
+        self._spans_unsupported = False
         self._lock = threading.Lock()
         self._stop = threading.Event()
         # Set when the buffer fills, so the flush thread POSTs early. The POST
@@ -211,11 +217,16 @@ class CalypriumRequestTracer:
         network: str = "",
         escalated_from: str = "",
         escalation_reason: str = "",
+        trace_ids: Optional[tuple] = None,
+        start: Optional[float] = None,
     ) -> None:
         """Buffer a span. Thread-safe — called from Scrapy's async context.
 
         ``tier``/``network``/``escalated_from``/``escalation_reason`` are sent
-        only when known; Forge derives what is missing."""
+        only when known; Forge derives what is missing. ``trace_ids`` (trace id,
+        attempt span id, request span id) place the attempt in its request's
+        trace (default: the attempt current in this task, see ``_trace``);
+        ``start`` is when it began (epoch seconds)."""
         span = {
             "trace_id": trace_id,
             "parent_span_id": parent_span_id,
@@ -244,12 +255,43 @@ class CalypriumRequestTracer:
         ):
             if value:
                 span[key] = value
+        ids = trace_ids or _trace.ATTEMPT.get()
+        if ids and len(ids) == 3:
+            began = start if start is not None else time.time() - duration_ms / 1000
+            span.update(otel_trace_id=ids[0], otel_span_id=ids[1], otel_parent_span_id=ids[2],
+                        otel_start=datetime.fromtimestamp(began, timezone.utc).isoformat())
         with self._lock:
             if len(self._buffer) >= MAX_BUFFER:
                 self.dropped += 1
                 return
             self._buffer.append(span)
             full = len(self._buffer) >= BATCH_SIZE
+        if full:
+            self._wake.set()
+
+    def record_trace_span(
+        self, name: str, trace_id: str, span_id: str, parent_span_id: Optional[str],
+        start: float, end: float, attributes: Optional[Dict[str, Any]] = None, error: Optional[str] = None,
+    ) -> None:
+        """Buffer a span of a request's trace that is not a priced attempt (``spider.request``,
+        ``spider.parse``). Thread-safe; never raises."""
+        if not self.enabled or self._spans_unsupported:
+            return
+        span = {
+            "name": name, "trace_id": trace_id, "span_id": span_id, "parent_span_id": parent_span_id or "",
+            "start": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+            "end": datetime.fromtimestamp(max(end, start), timezone.utc).isoformat(),
+            "attributes": {k: v for k, v in (attributes or {}).items()
+                           if v is not None and v != "" and isinstance(v, (str, bool, int, float))},
+        }
+        if error:
+            span["error"] = error[:500]
+        with self._lock:
+            if len(self._spans) >= MAX_BUFFER:
+                self.spans_dropped += 1
+                return
+            self._spans.append(span)
+            full = len(self._spans) >= BATCH_SIZE
         if full:
             self._wake.set()
 
@@ -343,8 +385,11 @@ class CalypriumRequestTracer:
             domain = urlparse(request.url).netloc
         except ValueError:
             domain = ""
+        attempt = meta.get(_trace.ATTEMPT_KEY) or {}
         self.record_span(
             trace_id=uuid.uuid4().hex,
+            trace_ids=_trace.attempt_ids(request),
+            start=attempt.get("start"),
             url=request.url,
             domain=domain,
             status=status,
@@ -397,11 +442,14 @@ class CalypriumRequestTracer:
 
     def _flush(self):
         with self._lock:
-            if not self._buffer:
-                return
             batch = self._buffer[:]
             self._buffer.clear()
-        self._post_batch(batch)
+            spans = self._spans[:]
+            self._spans.clear()
+        if batch:
+            self._post_batch(batch)
+        if spans:
+            self._post_spans(spans)
 
     def _post_batch(self, batch: List[Dict]):
         if not batch or not self.run_number:
@@ -416,3 +464,20 @@ class CalypriumRequestTracer:
             ))
         except Exception as exc:
             logger.debug("CalypriumRequestTracer POST failed: %s", exc)
+
+    def _post_spans(self, spans: List[Dict]):
+        if not spans or not self.run_number or self._spans_unsupported:
+            return
+        url = (
+            f"{self.forge_url}/jobs/spiders/{self.spider_slug}/"
+            f"runs/{self.run_number}/spans"
+        )
+        try:
+            response = self.auth.call(lambda h: httpx.post(
+                url, json={"spans": spans}, headers=h, timeout=10.0,
+            ))
+            if getattr(response, "status_code", 0) in (404, 405):
+                self._spans_unsupported = True
+                logger.info("CalypriumRequestTracer: Forge takes no request spans (older Forge); not sending them")
+        except Exception as exc:
+            logger.debug("CalypriumRequestTracer spans POST failed: %s", exc)
