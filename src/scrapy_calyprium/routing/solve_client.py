@@ -104,8 +104,13 @@ class SolveClient:
         proxy_session_id: Optional[str] = None,
         provider: Optional[str] = None,
         solvers: Optional[List[str]] = None,
+        challenge_type: Optional[str] = None,
     ) -> SolveResult:
-        """Call /api/solve and return the cookies (or a structured failure)."""
+        """Call /api/solve and return the cookies (or a structured failure).
+
+        ``challenge_type`` names the vendor the block showed (``challenge_family``):
+        Tessera then runs that vendor's solvers instead of assuming Cloudflare.
+        Mimic's own /api/solve ignores it (its browser passes any vendor)."""
         client = await self._get_client()
         body = {"domain": domain, **self.policy.solve_fields()}
         if target_url:
@@ -122,6 +127,8 @@ class SolveClient:
         # would blow our read budget); we drive retries with fresh IPs instead.
         if solvers:
             body["solvers"] = solvers
+        if challenge_type:
+            body["challenge_type"] = challenge_type
 
         url = f"{self.service_url}/api/solve"
         try:

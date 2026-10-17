@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
+from scrapy_calyprium.routing.chrome_preset import replay_preset
+
 logger = logging.getLogger(__name__)
 
 
@@ -365,6 +367,10 @@ class LocalFetcher:
             headers.update(extra_headers)
 
         start = time.time()
+
+        # A solver's clearance may name a Chrome preset it derived for the current
+        # release; httpcloak refuses names it does not know, so derive it here too.
+        preset = replay_preset(preset)
 
         def _do_sync_fetch():
             session = httpcloak.Session(

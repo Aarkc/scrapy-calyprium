@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from scrapy_calyprium.routing.block_detect import is_blocked
+from scrapy_calyprium.routing.block_detect import challenge_family, is_blocked
 from scrapy_calyprium.routing.domain_cache import DomainCache
 from scrapy_calyprium.routing.local_fetch import (
     LocalFetchError,
@@ -104,6 +104,9 @@ class SpiderAutoRouter:
         # actually calls /api/solve; the rest wait on the lock and reuse the
         # cookie pool the winner populated.
         self._solve_locks: Dict[str, asyncio.Lock] = {}
+        # The vendor each domain's last block showed (block_detect.challenge_family),
+        # named in its solves -- the hot path's and the refill's.
+        self._challenge_family: Dict[str, str] = {}
 
         # Phase 5: proactive cookie pool expansion. The hot path solve
         # coalescing collapses N concurrent requests into 1 solve, which is
@@ -246,6 +249,7 @@ class SpiderAutoRouter:
             try:
                 solve = await self.solve_client.solve(
                     domain=domain, provider=self.provider, solvers=self.solvers,
+                    challenge_type=self._challenge_family.get(domain),
                 )
             except SolveError as exc:
                 logger.info(
@@ -589,9 +593,14 @@ class SpiderAutoRouter:
             )
 
         block_status = result.status_code if result else 403
+        seen = result if result is not None else light_result
+        if seen is not None:
+            family = challenge_family(seen.status_code, seen.body, headers=seen.headers)
+            if family:
+                self._challenge_family[domain] = family
         logger.info(
-            "AutoRouter: %s blocked at httpcloak (status=%d), solving",
-            domain, block_status,
+            "AutoRouter: %s blocked at httpcloak (status=%d, %s), solving",
+            domain, block_status, self._challenge_family.get(domain) or "vendor unknown",
         )
 
         winning_slot = None
@@ -637,6 +646,7 @@ class SpiderAutoRouter:
             solve = await self.solve_client.solve(
                 domain=domain, target_url=url, provider=self.provider,
                 solvers=self.solvers,
+                challenge_type=self._challenge_family.get(domain),
             )
         except SolveError as exc:
             logger.debug("AutoRouter: solve attempt failed for %s: %s", domain, exc)
