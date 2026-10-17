@@ -80,6 +80,16 @@ def test_spectre_fingerprint_applied_once_resolved():
     mw.process_request(req, None)
     assert req.headers[b"User-Agent"] == b"Spectre-UA"
     assert req.meta["spectre_fingerprint_id"] == "fp1"
+    assert "spectre_fingerprint_hash" not in req.meta        # an older Spectre sends no hash
+
+
+def test_spectre_fingerprint_hash_rides_on_the_request():
+    mw = _spectre()
+    mw.process_request(Request("https://example.com/a"), None)
+    mw._run_blocking.calls[0][2].callback({**FP, "fingerprint_hash": "h" * 64})
+    req = Request("https://example.com/b")
+    mw.process_request(req, None)
+    assert req.meta["spectre_fingerprint_hash"] == "h" * 64
 
 
 def test_spectre_block_rotates_in_background():

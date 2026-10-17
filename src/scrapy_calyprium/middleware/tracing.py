@@ -146,6 +146,7 @@ class CalypriumTraceMiddleware:
                         "routing_method"),
                     "spider.parent_trace_id": trace.get("parent_trace_id"),
                     "spider.fingerprint_id": meta.get("spectre_fingerprint_id"),
+                    "spider.fingerprint_hash": meta.get("spectre_fingerprint_hash"),
                     "spider.slot_id": meta.get("mimic_slot_id"),
                 },
                 error=message,

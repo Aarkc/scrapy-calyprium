@@ -56,6 +56,7 @@ def test_parsing_a_page_sends_the_parse_and_request_spans():
     request = next(mw.process_start_requests(iter([Request("https://shop.example/", callback=_parse)]), None))
     mw.process_request(request, None)
     request.meta["spectre_fingerprint_id"] = "fp_1"
+    request.meta["spectre_fingerprint_hash"] = "f" * 64
     response = HtmlResponse(request.url, status=200, body=b"<html></html>", request=request)
     mw.process_spider_input(response, None)
     out = list(mw.process_spider_output(response, _parse(response), None))
@@ -71,6 +72,7 @@ def test_parsing_a_page_sends_the_parse_and_request_spans():
     a = root["attributes"]
     assert (a["url.full"], a["http.response.status_code"], a["spider.attempts"]) == ("https://shop.example/", 200, 1)
     assert a["spider.fingerprint_id"] == "fp_1" and a["spider.queue_wait_ms"] >= 0 and "error" not in root
+    assert a["spider.fingerprint_hash"] == "f" * 64
 
 
 def test_a_callback_that_raises_marks_both_spans_and_still_raises():
