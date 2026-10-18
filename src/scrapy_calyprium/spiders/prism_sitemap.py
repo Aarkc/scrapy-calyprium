@@ -158,7 +158,15 @@ class PrismSitemapSpider(scrapy.Spider):
         self._prism_scan_requested = False
         self._prism_wait_deadline: Optional[float] = None
 
-        # Build url_source from class attributes if not provided
+        # Build url_source from class attributes if not provided. A spider with neither a
+        # url_source nor a prism_domain reads its first allowed domain's URLs from Prism (it is
+        # scanned on demand when Prism has none): before, it logged "No url_source and no
+        # prism_domain set" and closed without a request (2026-10-18 fleet check, 9 spiders).
+        if not url_source and not self.prism_domain:
+            fallback = next((d for d in (getattr(self, "allowed_domains", None) or []) if d), None)
+            if fallback:
+                logger.info("No url_source or prism_domain: reading %s's URLs from Prism", fallback)
+                self.prism_domain = fallback
         if url_source:
             self.url_source = url_source
         elif self.prism_domain:
