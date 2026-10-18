@@ -43,18 +43,38 @@ never an immediate loop. A domain Prism has not indexed (404) gets the other
 URL listing is polled with that backoff for up to ``PRISM_WAIT_FOR_SCAN_S``
 (default 900 s). Still nothing: the refill stops and, if the run has no URLs,
 the spider closes with finish reason ``prism_no_urls`` (stat ``prism/no_urls``).
+
+Link discovery (``prism://``, ``PRISM_DISCOVERY_ENABLED``, default True): when the spider's
+``prism_path_prefix`` / ``prism_pattern`` matches none of Prism's URLs for its domain, the site's
+sitemap does not list those pages (2026-10-18 fleet check: hirose, nkk, fairview, eaton...). The
+run then finds them from the site's own links, best first: the pages above the prefix, the Prism
+URLs nearest the filter and the home page, then same-site links ranked by how much of the prefix
+they share (``PRISM_DISCOVERY_MAX_PAGES`` pages, default 300, at most ``PRISM_DISCOVERY_MAX_DEPTH``
+links deep, default 4). Every link that matches the filter goes to ``parse_item``. Sign-in,
+account, cart and checkout links are never followed. No matching page anywhere: the spider closes
+with finish reason ``prism_no_matching_urls``. Stats ``prism/discovery_*``.
+
+Prism URLs outside the spider's ``allowed_domains`` are dropped before they are requested (stat
+``prism/urls_offsite``). When the listing is all off the domain (the site moved:
+andersonpower.com's sitemap lists idealelectricalinc.com) the spider closes with finish reason
+``prism_urls_offsite``. A URL on a placeholder host (``http://default/de``: a CMS whose host name
+was never set) is read as the Prism domain's.
 """
 
+import heapq
 import json
 import logging
 import random
+import re
 import time
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, urlsplit, urlunsplit
 
 import scrapy
 from scrapy import signals
-from scrapy.exceptions import CloseSpider
+from scrapy.exceptions import CloseSpider, DontCloseSpider
+from scrapy.http import TextResponse
+from scrapy.linkextractors import LinkExtractor
 
 from scrapy_calyprium import _wait
 from scrapy_calyprium._forge import ForgeAuth
@@ -68,6 +88,55 @@ _PRISM_BACKOFF_MAX_S = 60.0
 _PRISM_WAIT_FOR_SCAN_S = 900.0
 # The finish reason (and stat) of a run that gave up on Prism ever having URLs for its domain.
 PRISM_NO_URLS = "prism_no_urls"
+# The finish reason of a run whose every Prism URL is outside its allowed_domains (the site moved).
+PRISM_URLS_OFFSITE = "prism_urls_offsite"
+# The finish reason of a run whose filter matched no Prism URL and no page reachable by links.
+PRISM_NO_MATCHING_URLS = "prism_no_matching_urls"
+# Give up on an all-offsite listing after this many URLs without one on the domain.
+_OFFSITE_GIVE_UP = 20000
+
+# Link discovery (see the module docstring).
+_DISCOVERY_MAX_PAGES = 300
+_DISCOVERY_MAX_DEPTH = 4
+_DISCOVERY_CONCURRENCY = 8
+_DISCOVERY_FRONTIER_MAX = 50000
+_DISCOVERY_SEED_LISTING = 2000  # unfiltered Prism URLs read to pick seeds from
+_DISCOVERY_SEEDS = 30
+_SEED_BONUS = 100
+# Never followed: sign-in, account, cart and checkout pages (public content only), and sections
+# that rarely lead into a catalogue.
+_DISCOVERY_DENY = re.compile(
+    r"/(log-?in|log-?out|sign-?in|sign-?up|sign-?out|register|registration|accounts?|"
+    r"my-?account|profile|cart|basket|checkout|wishlist|password|auth|sso|oauth|"
+    r"blogs?|news|press|careers?|jobs|events?|investors?|author|tags?)(/|$|[?.#;])",
+    re.I,
+)
+_CATALOGUE_WORDS = ("product", "catalog", "categor", "series", "family", "parts", "shop",
+                    "collection")
+
+
+def _on_domains(url: str, domains: List[str]) -> bool:
+    """``url``'s host is one of ``domains`` or under one, port aside (as Scrapy's offsite
+    filter decides; ``scrapy.utils.url.url_is_from_any_domain`` compares the port too)."""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(host) and any(host == d or host.endswith("." + d)
+                              for d in (x.lower().strip(".") for x in domains if x))
+
+
+def _placeholder_host_fixed(url: str, domain: str) -> str:
+    """``http://default/de`` -> ``https://<domain>/de``: a sitemap written by a CMS whose host
+    name was never set lists its pages on a single-label host (us.mersen.com, 2026-10-18)."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:
+        return url
+    if not host or "." in host or ":" in host or not domain:
+        return url
+    return urlunsplit(("https", domain, parts.path or "/", parts.query, ""))
 
 
 def _http_status(failure) -> Optional[int]:
@@ -157,6 +226,19 @@ class PrismSitemapSpider(scrapy.Spider):
         self._prism_alt_tried = False
         self._prism_scan_requested = False
         self._prism_wait_deadline: Optional[float] = None
+        # Prism URLs dropped as off the spider's domains, by host (PRISM_URLS_OFFSITE).
+        self._offsite_hosts: Dict[str, int] = {}
+        self._offsite_count = 0
+        self._onsite_seen = False
+        # Link discovery: a best-first frontier of (-score, depth, seq, url).
+        self._discovery_on = False
+        self._discovery_frontier: List[Tuple[int, int, int, str]] = []
+        self._discovery_seen: set = set()
+        self._discovery_seq = 0
+        self._discovery_pages = 0
+        self._discovery_inflight = 0
+        self._discovery_found = 0
+        self._filter_rx = None  # compiled prism pattern; False when it does not compile
 
         # Build url_source from class attributes if not provided. A spider with neither a
         # url_source nor a prism_domain reads its first allowed domain's URLs from Prism (it is
@@ -170,12 +252,12 @@ class PrismSitemapSpider(scrapy.Spider):
         if url_source:
             self.url_source = url_source
         elif self.prism_domain:
-            parts = []
-            if self.prism_path_prefix:
-                parts.append(f"path_prefix={self.prism_path_prefix}")
-            if self.prism_pattern:
-                parts.append(f"pattern={self.prism_pattern}")
-            qs = "?" + "&".join(parts) if parts else ""
+            # Encoded: the source is parsed back with urlparse/parse_qs, where a raw pattern's
+            # "+" read as a space and its "#" or "?" cut the query (before 2026-10-18 dwyer's
+            # /p/[^/?#]+$ reached Prism as /p/[^/? and panduit's .+ as ". ": 0 URLs each).
+            params = {k: v for k, v in (("path_prefix", self.prism_path_prefix),
+                                        ("pattern", self.prism_pattern)) if v}
+            qs = "?" + urlencode(params) if params else ""
             self.url_source = f"prism://{self.prism_domain}{qs}"
         else:
             self.url_source = None
@@ -218,6 +300,7 @@ class PrismSitemapSpider(scrapy.Spider):
         spider = super().from_crawler(crawler, *args, **kwargs)
         # Dupe-filtered requests never reach a callback or errback.
         crawler.signals.connect(spider._on_request_dropped, signal=signals.request_dropped)
+        crawler.signals.connect(spider._on_idle, signal=signals.spider_idle)
         return spider
 
     def _get_forge_auth(self) -> ForgeAuth:
@@ -631,7 +714,8 @@ class PrismSitemapSpider(scrapy.Spider):
         self._refill_in_flight = False
 
         data = response.json()
-        raw_urls = data.get("urls", [])
+        domain = response.meta.get("_prism_alt") or self._prism_domain()
+        raw_urls = [_placeholder_host_fixed(u, domain) for u in data.get("urls", [])]
         total = data.get("total", 0) or data.get("total_stale", 0)
 
         alt = response.meta.get("_prism_alt")
@@ -664,14 +748,19 @@ class PrismSitemapSpider(scrapy.Spider):
                 self._update_prism_checkpoint()
                 yield self._make_refill_request()
                 return
+            if page_start == 0 and any(self._prism_filter()) and self._can_discover():
+                yield from self._start_discovery(
+                    f"none of {self._prism_domain()}'s URLs match the filter")
+                return
             logger.info(f"No more URLs from Prism (total={total})")
             self._prism_exhausted = True
             self._update_prism_checkpoint()
+            self._close_if_all_offsite()
             return
 
         # Filter out fresh URLs if recrawl tracking is enabled.
         # Track raw_count separately so offset advances correctly.
-        urls = self._filter_fresh_urls(raw_urls)
+        urls = self._drop_offsite(self._filter_fresh_urls(raw_urls))
 
         logger.info(
             f"Prism: got {len(urls):,} stale / {raw_count:,} total URLs "
@@ -709,6 +798,8 @@ class PrismSitemapSpider(scrapy.Spider):
             if end_of_cycle or not self._maybe_wrap():
                 self._prism_exhausted = True
         self._update_prism_checkpoint()
+        if self._prism_exhausted or self._offsite_count >= _OFFSITE_GIVE_UP:
+            self._close_if_all_offsite()
 
         for url in urls:
             yield scrapy.Request(
@@ -1003,13 +1094,280 @@ class PrismSitemapSpider(scrapy.Spider):
         parsed = self._prism_parsed
         return (parsed.netloc or parsed.path) if parsed is not None else (self.prism_domain or "")
 
-    def _stat_inc(self, key: str) -> None:
+    def _stat_inc(self, key: str, count: int = 1) -> None:
         stats = getattr(getattr(self, "crawler", None), "stats", None)
         if stats is not None:
             try:
-                stats.inc_value(key)
+                stats.inc_value(key, count)
             except Exception:  # noqa: BLE001 -- stats never break a crawl
                 pass
+
+    # -- Prism URLs off the spider's domains ----------------------------------------------
+
+    def _drop_offsite(self, urls: List[str]) -> List[str]:
+        """The URLs on the spider's allowed_domains (all of them when it sets none)."""
+        allowed = [d for d in (getattr(self, "allowed_domains", None) or []) if d]
+        if not allowed:
+            self._onsite_seen = self._onsite_seen or bool(urls)
+            return urls
+        keep = []
+        for url in urls:
+            if _on_domains(url, allowed):
+                keep.append(url)
+                continue
+            try:
+                host = urlsplit(url).hostname or "?"
+            except ValueError:
+                host = "?"
+            if host in self._offsite_hosts or len(self._offsite_hosts) < 50:
+                self._offsite_hosts[host] = self._offsite_hosts.get(host, 0) + 1
+            self._offsite_count += 1
+        if len(keep) < len(urls):
+            self._stat_inc("prism/urls_offsite", len(urls) - len(keep))
+        self._onsite_seen = self._onsite_seen or bool(keep)
+        return keep
+
+    def _close_if_all_offsite(self) -> None:
+        """Every Prism URL so far was off the spider's domains: close as PRISM_URLS_OFFSITE."""
+        if self._onsite_seen or not self._offsite_count or self._urls_yielded:
+            return
+        self._prism_exhausted = True
+        hosts = ", ".join(h for h, _ in sorted(self._offsite_hosts.items(), key=lambda kv: -kv[1])[:5])
+        logger.error(
+            f"Prism: all {self._offsite_count:,} URLs for {self._prism_domain()} are on {hosts}, "
+            f"outside allowed_domains {list(getattr(self, 'allowed_domains', None) or [])}; the "
+            f"site may have moved ({PRISM_URLS_OFFSITE})"
+        )
+        raise CloseSpider(PRISM_URLS_OFFSITE)
+
+    # -- link discovery (see the module docstring) -------------------------------------------
+
+    def _setting(self, name: str, default, kind=int):
+        try:
+            getter = {int: self.settings.getint, bool: self.settings.getbool}[kind]
+            return getter(name, default)
+        except AttributeError:
+            return default
+
+    def _prism_filter(self) -> Tuple[Optional[str], Optional[str]]:
+        """The ``(path_prefix, pattern)`` of the ``prism://`` source."""
+        parsed = self._prism_parsed
+        params = parse_qs(parsed.query) if parsed is not None else {}
+        return params.get("path_prefix", [None])[0], params.get("pattern", [None])[0]
+
+    def _matches_filter(self, url: str) -> bool:
+        """Prism's own test: the prefix anywhere in the URL (``loc LIKE %prefix%``), the pattern
+        searched in it (``regexp_matches``)."""
+        prefix, pattern = self._prism_filter()
+        if not prefix and not pattern:
+            return False
+        if prefix and prefix not in url:
+            return False
+        if pattern:
+            if self._filter_rx is None:
+                try:
+                    self._filter_rx = re.compile(pattern)
+                except re.error:
+                    self._filter_rx = False
+            if not self._filter_rx or not self._filter_rx.search(url):
+                return False
+        return True
+
+    def _can_discover(self) -> bool:
+        return (self._prism_parsed is not None and not self._discovery_on
+                and not self._urls_yielded
+                and self._setting("PRISM_DISCOVERY_ENABLED", True, bool))
+
+    def _discovery_hosts(self) -> List[str]:
+        hosts = [d for d in (getattr(self, "allowed_domains", None) or []) if d]
+        domain = self._prism_domain()
+        return hosts or [d for d in (domain, _other_www(domain)) if d]
+
+    def _start_discovery(self, why: str) -> List[scrapy.Request]:
+        """Read the unfiltered listing to pick seeds from, then crawl (``_discovery_seed``)."""
+        self._discovery_on = True
+        self._prism_exhausted = True
+        self._update_prism_checkpoint()
+        self._stat_inc("prism/discovery_started")
+        prefix, pattern = self._prism_filter()
+        wanted = " and ".join(f"{k}={v}" for k, v in (("path_prefix", prefix), ("pattern", pattern))
+                              if v)
+        logger.warning(
+            f"Prism: {why} ({wanted}); finding those pages from the site's own links "
+            f"(up to {self._setting('PRISM_DISCOVERY_MAX_PAGES', _DISCOVERY_MAX_PAGES):,} pages)"
+        )
+        return [scrapy.Request(
+            self._build_prism_api_url(self._prism_parsed._replace(query=""), offset=0,
+                                      limit=_DISCOVERY_SEED_LISTING),
+            callback=self._handle_discovery_seeds,
+            errback=self._discovery_seeds_failed,
+            meta={"_internal": True, "download_timeout": 120, "download_slot": "_prism_internal"},
+            dont_filter=True,
+            priority=100,
+        )]
+
+    def _handle_discovery_seeds(self, response):
+        try:
+            urls = (response.json() or {}).get("urls") or []
+        except Exception:  # noqa: BLE001 -- seeds are a hint; the home page still works
+            urls = []
+        return self._discovery_seed([u for u in urls if isinstance(u, str)])
+
+    def _discovery_seeds_failed(self, failure):
+        return self._discovery_seed([])
+
+    def _discovery_seed(self, prism_urls: List[str]) -> List[scrapy.Request]:
+        """The pages above the prefix, the Prism URLs nearest the filter, the home page."""
+        domain = self._prism_domain()
+        prefix, _ = self._prism_filter()
+        out = []
+        prism_urls = [_placeholder_host_fixed(u, domain) for u in prism_urls]
+        for url in prism_urls:
+            if self._matches_filter(url):
+                request = self._discovery_target(url, 0)
+                if request is not None:
+                    out.append(request)
+        seeds = []
+        if prefix and prefix.startswith("/"):
+            segments = [s for s in prefix.split("/") if s]
+            seeds += [f"https://{domain}/" + "/".join(segments[:n]) + "/"
+                      for n in range(len(segments) - 1, 0, -1)]
+        ranked = sorted(prism_urls, key=self._link_score, reverse=True)[:_DISCOVERY_SEEDS]
+        seeds += [u for u in ranked if self._link_score(u) > 0]
+        seeds.append(f"https://{domain}/")
+        for rank, url in enumerate(dict.fromkeys(seeds)):
+            self._discovery_push(url, 0, bonus=_SEED_BONUS - rank)
+        return out + list(self._discovery_pump())
+
+    def _link_score(self, url: str) -> int:
+        """How likely a link leads to the filter's pages: the prefix's leading path segments it
+        shares, catalogue words in its path, less with a query string (facets, sorting)."""
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return -10
+        path = parts.path.lower()
+        score = 0
+        prefix, _ = self._prism_filter()
+        if prefix:
+            have = [s for s in path.split("/") if s]
+            for want, got in zip([s for s in prefix.lower().split("/") if s], have):
+                if want != got:
+                    score += 1 if got.startswith(want) or want.startswith(got) else 0
+                    break
+                score += 2
+        score += sum(1 for word in _CATALOGUE_WORDS if word in path)
+        return score - (2 if parts.query else 0)
+
+    def _discovery_push(self, url: str, depth: int, bonus: int = 0) -> None:
+        url = url.split("#", 1)[0]
+        if url in self._discovery_seen or len(self._discovery_frontier) >= _DISCOVERY_FRONTIER_MAX:
+            return
+        try:
+            path = urlsplit(url).path or "/"
+        except ValueError:
+            return
+        if _DISCOVERY_DENY.search(path):
+            return
+        self._discovery_seen.add(url)
+        self._discovery_seq += 1
+        heapq.heappush(self._discovery_frontier,
+                       (-(self._link_score(url) + bonus), depth, self._discovery_seq, url))
+
+    def _discovery_pump(self):
+        """The best pages of the frontier, a few in flight at a time, within the page budget."""
+        budget = self._setting("PRISM_DISCOVERY_MAX_PAGES", _DISCOVERY_MAX_PAGES)
+        while (self._discovery_frontier and self._discovery_inflight < _DISCOVERY_CONCURRENCY
+               and self._discovery_pages < budget):
+            _, depth, _, url = heapq.heappop(self._discovery_frontier)
+            self._discovery_inflight += 1
+            self._discovery_pages += 1
+            self._stat_inc("prism/discovery_pages")
+            yield scrapy.Request(url, callback=self._discovery_page,
+                                 errback=self._discovery_page_failed,
+                                 meta={"_prism_discovery_depth": depth}, priority=-depth)
+
+    def _discovery_target(self, url: str, depth: int) -> Optional[scrapy.Request]:
+        if url in self._discovery_seen or (self.max_urls and self._urls_yielded >= self.max_urls):
+            return None
+        self._discovery_seen.add(url)
+        self._urls_yielded += 1
+        self._discovery_found += 1
+        self._stat_inc("prism/discovery_targets")
+        return scrapy.Request(url, callback=self._discovery_parse,
+                              errback=self._discovery_target_failed,
+                              meta={"_prism_discovery_depth": depth}, priority=20)
+
+    def _discovery_links(self, response):
+        """A page's same-site links: those matching the filter are requested for parse_item,
+        the others join the frontier."""
+        if not isinstance(response, TextResponse):
+            return
+        depth = (response.meta.get("_prism_discovery_depth") or 0) + 1
+        max_depth = self._setting("PRISM_DISCOVERY_MAX_DEPTH", _DISCOVERY_MAX_DEPTH)
+        hosts = self._discovery_hosts()
+        try:
+            links = LinkExtractor().extract_links(response)
+        except Exception:  # noqa: BLE001 -- a page we cannot read links from is a dead end
+            return
+        for link in links:
+            url = link.url.split("#", 1)[0]
+            if not _on_domains(url, hosts):
+                continue
+            if self._matches_filter(url):
+                request = self._discovery_target(url, depth)
+                if request is not None:
+                    yield request
+            elif depth <= max_depth:
+                self._discovery_push(url, depth)
+
+    def _discovery_page(self, response):
+        self._discovery_inflight = max(0, self._discovery_inflight - 1)
+        yield from self._discovery_links(response)
+        yield from self._discovery_pump()
+
+    def _discovery_page_failed(self, failure):
+        self._discovery_inflight = max(0, self._discovery_inflight - 1)
+        yield from self._discovery_pump()
+
+    def _discovery_parse(self, response):
+        self._urls_responded += 1
+        yield from self.parse_item(response)
+        yield from self._discovery_links(response)
+        yield from self._discovery_pump()
+
+    def _discovery_target_failed(self, failure):
+        self._urls_responded += 1
+        yield from self._discovery_pump()
+
+    def _on_idle(self, spider=None) -> None:
+        """Nothing is in flight: send more of the frontier, or end discovery. Requests dropped
+        on the way (offsite, duplicates) never reach a callback, so the in-flight count is reset
+        here rather than trusted."""
+        if not self._discovery_on:
+            return
+        self._discovery_inflight = 0
+        more = list(self._discovery_pump())
+        if more:
+            engine = self.crawler.engine
+            for request in more:
+                try:
+                    engine.crawl(request)
+                except TypeError:  # Scrapy < 2.10: crawl(request, spider)
+                    engine.crawl(request, self)
+            raise DontCloseSpider
+        self._discovery_on = False
+        if self._discovery_found:
+            logger.info(f"Prism discovery: {self._discovery_found:,} matching pages from "
+                        f"{self._discovery_pages:,} pages visited")
+            return
+        prefix, pattern = self._prism_filter()
+        logger.error(
+            f"Prism discovery: no page matching path_prefix={prefix!r} pattern={pattern!r} "
+            f"in {self._discovery_pages:,} pages of {self._prism_domain()} ({PRISM_NO_MATCHING_URLS})"
+        )
+        self._stat_inc("prism/discovery_found_nothing")
+        raise CloseSpider(PRISM_NO_MATCHING_URLS)
 
     def _start_from_file(self, path):
         """Read URLs from a text file (one per line)."""
