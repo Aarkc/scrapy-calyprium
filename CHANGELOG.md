@@ -1,3 +1,10 @@
+# [1.34.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.33.0...v1.34.0) (2026-10-18)
+
+
+### Features
+
+* **prism:** find a filter's pages from the site's links when the sitemap lists none ([07a3f23](https://github.com/Aarkc/scrapy-calyprium/commit/07a3f23bca3a0c586f89bee560881d68dca5ccb6))
+
 # [1.33.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.32.0...v1.33.0) (2026-10-18)
 
 
