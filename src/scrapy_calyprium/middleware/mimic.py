@@ -31,6 +31,23 @@ Settings:
         connection resets) when Scrapy's RetryMiddleware is disabled, as the
         platform does (default: 2)
 
+    Every attempt gets a diagnosis from the fetch layer's shared classifier
+    (Mimic's own ``routing.diagnosis`` when it sends one), kept in
+    ``meta['calyprium_diagnosis']`` (see ``scrapy_calyprium._outcome``), and the
+    diagnosis's move decides whether the request is tried again:
+    CALYPRIUM_RETRY_ENABLED: re-schedule a response whose move is
+        retry_elsewhere, retry_later, slow_down or climb, and fix_ours once;
+        never a stop (not found, walls, policy) (default: True)
+    CALYPRIUM_RETRY_TIMES: retries per request (default: 2; a request's
+        ``meta['max_retry_times']`` overrides it, ``meta['dont_retry']`` skips it)
+    CALYPRIUM_RETRY_DELAY: seconds before retrying a retry_later, and the base of
+        slow_down's doubling backoff; a Retry-After wins (default: 5)
+    CALYPRIUM_RETRY_MAX_DELAY: cap on any retry delay, in seconds (default: 60)
+    A retry carries ``meta['calyprium_attempt_number']`` (1, 2, ...) and
+    ``meta['calyprium_prior_class']``, which /api/fetch receives as ``attempt``
+    and ``prior_class`` so Mimic can resume its ladder. With Scrapy's
+    RetryMiddleware enabled, the statuses in RETRY_HTTP_CODES are left to it.
+
     Browser sessions are created lazily, on the first request that needs one
     (AAR-64): with MIMIC_ALL_REQUESTS / local-first only /api/fetch or
     /api/solve are used, so an eager session sat idle for the whole run.
@@ -47,7 +64,7 @@ Settings:
 import asyncio
 import logging
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -55,9 +72,44 @@ from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
-from scrapy_calyprium import _trace
+from scrapy_calyprium import _outcome, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
+from scrapy_calyprium.routing import diagnosis as dg
+
+# Mimic reply headers a Scrapy response must not carry: hop-by-hop headers, the framing of
+# the page Mimic already decoded (Content-Encoding would make HttpCompressionMiddleware
+# decode it twice) and cookies, which Mimic keeps and which must never reach logs.
+_DROP_HEADERS = frozenset((
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection",
+    "te", "trailer", "trailers", "transfer-encoding", "upgrade",
+    "content-encoding", "content-length", "set-cookie", "set-cookie2", "cookie",
+))
+# meta flag: the request already had its one fix_ours retry
+_FIX_OURS_RETRIED = "calyprium_fix_ours_retried"
+
+
+def _mimic_headers(env: Any) -> Optional[Dict[str, Any]]:
+    """The headers of Mimic's reply for the Scrapy response (see ``_DROP_HEADERS``)."""
+    if not isinstance(env, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for key, value in env.items():
+        if value is None or str(key).lower() in _DROP_HEADERS:
+            continue
+        out[str(key)] = [str(v) for v in value] if isinstance(value, (list, tuple)) else str(value)
+    return out or None
+
+
+def _header(env: Any, name: str) -> str:
+    if not isinstance(env, dict):
+        return ""
+    for key, value in env.items():
+        if str(key).lower() == name:
+            if isinstance(value, (list, tuple)):
+                return ", ".join(map(str, value))
+            return str(value or "")
+    return ""
 
 
 def _response_from_envelope(request, url, status, headers, body, content_type):
@@ -193,6 +245,14 @@ class MimicBrowserMiddleware:
         self.escalation_ttl: float = 600.0
         self._escalated: Dict[str, float] = {}
         self.transport_retries: int = 2
+        # Calyprium retry: re-schedule what the diagnosis says is worth another attempt.
+        self.retry_enabled: bool = True
+        self.retry_times: int = 2
+        self.retry_delay: float = 5.0
+        self.retry_max_delay: float = 60.0
+        self.retry_priority_adjust: int = -1
+        # Statuses Scrapy's own RetryMiddleware retries, when it is enabled (left to it).
+        self._builtin_retry_codes: frozenset = frozenset()
         self._session_lock: Optional[asyncio.Lock] = None
         self._consecutive_failures = 0
         self.session_id: Optional[str] = None
@@ -249,10 +309,21 @@ class MimicBrowserMiddleware:
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
         middleware.policy = RunPolicy.from_settings(crawler.settings)
         middleware.escalation_ttl = crawler.settings.getfloat("MIMIC_ESCALATION_TTL", 600.0)
+        builtin_retry = _builtin_retry_active(crawler.settings)
         middleware.transport_retries = (
-            0 if _builtin_retry_active(crawler.settings)
+            0 if builtin_retry
             else crawler.settings.getint("MIMIC_TRANSPORT_RETRIES", 2)
         )
+        settings = crawler.settings
+        middleware.retry_enabled = settings.getbool("CALYPRIUM_RETRY_ENABLED", True)
+        middleware.retry_times = max(0, settings.getint("CALYPRIUM_RETRY_TIMES", 2))
+        middleware.retry_delay = max(0.0, settings.getfloat("CALYPRIUM_RETRY_DELAY", 5.0))
+        middleware.retry_max_delay = max(0.0, settings.getfloat("CALYPRIUM_RETRY_MAX_DELAY", 60.0))
+        middleware.retry_priority_adjust = settings.getint("RETRY_PRIORITY_ADJUST", -1)
+        if builtin_retry:
+            middleware._builtin_retry_codes = frozenset(
+                int(c) for c in settings.getlist("RETRY_HTTP_CODES") or ()
+            )
         middleware.crawler = crawler
 
         # AAR-17: local-first routing opt-in
@@ -285,6 +356,59 @@ class MimicBrowserMiddleware:
         if engine:
             fields["browser_engine"] = engine
         return fields
+
+    @staticmethod
+    def _attempt_fields(request) -> dict:
+        """``attempt`` / ``prior_class`` for /api/fetch on a Calyprium retry, so Mimic can resume
+        its ladder (Mimic's FetchRequest ignores fields it does not know)."""
+        attempt = _outcome.attempt_number(request)
+        if not attempt:
+            return {}
+        fields: Dict[str, Any] = {"attempt": attempt}
+        prior = request.meta.get(_outcome.PRIOR_CLASS)
+        if prior:
+            fields["prior_class"] = str(prior)
+        return fields
+
+    def _keep_mimic_outcome(self, request, data: dict, status: int, html: Any, content_type: str,
+                            env_headers: Any, final_url: str) -> None:
+        """Keep the attempt's diagnosis (Mimic's, else the classifier's) and Mimic's error
+        text in meta."""
+        error = _header(env_headers, "x-mimic-error")
+        if error:
+            request.meta[_outcome.FETCH_ERROR] = error[:300]
+        diagnosis = _outcome.from_mimic(data.get("routing"))
+        if diagnosis is None:
+            if error and not html and int(status or 0) >= 500:
+                # A degraded reply (502/504): Mimic's own failure, not a page from the site.
+                # (Mimic's pacing answer is a 429 with Retry-After: a rate limit, below.)
+                diagnosis = _outcome.of_error(error)
+            else:
+                # Full headers (cookie names hint at the vendor; a diagnosis never holds values).
+                diagnosis = _outcome.of_response(status, html, content_type or None, env_headers,
+                                                 request.url, final_url)
+        request.meta[_outcome.DIAGNOSIS] = diagnosis
+
+    @staticmethod
+    def _mimic_failure(error: BaseException) -> Tuple[Dict[str, Any], str]:
+        """Diagnosis and text of a Mimic call that raised (the request falls back to a plain
+        download)."""
+        if isinstance(error, httpx.HTTPStatusError):
+            resp = error.response
+            try:
+                body = resp.json()
+                detail = str(body.get("detail") or "") if isinstance(body, dict) else ""
+            except Exception:  # noqa: BLE001 -- not JSON
+                detail = (resp.text or "")[:200]
+            text = f"mimic {resp.status_code}: {detail}".strip()
+            if resp.status_code in (429, 502, 503, 504):
+                ra = (resp.headers.get("retry-after") or "").strip()
+                return dg.Diagnosis(
+                    dg.CAPACITY, "", 0, f"mimic_{resp.status_code}",
+                    retry_after=float(ra) if ra.isdigit() else None,
+                ).to_dict(), text
+            return _outcome.of_error(text), text
+        return _outcome.of_error(error), f"{type(error).__name__}: {error}"
 
     def _get_headers(self) -> dict:
         headers = {"Content-Type": "application/json"}
@@ -594,6 +718,14 @@ class MimicBrowserMiddleware:
         except Exception:
             return ""
 
+    @staticmethod
+    def _keep_local_fallback(request, diagnosis: Optional[dict], error: Optional[str]) -> None:
+        """Why the local route handed the request on (the next path diagnoses its own attempt)."""
+        if diagnosis is not None:
+            request.meta[_outcome.FALLBACK_DIAGNOSIS] = diagnosis
+        if error:
+            request.meta[_outcome.FETCH_ERROR] = str(error)[:300]
+
     async def _try_local_route(self, request, spider) -> Optional[Response]:
         """AAR-17: try the local-first auto-router. Return a Response on success,
         None to fall through to the legacy /api/fetch path.
@@ -618,7 +750,11 @@ class MimicBrowserMiddleware:
                 f"falling back to legacy"
             )
             self._local_stats["fallback_legacy"] += 1
+            request.meta[_outcome.FALLBACK_DIAGNOSIS] = _outcome.of_error(e)
             return None
+
+        route_diag = getattr(result, "diagnosis", None)
+        diagnosis = route_diag.to_dict() if isinstance(route_diag, dg.Diagnosis) else None
 
         if result.needs_legacy_fallback:
             self._local_stats["fallback_legacy"] += 1
@@ -626,18 +762,34 @@ class MimicBrowserMiddleware:
                 f"MimicMiddleware: local route fell through for {domain} "
                 f"({result.routing_method}, error={result.error})"
             )
+            self._keep_local_fallback(request, diagnosis, result.error)
             return None
 
-        if result.fetch is None or result.blocked:
+        # A rate limit comes back as the response it is: the Calyprium retry slows down
+        # (falling through would fetch the same URL again at once by another path).
+        rate_limited = (result.fetch is not None and result.blocked and diagnosis is not None
+                        and diagnosis.get("move") == dg.SLOW_DOWN)
+        if (result.fetch is None or result.blocked) and not rate_limited:
             self._local_stats["local_blocked"] += 1
+            self._keep_local_fallback(request, diagnosis, result.error)
             return None
 
         # Success — wrap as a Scrapy Response with raw bytes (AAR-12 fix point)
-        if result.routing_method == "solve_then_replay":
+        if rate_limited:
+            self._local_stats["local_blocked"] += 1
+        elif result.routing_method == "solve_then_replay":
             self._local_stats["local_solve"] += 1
         else:
             self._local_stats["local_success"] += 1
 
+        if diagnosis is None:
+            diagnosis = _outcome.of_response(
+                result.fetch.status_code, result.fetch.body,
+                result.fetch.content_type or None, result.fetch.headers,
+                request.url, result.fetch.final_url,
+            )
+        request.meta[_outcome.DIAGNOSIS] = diagnosis
+        request.meta[_outcome.ROUTING_METHOD] = result.routing_method
         request.meta["mimic_local_route"] = result.routing_method
         if result.trace_id:
             # The router already recorded this attempt's span.
@@ -688,11 +840,16 @@ class MimicBrowserMiddleware:
         # SpiderAutoRouter already traced it. See CalypriumRequestTracer.
         request.meta.pop("calyprium_trace_id", None)
         request.meta.pop("calyprium_routing", None)
+        # ...and its outcome (see _outcome): each attempt is diagnosed afresh.
+        for key in (_outcome.DIAGNOSIS, _outcome.FETCH_ERROR, _outcome.FALLBACK_DIAGNOSIS,
+                    _outcome.ROUTING_METHOD):
+            request.meta.pop(key, None)
         request.meta["_calyprium_t0"] = time.monotonic()
         # The attempt CalypriumTraceMiddleware started, for the calls made below (this coroutine's own context).
         ids = _trace.attempt_ids(request)
         if ids:
             _trace.ATTEMPT.set(ids)
+        _outcome.CURRENT_ATTEMPT.set(_outcome.attempt_number(request))
 
         # AAR-17: local-first fast path
         if self._local_enabled:
@@ -733,6 +890,12 @@ class MimicBrowserMiddleware:
             # Never tear down the shared client or local router here — other
             # coroutines are using them (AAR-64).
             logger.error(f"MimicMiddleware: Failed {request.url}: {e}")
+            # Keep why Mimic failed; the plain download diagnoses its own outcome.
+            diagnosis, text = self._mimic_failure(e)
+            for key in (_outcome.DIAGNOSIS, "calyprium_routing", _outcome.ROUTING_METHOD):
+                request.meta.pop(key, None)
+            request.meta[_outcome.FALLBACK_DIAGNOSIS] = diagnosis
+            request.meta[_outcome.FETCH_ERROR] = text[:300]
             self._consecutive_failures += 1
             if self._consecutive_failures >= 3 and self.session_id:
                 logger.warning(
@@ -766,6 +929,7 @@ class MimicBrowserMiddleware:
             "url": request.url,
             "stealth_level": self._stealth_for(self._domain_for(request)),
             **self._fetch_policy_fields(),
+            **self._attempt_fields(request),
         }
 
         resp = await client.post(
@@ -780,18 +944,23 @@ class MimicBrowserMiddleware:
         html = data.get("html") or data.get("content") or ""
         status = data.get("status_code", 200)
         env_headers = data.get("headers") or {}
-        ct = env_headers.get("content-type") or env_headers.get("Content-Type") or ""
+        ct = _header(env_headers, "content-type")
+        final_url = data.get("final_url") or request.url
 
         self._consecutive_failures = 0
-        request.meta["calyprium_routing"] = self._routing_from_fetch(data)
+        routing = self._routing_from_fetch(data)
+        request.meta["calyprium_routing"] = routing
+        request.meta[_outcome.ROUTING_METHOD] = routing.get("routing_method") or "mimic_fetch"
+        self._keep_mimic_outcome(request, data, status, html, ct, env_headers, final_url)
 
         # Wrap by Content-Type so an XML/JSON API body (e.g. Legistar OData) gets
         # the right parser instead of being HTML-parsed into 0 items (AAR-12).
+        # Mimic's headers ride along (minus framing and cookies, see _DROP_HEADERS).
         return _response_from_envelope(
             request,
-            url=data.get("final_url") or request.url,
+            url=final_url,
             status=status,
-            headers={"Content-Type": ct} if ct else None,
+            headers=_mimic_headers(env_headers),
             body=html,
             content_type=ct,
         )
@@ -851,6 +1020,7 @@ class MimicBrowserMiddleware:
                     "session_id": self.session_id,
                     "stealth_level": self._stealth_for(self._domain_for(request)),
                     **self._fetch_policy_fields(),
+                    **self._attempt_fields(request),
                 },
                 headers=self._get_headers(),
                 timeout=60.0,
@@ -863,61 +1033,41 @@ class MimicBrowserMiddleware:
             final_url = data.get("final_url") or request.url
             routing = self._routing_from_fetch(data)
 
-        ct = env.get("content-type") or env.get("Content-Type") or ""
+        ct = _header(env, "content-type")
         self._consecutive_failures = 0
         request.meta["calyprium_routing"] = routing
+        request.meta[_outcome.ROUTING_METHOD] = routing.get("routing_method") or "browser_direct"
+        self._keep_mimic_outcome(request, data, status, html, ct, env, final_url)
 
         return _response_from_envelope(
             request,
             url=final_url,
             status=status,
-            headers={"Content-Type": ct} if ct else None,
+            headers=_mimic_headers(env),
             body=html,
             content_type=ct,
         )
 
     async def process_response(self, request, response, spider):
-        """Detect blocks and potentially upgrade stealth level.
+        """Diagnose the attempt, escalate a blocked domain, and retry what is worth it.
 
-        AAR-5: previously this used a substring match on `b"blocked" in body
-        and b"access" in body` which fired on every legitimate page that
-        happened to contain both words (DigiKey product pages contain
-        "access" 100+ times in markup, "blocked" twice in legal text).
-        Every successful response triggered a stealth-level upgrade and
-        session reset, churning the spider for no reason.
+        The diagnosis is the one the Mimic / local path kept in meta for the
+        response it built (Mimic's own when it sends one), else the shared
+        classifier's verdict on this response (a plain download). AAR-5: block
+        detection never matches loose words on a page; see block_detect.
 
-        Now delegates to the AAR-15 block_detect.is_blocked() helper which
-        looks for real challenge markers (cf-browser-verification, just a
-        moment, datadome, hcaptcha, etc.) plus the status-code rules.
+        A response whose diagnosis says try again (see ``_retry``) is replaced by
+        a new request; ``response_received`` never fires for it, so its span is
+        recorded here.
         """
-        if not request.meta.get("mimic_browser"):
+        if request.meta.get("_internal"):
             return response
+        diagnosis = _outcome.for_response(request, response)
 
-        blocked = False
-        if hasattr(response, "body"):
-            try:
-                from scrapy_calyprium.routing.block_detect import is_blocked
-                content_type = response.headers.get("Content-Type", b"").decode(
-                    "latin-1", "ignore"
-                )
-                # Route block statuses through the gate too (with headers), so a
-                # plain IIS/nginx rate-limit 403 with no WAF signal isn't treated
-                # as a solvable block. Previously 403/429/503 were hard-coded as
-                # blocked here, bypassing the gate entirely.
-                blocked = is_blocked(
-                    response.status, response.body,
-                    content_type=content_type, headers=dict(response.headers),
-                )
-            except ImportError:
-                # Optional [local] extra not installed — fall back to status only.
-                blocked = response.status in (403, 429, 503)
-        else:
-            blocked = response.status in (403, 429, 503)
-
-        if blocked:
+        if request.meta.get("mimic_browser") and _outcome.blocked(diagnosis):
             logger.warning(
                 f"MimicMiddleware: Possible block at {request.url} "
-                f"(status: {response.status})"
+                f"(status: {response.status}, {diagnosis.get('class')})"
             )
             domain = self._domain_for(request)
             if domain and self.stealth_level != "maximum":
@@ -928,23 +1078,119 @@ class MimicBrowserMiddleware:
                     )
                 self._escalated[domain] = time.monotonic() + self.escalation_ttl
 
-        return response
+        retry = await self._retry(request, diagnosis, response)
+        return retry if retry is not None else response
+
+    async def _retry(self, request, diagnosis: Optional[dict], response=None):
+        """A new attempt of ``request`` when its diagnosis's move is worth one, else None.
+
+        retry_elsewhere / climb go again at once (another exit; Mimic resumes its
+        ladder from ``attempt`` / ``prior_class``), retry_later after
+        CALYPRIUM_RETRY_DELAY, slow_down after a doubling backoff, and a
+        Retry-After the site or Mimic gave wins; fix_ours goes again once; stop
+        moves never. Capped at CALYPRIUM_RETRY_TIMES per request.
+        """
+        if not self.retry_enabled or not isinstance(diagnosis, dict):
+            return None
+        meta = request.meta
+        if meta.get("dont_retry") or meta.get("_internal"):
+            return None
+        cls = str(diagnosis.get("class") or "")
+        move = diagnosis.get("move")
+        if move == dg.FIX_OURS:
+            if meta.get(_FIX_OURS_RETRIED):
+                return None
+        elif move not in _outcome.RETRY_MOVES:
+            return None
+        if response is not None and response.status in self._builtin_retry_codes:
+            return None  # Scrapy's RetryMiddleware already retried this status
+        attempt = _outcome.attempt_number(request)
+        try:
+            limit = int(meta.get("max_retry_times", self.retry_times))
+        except (TypeError, ValueError):
+            limit = self.retry_times
+        stats = getattr(self.crawler, "stats", None)
+        if attempt >= limit:
+            if stats is not None:
+                stats.inc_value("calyprium/retry/max_reached")
+            logger.info(
+                f"MimicMiddleware: gave up on {request.url} after {attempt} "
+                f"retr{'y' if attempt == 1 else 'ies'} ({cls})"
+            )
+            return None
+
+        if response is not None:
+            # This attempt went out on the wire, and response_received will not fire for it.
+            tracer = self._find_tracer()
+            if tracer is not None and hasattr(tracer, "trace_response"):
+                try:
+                    tracer.trace_response(request, response)
+                except Exception as exc:  # noqa: BLE001 -- tracing never breaks a crawl
+                    logger.debug(f"MimicMiddleware: retry trace failed: {exc}")
+        if stats is not None:
+            stats.inc_value("calyprium/retry/count")
+            stats.inc_value(f"calyprium/retry/{cls or 'unknown'}")
+        delay = self._retry_delay(diagnosis, attempt)
+        vendor = diagnosis.get("vendor")
+        logger.info(
+            f"MimicMiddleware: retrying {request.url} ({cls}"
+            f"{', ' + str(vendor) if vendor else ''}: {move}) "
+            f"{attempt + 1}/{limit}" + (f" in {delay:.1f}s" if delay else "")
+        )
+        if delay > 0:
+            await self._sleep(delay)
+        retry = request.replace(dont_filter=True,
+                                priority=request.priority + self.retry_priority_adjust)
+        retry.meta[_outcome.ATTEMPT_NUMBER] = attempt + 1
+        retry.meta[_outcome.PRIOR_CLASS] = cls
+        if move == dg.FIX_OURS:
+            retry.meta[_FIX_OURS_RETRIED] = True
+        return retry
+
+    def _retry_delay(self, diagnosis: dict, attempt: int) -> float:
+        """Seconds to wait before retrying: Retry-After when given, else by move."""
+        move = diagnosis.get("move")
+        retry_after = diagnosis.get("retry_after")
+        try:
+            retry_after = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            retry_after = None
+        if retry_after is not None and retry_after >= 0:
+            delay = retry_after
+        elif move == dg.SLOW_DOWN:
+            delay = self.retry_delay * (2 ** attempt)
+        elif move == dg.RETRY_LATER:
+            delay = self.retry_delay
+        else:
+            delay = 0.0
+        return max(0.0, min(delay, self.retry_max_delay))
+
+    @staticmethod
+    async def _sleep(delay: float) -> None:
+        """Wait without blocking the reactor (see ``_wait.sleep``). Holds the request's place in
+        CONCURRENT_REQUESTS meanwhile, so a rate-limited crawl slows down as a whole; a download
+        slot's delay would not apply, since a Mimic-served request never enters the slot queue."""
+        await _wait.sleep(delay)
 
     async def process_exception(self, request, exception, spider):
         """Capped retry of transport errors (timeouts, resets, DNS).
 
         The platform disables Scrapy's RetryMiddleware, so without this a
         single timeout dropped the URL for good (AAR-64). Only active when
-        RetryMiddleware isn't, so retries never double up.
+        RetryMiddleware isn't, so retries never double up. The error's
+        diagnosis is kept in ``meta['calyprium_diagnosis']`` (an errback sees it).
         """
         if request.meta.get("mimic_browser"):
             logger.error(f"MimicMiddleware: Exception for {request.url}: {exception}")
-        if isinstance(exception, _TRANSPORT_ERRORS):
-            # Every failed attempt went out on the wire: one span each.
-            tracer = self._find_tracer()
-            if tracer is not None and hasattr(tracer, "trace_exception"):
-                tracer.trace_exception(request, exception)
-        if not self.transport_retries or not isinstance(exception, _TRANSPORT_ERRORS):
+        if not isinstance(exception, _TRANSPORT_ERRORS):
+            return None
+        diagnosis = _outcome.of_error(exception)
+        request.meta[_outcome.DIAGNOSIS] = diagnosis
+        # Every failed attempt went out on the wire: one span each.
+        tracer = self._find_tracer()
+        if tracer is not None and hasattr(tracer, "trace_exception"):
+            tracer.trace_exception(request, exception)
+        if not self.transport_retries:
             return None
         retries = request.meta.get("mimic_transport_retries", 0)
         stats = getattr(self.crawler, "stats", None)
@@ -954,6 +1200,7 @@ class MimicBrowserMiddleware:
             return None
         if stats is not None:
             stats.inc_value("mimic/transport_retry/count")
+            stats.inc_value(f"calyprium/retry/{diagnosis['class']}")
         logger.info(
             f"MimicMiddleware: retrying {request.url} after transport error "
             f"({retries + 1}/{self.transport_retries}): {exception!r}"

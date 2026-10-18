@@ -35,18 +35,59 @@ a killed run doesn't skip queued-but-uncrawled URLs. When a run that resumed
 at offset R reaches the end of the corpus it wraps to 0 and continues up to R
 (``PRISM_WRAP_ON_EXHAUST``, default True), so an exhausted checkpoint never
 pins later runs at 0 URLs.
+
+Refill failures (``prism://``) back off, 2 s doubling to 60 s with jitter,
+never an immediate loop. A domain Prism has not indexed (404) gets the other
+``www.`` form tried once, then one scan request per run
+(``POST {prism_url}/api/sitemaps/fetch``, with the run's credentials), and the
+URL listing is polled with that backoff for up to ``PRISM_WAIT_FOR_SCAN_S``
+(default 900 s). Still nothing: the refill stops and, if the run has no URLs,
+the spider closes with finish reason ``prism_no_urls`` (stat ``prism/no_urls``).
 """
 
+import json
 import logging
-from typing import Dict, Optional
+import random
+import time
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode
 
 import scrapy
 from scrapy import signals
+from scrapy.exceptions import CloseSpider
 
+from scrapy_calyprium import _wait
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
+
+# A failed Prism page request is retried after 2 s, doubling to 60 s (with jitter).
+_PRISM_BACKOFF_BASE_S = 2.0
+_PRISM_BACKOFF_MAX_S = 60.0
+# How long a run waits for Prism to index a domain it does not know (PRISM_WAIT_FOR_SCAN_S).
+_PRISM_WAIT_FOR_SCAN_S = 900.0
+# The finish reason (and stat) of a run that gave up on Prism ever having URLs for its domain.
+PRISM_NO_URLS = "prism_no_urls"
+
+
+def _http_status(failure) -> Optional[int]:
+    """The HTTP status of a failed request (HttpErrorMiddleware's HttpError), else None."""
+    response = getattr(getattr(failure, "value", None), "response", None)
+    status = getattr(response, "status", None)
+    return status if isinstance(status, int) else None
+
+
+def _other_www(domain: str) -> Optional[str]:
+    """``www.x.com`` <-> ``x.com`` (None for a bare single-label host)."""
+    domain = (domain or "").strip().lower()
+    if domain.startswith("www."):
+        return domain[4:] or None
+    return f"www.{domain}" if "." in domain else None
+
+
+def _with_domain(parsed, domain: str):
+    """The ``prism://`` source with another domain (kept in netloc, or path for prism:x)."""
+    return parsed._replace(netloc=domain) if parsed.netloc else parsed._replace(path=domain)
 
 # Only fetch the next batch when pending requests drop below this
 _REFILL_THRESHOLD = 1000
@@ -109,6 +150,13 @@ class PrismSitemapSpider(scrapy.Spider):
         self._prism_stop_at: Optional[int] = None
         self._prism_wrapped = False
         self._prism_page_limit = min(self.batch_size, 100000)
+        # Refill failures (prism://): consecutive failures drive the backoff; a domain Prism
+        # does not know gets its other www form tried once and one scan request per run,
+        # then is polled until the wait deadline (monotonic).
+        self._prism_refill_failures = 0
+        self._prism_alt_tried = False
+        self._prism_scan_requested = False
+        self._prism_wait_deadline: Optional[float] = None
 
         # Build url_source from class attributes if not provided
         if url_source:
@@ -499,9 +547,10 @@ class PrismSitemapSpider(scrapy.Spider):
         }
         return f"{forge_url}/spiders/{spider_slug}/recrawl/stale-urls?{urlencode(api_params)}"
 
-    def _build_prism_api_url(self, parsed, offset: int, limit: Optional[int] = None) -> str:
-        """Build the Prism API URL for a page of URLs."""
-        domain = parsed.netloc or parsed.path
+    def _build_prism_api_url(self, parsed, offset: int, limit: Optional[int] = None,
+                             domain: Optional[str] = None) -> str:
+        """Build the Prism API URL for a page of URLs (of ``domain``, default the source's)."""
+        domain = domain or parsed.netloc or parsed.path
         params = parse_qs(parsed.query)
 
         api_params = {
@@ -576,6 +625,22 @@ class PrismSitemapSpider(scrapy.Spider):
         data = response.json()
         raw_urls = data.get("urls", [])
         total = data.get("total", 0) or data.get("total_stale", 0)
+
+        alt = response.meta.get("_prism_alt")
+        if alt:
+            if not raw_urls:
+                # Prism knows the other www form but has no URLs for it either.
+                yield from self._prism_not_found_requests()
+                return
+            logger.warning(
+                f"Prism: no URLs for {self._prism_domain()} but {len(raw_urls):,} for {alt}; "
+                f"using {alt} for this run"
+            )
+            self._prism_parsed = _with_domain(self._prism_parsed, alt)
+            self._stat_inc("prism/domain_switched")
+        # Prism answered: the failure run (and any wait for a scan) is over.
+        self._prism_refill_failures = 0
+        self._prism_wait_deadline = None
         page_start = response.meta.get("_prism_offset", self._prism_next_offset)
         limit = response.meta.get("_prism_limit") or min(self.batch_size, 100000)
 
@@ -729,8 +794,9 @@ class PrismSitemapSpider(scrapy.Spider):
         ):
             yield self._make_refill_request()
 
-    def _make_refill_request(self):
-        """Create a request to fetch the next Prism page.
+    def _make_refill_request(self, alt_domain: Optional[str] = None):
+        """Create a request to fetch the next Prism page (of ``alt_domain`` when probing
+        the other www form of a domain Prism does not know).
 
         Sets ``_refill_in_flight = True`` so any concurrent call sites
         (fast-skip path in ``_handle_prism_page`` and the per-response
@@ -743,45 +809,199 @@ class PrismSitemapSpider(scrapy.Spider):
         logger.info(
             f"Prism: refilling from offset {offset:,} "
             f"(pending={self._pending_count:,})"
+            + (f" from {alt_domain}" if alt_domain else "")
         )
+        meta = {
+            "_internal": True,
+            "_prism_offset": offset,
+            "_prism_limit": limit,
+            "download_timeout": 120,
+            # Use a separate download slot so Prism API calls don't
+            # compete with proxy-routed scrape requests. Without this,
+            # when all CONCURRENT_REQUESTS slots are occupied by
+            # stuck/failing proxy requests, the Prism pagination
+            # request can't get through → no new URLs → spider
+            # finishes prematurely.
+            "download_slot": "_prism_internal",
+        }
+        if alt_domain:
+            meta["_prism_alt"] = alt_domain
         return scrapy.Request(
-            self._build_prism_api_url(self._prism_parsed, offset=offset, limit=limit),
+            self._build_prism_api_url(self._prism_parsed, offset=offset, limit=limit,
+                                      domain=alt_domain),
             callback=self._handle_prism_page,
             errback=self._handle_prism_error,
-            meta={
-                "_internal": True,
-                "_prism_offset": offset,
-                "_prism_limit": limit,
-                "download_timeout": 120,
-                # Use a separate download slot so Prism API calls don't
-                # compete with proxy-routed scrape requests. Without this,
-                # when all CONCURRENT_REQUESTS slots are occupied by
-                # stuck/failing proxy requests, the Prism pagination
-                # request can't get through → no new URLs → spider
-                # finishes prematurely.
-                "download_slot": "_prism_internal",
-            },
+            meta=meta,
             dont_filter=True,
             priority=100,  # higher priority than normal scrape requests
         )
 
-    def _handle_prism_error(self, failure):
-        """Reset refill flag and re-queue if the Prism page request fails.
+    async def _handle_prism_error(self, failure):
+        """A failed Prism page request: try again after a backoff, never in a loop.
 
-        Without this, a failed Prism fetch leaves ``_refill_in_flight=True``
-        forever, no further refills are attempted, and the spider exits
-        with finish_reason='finished' once the pending queue drains. We
-        re-queue the request so the spider self-heals from transient
-        Prism outages even if no scrape response arrives to re-trigger
-        the refill check.
+        Without a retry, a failed Prism fetch left ``_refill_in_flight=True``
+        forever and the spider exited once the pending queue drained; an
+        immediate re-queue, though, hot-looped (a 404 for a domain Prism has
+        not indexed made ~2,265 requests in 5 minutes and 0 items). So the
+        retry waits (2 s doubling to 60 s, with jitter), and a 404 goes through
+        ``_prism_not_found``: the other www form once, one scan request per
+        run, then polling until ``PRISM_WAIT_FOR_SCAN_S``, then give up.
+
+        The wait happens here, in this errback's coroutine (``_wait.sleep``):
+        the failure stays in Scrapy's scraper meanwhile, so the spider is not
+        idle and does not close under it.
         """
         self._refill_in_flight = False
+        if self._prism_exhausted:
+            return []
+        delay, requests = self._prism_after_failure(failure)
+        if delay > 0:
+            await _wait.sleep(delay)
+        return requests
+
+    def _prism_after_failure(self, failure) -> Tuple[float, List[scrapy.Request]]:
+        """How long to wait and what to send after a failed Prism page request (the
+        requests are made now, so ``_refill_in_flight`` holds off other refills while
+        waiting). Raises CloseSpider when the run gives up on an unindexed domain."""
+        self._prism_refill_failures += 1
+        status = _http_status(failure)
+        if status == 404:
+            meta = getattr(getattr(failure, "request", None), "meta", None) or {}
+            return self._prism_not_found(meta.get("_prism_alt"))
+        self._stat_inc("prism/refill_failures")
+        delay = self._prism_backoff()
         logger.warning(
             f"Prism refill request failed at offset {self._prism_next_offset:,}: "
-            f"{failure.value!r}. Re-queuing."
+            f"{failure.value!r}. Retrying in {delay:.1f}s "
+            f"(failure {self._prism_refill_failures})."
         )
-        if not self._prism_exhausted:
-            return self._make_refill_request()
+        return delay, [self._make_refill_request()]
+
+    def _prism_not_found(self, alt_failed: Optional[str] = None
+                         ) -> Tuple[float, List[scrapy.Request]]:
+        """Prism has no URLs for the domain (404): the other www form once, a scan request
+        once, then poll with backoff until the wait is over, then give up."""
+        domain = self._prism_domain()
+        now = time.monotonic()
+        if self._prism_wait_deadline is None:
+            self._prism_wait_deadline = now + self._prism_wait_for_scan_s()
+            self._stat_inc("prism/not_indexed")
+        if alt_failed:
+            logger.warning(f"Prism has no URLs for {alt_failed} either")
+        alt = _other_www(domain)
+        if alt and not self._prism_alt_tried and not self._urls_yielded:
+            self._prism_alt_tried = True
+            logger.warning(f"Prism has no URLs for {domain}; trying {alt}")
+            return 0.0, [self._make_refill_request(alt_domain=alt)]
+        requests = self._prism_not_found_requests(poll=False)
+        remaining = self._prism_wait_deadline - now
+        if remaining <= 0 and not requests:  # the scan request always goes out first
+            self._prism_give_up(domain)
+            return 0.0, []
+        delay = min(self._prism_backoff(), max(0.0, remaining))
+        logger.warning(
+            f"Prism has no URLs for {domain} yet (scan requested); polling again in "
+            f"{delay:.1f}s, giving up in {max(0.0, remaining):.0f}s"
+        )
+        return delay, requests + [self._make_refill_request()]
+
+    def _prism_not_found_requests(self, poll: bool = True) -> List[scrapy.Request]:
+        """The scan request (once per run) and, with ``poll``, the next URL page request."""
+        requests = []
+        if not self._prism_scan_requested:
+            self._prism_scan_requested = True
+            if self._prism_wait_deadline is None:
+                self._prism_wait_deadline = time.monotonic() + self._prism_wait_for_scan_s()
+            requests.append(self._make_scan_request(self._prism_domain()))
+        if poll:
+            requests.append(self._make_refill_request())
+        return requests
+
+    def _make_scan_request(self, domain: str) -> scrapy.Request:
+        """Ask Prism to index ``domain`` (POST /api/sitemaps/fetch). The URL listing is
+        public, but this endpoint needs credentials: the run's API key (Prism accepts any
+        valid ``clp_`` key) or, without one, the legacy service secret."""
+        logger.warning(f"Prism: asking Prism to scan {domain}")
+        return scrapy.Request(
+            f"{self.prism_url}/api/sitemaps/fetch?{urlencode({'domain': domain})}",
+            method="POST",
+            body=json.dumps({"scan_type": "full", "force": False}),
+            headers={"Content-Type": "application/json", **self._get_forge_auth().headers()},
+            callback=self._handle_prism_scan,
+            errback=self._handle_prism_scan_error,
+            meta={"_internal": True, "_prism_scan": domain, "download_timeout": 60,
+                  "download_slot": "_prism_internal", "handle_httpstatus_all": True},
+            dont_filter=True,
+            priority=100,
+        )
+
+    def _handle_prism_scan(self, response):
+        domain = response.meta.get("_prism_scan")
+        if response.status in (200, 202, 409):
+            # 200: a recent scan exists; 202: scan started; 409: one is already running.
+            logger.info(f"Prism: scan of {domain} requested ({response.status})")
+            self._stat_inc("prism/scan_requested")
+        else:
+            logger.warning(
+                f"Prism did not take the scan request for {domain} ({response.status}); "
+                f"waiting for its URLs anyway"
+            )
+            self._stat_inc("prism/scan_refused")
+        return []
+
+    def _handle_prism_scan_error(self, failure):
+        logger.warning(f"Prism scan request failed: {failure.value!r}; waiting for URLs anyway")
+        self._stat_inc("prism/scan_refused")
+        return []
+
+    def _prism_give_up(self, domain: str) -> None:
+        """Stop the refill; close the spider if the run has no URLs at all."""
+        self._prism_exhausted = True
+        self._stat_inc("prism/no_urls")
+        alt = _other_www(domain)
+        waited = self._prism_wait_for_scan_s()
+        tried = f"{domain}" + (f" or {alt}" if alt and self._prism_alt_tried else "")
+        if self._urls_yielded:
+            logger.error(
+                f"Prism: no URLs for {tried} after waiting {waited:.0f}s for a scan; "
+                f"stopping the refill ({PRISM_NO_URLS})"
+            )
+            return
+        logger.error(
+            f"Prism: no URLs for {tried} after waiting {waited:.0f}s for a scan; "
+            f"closing the spider ({PRISM_NO_URLS})"
+        )
+        raise CloseSpider(PRISM_NO_URLS)
+
+    def _prism_backoff(self) -> float:
+        """2 s doubling to 60 s with the consecutive failures, jittered down by up to 25%."""
+        n = max(1, self._prism_refill_failures)
+        base = min(_PRISM_BACKOFF_MAX_S, _PRISM_BACKOFF_BASE_S * 2 ** min(n - 1, 16))
+        return base * random.uniform(0.75, 1.0)
+
+    def _prism_wait_for_scan_s(self) -> float:
+        """PRISM_WAIT_FOR_SCAN_S, ending 30 s before CLOSESPIDER_TIMEOUT when that is set, so
+        the run closes as ``prism_no_urls`` rather than on its timeout."""
+        try:
+            wait = self.settings.getfloat("PRISM_WAIT_FOR_SCAN_S", _PRISM_WAIT_FOR_SCAN_S)
+            timeout = self.settings.getfloat("CLOSESPIDER_TIMEOUT", 0)
+        except AttributeError:
+            return _PRISM_WAIT_FOR_SCAN_S
+        if timeout > 0:
+            wait = min(wait, max(0.0, timeout - 30))
+        return max(0.0, wait)
+
+    def _prism_domain(self) -> str:
+        parsed = self._prism_parsed
+        return (parsed.netloc or parsed.path) if parsed is not None else (self.prism_domain or "")
+
+    def _stat_inc(self, key: str) -> None:
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is not None:
+            try:
+                stats.inc_value(key)
+            except Exception:  # noqa: BLE001 -- stats never break a crawl
+                pass
 
     def _start_from_file(self, path):
         """Read URLs from a text file (one per line)."""

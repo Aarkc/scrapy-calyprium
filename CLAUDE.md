@@ -41,6 +41,20 @@ its `trace_id` field stays a per-attempt id) with the trace ids added (`otel_*`)
 `spider.parse` spans to Forge's `/spans`. Calls to Mimic and Tessera carry `traceparent` from `_trace.ATTEMPT`,
 which the Mimic middleware sets inside its own coroutine (never in a shared callback).
 
+### Failure Diagnosis and the Calyprium Retry
+
+`routing/diagnosis.py` is Mimic's failure classifier, **vendored verbatim** from the monorepo
+(`stealth/mimic/mimic/routing/diagnosis.py`, standard library only): never edit it here, re-copy it
+when Mimic changes it (`tests/test_diagnosis_vendored.py` checks `VERSION` and the stdlib-only rule).
+`routing/block_detect.py` adapts SDK inputs to it (`diagnose()`), and `is_blocked()` is "the class is
+in `BLOCKED_CLASSES`". `_outcome.py` names the meta keys (`calyprium_diagnosis`, `calyprium_fetch_error`,
+`calyprium_fallback_diagnosis`, `calyprium_attempt_number`, `calyprium_prior_class`,
+`calyprium_routing_method`). The Mimic middleware keeps each attempt's diagnosis (Mimic's
+`routing.diagnosis` when sent), retries by the diagnosis's move (`CALYPRIUM_RETRY_*`), traces a retried
+response itself (`response_received` never fires for it), and sends `attempt` / `prior_class` to
+`/api/fetch`. Retry delays use `_wait.sleep` (asyncio or Twisted, per reactor); a download slot's delay
+would not apply to Mimic-served requests, which never enter the slot queue.
+
 ### Local-First Auto-Routing (`routing/`)
 
 This is the most complex subsystem. The flow per request:
@@ -77,6 +91,8 @@ Each `CookieSlot` in the `DomainCache` has:
 | `SPIDER_ID`, `RUN_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
 | `VEIL_PROXY_TYPE` | Veil username `-type_`; also the tier (`fast` / `residential`) `CalypriumRequestTracer` puts on Veil-path spans |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
+| `CALYPRIUM_RETRY_ENABLED`, `CALYPRIUM_RETRY_TIMES`, `CALYPRIUM_RETRY_DELAY`, `CALYPRIUM_RETRY_MAX_DELAY` | Calyprium retry in `MimicBrowserMiddleware` (on by default; 2 retries, 5 s base, 60 s cap) |
+| `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: wait for Prism to index an unknown domain (404) before closing as `prism_no_urls` (default 900 s); refill failures back off 2 s doubling to 60 s |
 | `SNAPSHOTS_ENABLED`, `SNAPSHOTS_SAMPLE`, `SNAPSHOTS_ERRORS`, `SNAPSHOTS_MAX_BYTES` | `SnapshotRecorder` extension: gzipped sample/error/blocked pages uploaded to `{run prefix}/snapshots/{sha256}.html.gz` and reported to forge `POST /jobs/spiders/{slug}/runs/{n}/snapshots` at close |
 
 ## Code Conventions
@@ -86,4 +102,4 @@ Each `CookieSlot` in the `DomainCache` has:
 - AAR-XX references in comments point to internal design docs (Anti-Anti-bot Research tickets)
 - `LocalFetcher` preserves response body as raw bytes — never decode to str (AAR-12 fix)
 - httpcloak is sync (Rust FFI); wrapped in `asyncio.to_thread()` for async compatibility
-- `CalypriumRequestTracer` must emit exactly one top-level span per download attempt (forge prices each into `usage_events`): `SpiderAutoRouter.fetch()` records its own and marks `meta["calyprium_trace_id"]`; everything else is traced from the `response_received` signal using `meta["calyprium_routing"]` (mimic's `routing` object) or the Veil/direct path; transport errors via `MimicBrowserMiddleware.process_exception`
+- `CalypriumRequestTracer` must emit exactly one top-level span per download attempt (forge prices each into `usage_events`): `SpiderAutoRouter.fetch()` records its own and marks `meta["calyprium_trace_id"]`; everything else is traced from the `response_received` signal using `meta["calyprium_routing"]` (mimic's `routing` object) or the Veil/direct path; transport errors via `MimicBrowserMiddleware.process_exception`; a response the Calyprium retry replaces via `MimicBrowserMiddleware._retry`. A span's `status` is the attempt's diagnosis (`_outcome.outcome`), never "success" for a transport error

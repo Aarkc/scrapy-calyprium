@@ -62,6 +62,24 @@ DOWNLOADER_MIDDLEWARES = {"scrapy_calyprium.CalypriumTraceMiddleware": 50}
 SPIDER_MIDDLEWARES = {"scrapy_calyprium.CalypriumTraceMiddleware": 50}
 ```
 
+### Failure Diagnosis and Retries
+
+Every download attempt gets a diagnosis from the fetch layer's shared failure classifier (the same
+one Mimic and Tessera use), in `response.meta["calyprium_diagnosis"]`:
+`{"class", "number", "side", "move", "vendor"?, "status"?, "evidence"?, "confidence"?, "retry_after"?}`.
+A transport error leaves it on `failure.request.meta` for an errback. When Mimic's own call failed
+and the request fell back to a plain download, `meta["calyprium_fallback_diagnosis"]` and
+`meta["calyprium_fetch_error"]` say why.
+
+`MimicBrowserMiddleware` retries an attempt when its diagnosis's move is worth another try:
+`retry_elsewhere` and `climb` at once, `retry_later` after `CALYPRIUM_RETRY_DELAY`, `slow_down`
+after a doubling backoff (a `Retry-After` wins), `fix_ours` once, and never a `stop` (not found,
+sign-in / geo / consent walls, policy). A retry carries `meta["calyprium_attempt_number"]` and
+`meta["calyprium_prior_class"]`, which Mimic receives to resume its ladder. `meta["dont_retry"]`
+and `meta["max_retry_times"]` work as with Scrapy's RetryMiddleware; with that middleware enabled,
+the statuses in `RETRY_HTTP_CODES` are left to it. Stats: `calyprium/retry/<class>` per retry,
+`calyprium/class/<class>` per final response.
+
 ### Saving Output to Calyprium Storage
 
 Spider output is saved to Calyprium's S3-compatible storage using Scrapy's built-in feed export:
@@ -124,6 +142,18 @@ All middleware requires a valid API key. Set it via:
 | `MIMIC_USE_PROXY` | Route browser through proxy | `False` |
 | `MIMIC_ALL_REQUESTS` | Render all requests via browser | `False` |
 | `MIMIC_USE_SPECTRE` | Use device fingerprints | `True` |
+| `CALYPRIUM_RETRY_ENABLED` | Retry attempts whose diagnosis says so | `True` |
+| `CALYPRIUM_RETRY_TIMES` | Retries per request | `2` |
+| `CALYPRIUM_RETRY_DELAY` | Seconds before a `retry_later`; base of the `slow_down` backoff | `5` |
+| `CALYPRIUM_RETRY_MAX_DELAY` | Cap on any retry delay (seconds) | `60` |
+| `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: how long to wait for Prism to index an unknown domain before closing as `prism_no_urls` (ends 30 s before `CLOSESPIDER_TIMEOUT`) | `900` |
+
+## Development
+
+`src/scrapy_calyprium/routing/diagnosis.py` is **vendored**: it is Mimic's failure classifier,
+copied verbatim from the Calyprium monorepo (`stealth/mimic/mimic/routing/diagnosis.py`). Never
+edit it here; when Mimic changes it, copy the file again (its `VERSION` constant says which
+contract it is) and run the tests. SDK-side adaptations live in `routing/block_detect.py`.
 
 ## License
 

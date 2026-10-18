@@ -17,13 +17,15 @@ Flow per request:
   3. Otherwise → local httpcloak without cookies. On success: cache as
      "light" and return. On block: fall through.
   4. Call /api/solve to get fresh cookies → cache as a new slot → retry
-     local httpcloak with the new cookies.
+     local httpcloak with the new cookies. A transport error or a rate limit
+     never solves (a solve cannot fix either): the router backs off instead.
   5. If solve returned success=False (real domain block) → mark domain heavy
      and surface a 403 to the caller. Caller decides whether to fall through
      to the legacy browser path or fail the Scrapy request.
 
-Returns `RouteResult`. The caller (MimicMiddleware) wraps it in a Scrapy
-Response.
+"Blocked" is the shared classifier's verdict (block_detect.diagnose), and every
+`RouteResult` carries the diagnosis of how it ended. Returns `RouteResult`. The
+caller (MimicMiddleware) wraps it in a Scrapy Response.
 
 AAR-17.
 """
@@ -36,7 +38,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from scrapy_calyprium.routing.block_detect import challenge_family, is_blocked
+from scrapy_calyprium import _outcome
+from scrapy_calyprium.routing import diagnosis as dg
+from scrapy_calyprium.routing.block_detect import challenge_family, diagnose
 from scrapy_calyprium.routing.domain_cache import DomainCache
 from scrapy_calyprium.routing.local_fetch import (
     LocalFetchError,
@@ -67,6 +71,14 @@ class RouteResult:
     # Set when the request tracer recorded a span for this fetch, so the
     # middleware can keep the response from being traced a second time.
     trace_id: Optional[str] = None
+    # Why the fetch ended as it did (the shared classifier's verdict on `fetch`, or on the
+    # transport error when there is no response). Filled by fetch() when left None.
+    diagnosis: Optional[dg.Diagnosis] = None
+
+
+def _diagnose_fetch(fetch: LocalFetchResult, url: Optional[str] = None) -> dg.Diagnosis:
+    return diagnose(fetch.status_code, fetch.body, fetch.content_type or None, fetch.headers,
+                    url or fetch.url, fetch.final_url)
 
 
 class SpiderAutoRouter:
@@ -389,6 +401,12 @@ class SpiderAutoRouter:
         start_time = time.monotonic()
         trace_id = uuid.uuid4().hex
         result = await self._fetch_inner(url, domain=domain)
+        if result.diagnosis is None:
+            if result.fetch is not None:
+                result.diagnosis = _diagnose_fetch(result.fetch, url)
+            elif result.error:
+                result.diagnosis = dg.diagnose_error(result.error)
+        diag = result.diagnosis.to_dict() if result.diagnosis is not None else None
         # Emit trace span if tracer is active
         if self.tracer and self.tracer.run_number:
             duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -397,14 +415,20 @@ class SpiderAutoRouter:
                 entry = self.cache.get(domain)
                 if entry:
                     slot = next((s for s in entry.slots if s.slot_id == result.slot_id), None)
+            status_code = result.fetch.status_code if result.fetch else 0
+            if diag is not None:
+                # A transport error is an error (or timeout) span, never a priced success.
+                status = _outcome.outcome(diag, status_code)
+            else:
+                status = "blocked" if result.blocked else "success"
             self.tracer.record_span(
                 trace_id=trace_id,
                 url=url,
                 domain=domain,
                 component="spider",
                 operation="fetch",
-                status="success" if not result.blocked else "blocked",
-                status_code=result.fetch.status_code if result.fetch else 0,
+                status=status,
+                status_code=status_code,
                 duration_ms=duration_ms,
                 routing_method=result.routing_method,
                 slot_id=result.slot_id or "",
@@ -412,6 +436,7 @@ class SpiderAutoRouter:
                 proxy_session_id=slot.proxy_session_id if slot else "",
                 response_bytes=len(result.fetch.body) if result.fetch and result.fetch.body else 0,
                 error_message=result.error or "",
+                diagnosis=diag,
             )
             result.trace_id = trace_id
         return result
@@ -443,10 +468,8 @@ class SpiderAutoRouter:
             # solve can't fix a dead connection. Remember it so the solve step
             # can back off instead of escalating.
             transport_error = exc
-        if light_result and not is_blocked(
-            light_result.status_code, light_result.body,
-            content_type=light_result.content_type, headers=light_result.headers,
-        ):
+        light_diag = _diagnose_fetch(light_result, url) if light_result else None
+        if light_result and not light_diag.blocked:
             # A cookieless 200 here is often a warm-IP fluke: hard domains like
             # DigiKey serve ~8% of cookieless requests on Evomi IPs that recently
             # passed a challenge. set_light() REPLACES the entry and discards
@@ -464,9 +487,10 @@ class SpiderAutoRouter:
                 routing_method="httpcloak_light",
                 blocked=False,
                 domain_level="cookies" if has_pool else "light",
+                diagnosis=light_diag,
             )
 
-        # If a non-None light_result reached here it FAILED the is_blocked check
+        # If a non-None light_result reached here the classifier called it a block
         # above — i.e. it was a genuine block response, not a transport error.
         # That distinction gates whether the solve step is worthwhile below.
         light_blocked = light_result is not None
@@ -521,10 +545,8 @@ class SpiderAutoRouter:
                     # let the solve step back off rather than escalate.
                     transport_error = exc
                 else:
-                    if not is_blocked(
-                        result.status_code, result.body,
-                        content_type=result.content_type, headers=result.headers,
-                    ):
+                    replay_diag = _diagnose_fetch(result, url)
+                    if not replay_diag.blocked:
                         self.cache.record_slot_success(domain, slot.slot_id)
                         self._report_ip_outcome(
                             domain=domain, slot=slot, outcome="success",
@@ -538,6 +560,7 @@ class SpiderAutoRouter:
                             blocked=False,
                             domain_level="cookies",
                             slot_id=slot.slot_id,
+                            diagnosis=replay_diag,
                         )
                     self.cache.record_slot_failure(
                         domain, slot.slot_id, status_code=result.status_code,
@@ -590,10 +613,26 @@ class SpiderAutoRouter:
                 blocked=False,
                 domain_level=level or "light",
                 error=str(transport_error),
+                diagnosis=dg.diagnose_error(transport_error),
             )
 
         block_status = result.status_code if result else 403
         seen = result if result is not None else light_result
+        seen_diag = _diagnose_fetch(seen, url) if seen is not None else None
+        # A rate limit is not a challenge: a solve cannot lift it and costs a browser or a
+        # paid token. Hand the response back so the middleware slows down and retries.
+        if seen_diag is not None and seen_diag.info.move == dg.SLOW_DOWN:
+            logger.info(
+                "AutoRouter: %s rate limited at httpcloak (status=%d); backing off instead "
+                "of solving", domain, seen.status_code,
+            )
+            return RouteResult(
+                fetch=seen,
+                routing_method="httpcloak_cookies" if seen is result else "httpcloak_light",
+                blocked=True,
+                domain_level=level or "light",
+                diagnosis=seen_diag,
+            )
         if seen is not None:
             family = challenge_family(seen.status_code, seen.body, headers=seen.headers)
             if family:
@@ -638,6 +677,7 @@ class SpiderAutoRouter:
             blocked=True,
             domain_level="cookies",
             error="solve failed",
+            diagnosis=seen_diag,
         )
 
     async def _try_one_solve(self, domain: str, url: str):
@@ -701,12 +741,18 @@ class SpiderAutoRouter:
                 blocked=True,
                 domain_level="cookies",
                 error=str(exc),
+                diagnosis=dg.most_informative([
+                    _diagnose_fetch(original_result, url) if original_result else None,
+                    dg.diagnose_error(exc),
+                ]),
             )
 
-        if is_blocked(
-            replay.status_code, replay.body,
-            content_type=replay.content_type, headers=replay.headers,
-        ):
+        replay_diag = _diagnose_fetch(replay, url)
+        if replay_diag.blocked:
+            if replay_diag.cls in (dg.CHALLENGE, dg.EDGE_DENY):
+                # The site refused the clearance a solve just earned.
+                replay_diag = dg.Diagnosis(dg.CLEARANCE_REFUSED, replay_diag.vendor,
+                                           replay_diag.status, "replay_refused")
             self.cache.record_slot_failure(
                 domain, slot.slot_id, status_code=replay.status_code,
             )
@@ -720,6 +766,7 @@ class SpiderAutoRouter:
                 blocked=True,
                 domain_level="cookies",
                 error=f"replay blocked (status={replay.status_code})",
+                diagnosis=replay_diag,
             )
 
         self._report_ip_outcome(
@@ -731,4 +778,5 @@ class SpiderAutoRouter:
             blocked=False,
             domain_level="cookies",
             slot_id=slot.slot_id,
+            diagnosis=replay_diag,
         )

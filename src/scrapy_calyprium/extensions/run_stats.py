@@ -20,6 +20,12 @@ Required settings:
 
 Optional:
     CALYPRIUM_STATS_INTERVAL (seconds, default 30)
+
+Each final response is also counted by how it was served (``routing_method_counts``:
+``meta['calyprium_routing_method']``, Mimic's routing, or ``veil_proxy`` / ``direct``)
+and by its diagnosis class (``failure_class_counts``, and the Scrapy stat
+``calyprium/class/<class>``; see ``scrapy_calyprium._outcome``). Responses the Mimic
+middleware retries are not final; they are counted as ``calyprium/retry/<class>``.
 """
 from __future__ import annotations
 
@@ -35,9 +41,23 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
+from scrapy_calyprium import _outcome
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
+
+
+def routing_method(request) -> str:
+    """How an attempt was served: what the Mimic middleware recorded, else the download path."""
+    meta = getattr(request, "meta", None) or {}
+    method = meta.get(_outcome.ROUTING_METHOD) or meta.get("mimic_local_route")
+    if not method:
+        routing = meta.get("calyprium_routing")
+        if isinstance(routing, dict):
+            method = routing.get("routing_method")
+    if not method:
+        method = "veil_proxy" if meta.get("proxy") else "direct"
+    return str(method)
 
 
 class CalypriumRunStats:
@@ -71,6 +91,9 @@ class CalypriumRunStats:
         self._bytes_downloaded = 0
         self._status_counts: Counter = Counter()
         self._routing_counts: Counter = Counter()
+        self._class_counts: Counter = Counter()
+        # Scrapy's stats collector (set in from_crawler), for calyprium/class/<class>.
+        self.stats = None
         self._started_at = datetime.now(timezone.utc)
 
         self._stop = threading.Event()
@@ -117,6 +140,7 @@ class CalypriumRunStats:
 
         ext = cls(forge_url, secret, user_id, slug, job_id, run_number, interval,
                   api_key=api_key)
+        ext.stats = getattr(crawler, "stats", None)
         crawler.signals.connect(ext.spider_opened, signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signals.spider_closed)
         crawler.signals.connect(ext.response_received, signals.response_received)
@@ -131,7 +155,17 @@ class CalypriumRunStats:
             self._request_count += 1
 
     def response_received(self, response, request, spider):
+        try:
+            failure_class = _outcome.for_response(request, response).get("class")
+        except Exception as exc:  # noqa: BLE001 -- stats never break a crawl
+            logger.debug("CalypriumRunStats: no diagnosis for %s: %s",
+                         getattr(response, "url", "?"), exc)
+            failure_class = None
+        if failure_class and self.stats is not None:
+            self.stats.inc_value(f"calyprium/class/{failure_class}")
         with self._lock:
+            if failure_class:
+                self._class_counts[failure_class] += 1
             self._response_count += 1
             self._status_counts[str(response.status)] += 1
             # Scrapy's Response has .body (bytes) — use len() for size.
@@ -145,10 +179,8 @@ class CalypriumRunStats:
                         self._bytes_downloaded += int(cl)
                     except ValueError:
                         pass
-            # Routing method from our own middleware (if set)
-            method = request.meta.get("calyprium_routing_method")
-            if method:
-                self._routing_counts[method] += 1
+            # How it was served (the Mimic middleware's record, else the download path).
+            self._routing_counts[routing_method(request)] += 1
 
     def item_scraped(self, item, response, spider):
         with self._lock:
@@ -204,6 +236,8 @@ class CalypriumRunStats:
                 "bytes_downloaded": self._bytes_downloaded,
                 "status_code_counts": dict(self._status_counts),
                 "routing_method_counts": dict(self._routing_counts),
+                # Not read by Forge yet (an older Forge ignores it).
+                "failure_class_counts": dict(self._class_counts),
                 "window_start": self._started_at.isoformat(),
                 "window_end": datetime.now(timezone.utc).isoformat(),
             }
