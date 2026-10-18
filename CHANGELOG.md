@@ -1,3 +1,10 @@
+# [1.33.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.32.0...v1.33.0) (2026-10-18)
+
+
+### Features
+
+* **prism:** a spider with no url source reads its allowed domain's urls from prism ([76831bf](https://github.com/Aarkc/scrapy-calyprium/commit/76831bf8f8578d49b7ed738fe04210da21473ba4))
+
 # [1.32.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.31.0...v1.32.0) (2026-10-18)
 
 
