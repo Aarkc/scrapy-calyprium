@@ -146,6 +146,7 @@ All middleware requires a valid API key. Set it via:
 | `CALYPRIUM_RETRY_TIMES` | Retries per request | `2` |
 | `CALYPRIUM_RETRY_DELAY` | Seconds before a `retry_later`; base of the `slow_down` backoff | `5` |
 | `CALYPRIUM_RETRY_MAX_DELAY` | Cap on any retry delay (seconds) | `60` |
+| `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: how long to wait for Prism to index an unknown domain before closing as `prism_no_urls` (ends 30 s before `CLOSESPIDER_TIMEOUT`) | `900` |
 
 ## Development
 

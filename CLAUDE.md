@@ -92,6 +92,7 @@ Each `CookieSlot` in the `DomainCache` has:
 | `VEIL_PROXY_TYPE` | Veil username `-type_`; also the tier (`fast` / `residential`) `CalypriumRequestTracer` puts on Veil-path spans |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
 | `CALYPRIUM_RETRY_ENABLED`, `CALYPRIUM_RETRY_TIMES`, `CALYPRIUM_RETRY_DELAY`, `CALYPRIUM_RETRY_MAX_DELAY` | Calyprium retry in `MimicBrowserMiddleware` (on by default; 2 retries, 5 s base, 60 s cap) |
+| `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: wait for Prism to index an unknown domain (404) before closing as `prism_no_urls` (default 900 s); refill failures back off 2 s doubling to 60 s |
 | `SNAPSHOTS_ENABLED`, `SNAPSHOTS_SAMPLE`, `SNAPSHOTS_ERRORS`, `SNAPSHOTS_MAX_BYTES` | `SnapshotRecorder` extension: gzipped sample/error/blocked pages uploaded to `{run prefix}/snapshots/{sha256}.html.gz` and reported to forge `POST /jobs/spiders/{slug}/runs/{n}/snapshots` at close |
 
 ## Code Conventions
