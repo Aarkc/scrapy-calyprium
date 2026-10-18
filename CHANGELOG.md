@@ -1,3 +1,15 @@
+# [1.32.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.31.0...v1.32.0) (2026-10-18)
+
+
+### Bug Fixes
+
+* **prism:** back off refill failures and give up on unindexed domains ([30a5440](https://github.com/Aarkc/scrapy-calyprium/commit/30a544064a784344f883fb80fba8298969dfa9d8))
+
+
+### Features
+
+* **diagnosis:** keep each fetch's failure class and retry by its move ([eb35974](https://github.com/Aarkc/scrapy-calyprium/commit/eb35974df9943cf64b8292f4988d75694c5b5606))
+
 # [1.31.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.30.0...v1.31.0) (2026-10-17)
 
 
