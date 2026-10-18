@@ -309,8 +309,8 @@ class SpectreMiddleware:
         that happened to contain both words (DigiKey product pages
         contain both 100+ times). Every false positive cleared the
         fingerprint cache and forced a Spectre re-roll. Now uses the
-        AAR-15 block_detect.is_blocked() helper which checks for real
-        challenge markers.
+        attempt's diagnosis (the fetch layer's shared classifier, via the
+        Mimic middleware or block_detect.is_blocked()).
 
         Block-detection can be turned off entirely with SPECTRE_BLOCK_DETECTION
         = False (for clean JSON/XML API spiders) or skipped per-request with
@@ -320,8 +320,14 @@ class SpectreMiddleware:
             return response
 
         blocked = False
+        # The attempt's diagnosis, when the Mimic middleware kept one (Mimic's own verdict,
+        # made with headers the Scrapy response no longer carries).
+        diagnosis = request.meta.get("calyprium_diagnosis")
 
-        if hasattr(response, "body"):
+        if isinstance(diagnosis, dict) and diagnosis.get("class"):
+            from scrapy_calyprium.routing.block_detect import BLOCKED_CLASSES
+            blocked = diagnosis["class"] in BLOCKED_CLASSES
+        elif hasattr(response, "body"):
             try:
                 from scrapy_calyprium.routing.block_detect import is_blocked
                 content_type = response.headers.get("Content-Type", b"").decode(

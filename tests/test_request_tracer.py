@@ -40,7 +40,12 @@ def _spans(tracer):
     return list(tracer._buffer)
 
 
-def _response(request, status=200, body=b"<html>ok</html>", flags=None):
+# A real page: the classifier calls a tiny titled-less stub like "<html>ok</html>" a soft block.
+PAGE = (b"<html><head><title>Item | Shop</title></head><body><nav></nav><main>"
+        + b"<a href='/p'>product</a>" * 5 + b"</main></body></html>")
+
+
+def _response(request, status=200, body=PAGE, flags=None):
     return HtmlResponse(request.url, status=status, body=body, request=request,
                         flags=flags or [])
 
@@ -80,7 +85,8 @@ def test_veil_proxy_response_is_traced_via_signal():
     assert span["network"] == "datacenter"
     assert span["status"] == "success"
     assert span["status_code"] == 200
-    assert span["response_bytes"] == len(b"<html>ok</html>")
+    assert span["response_bytes"] == len(PAGE)
+    assert (span["failure_class"], span["attempt"]) == ("ok", 0)
     assert span["duration_ms"] == 250
     assert span["domain"] == "shop.example"
     assert span["run_number"] == 7
@@ -149,7 +155,7 @@ async def test_mimic_fetch_routing_becomes_span_fields():
     mw = _mimic(tracer)
     req = Request("https://cf.example/item", meta={"proxy": "http://gw:8080"})
     client = _mimic_client({
-        "html": "<html>rendered</html>", "status_code": 200,
+        "html": PAGE.decode(), "status_code": 200,
         "headers": {"content-type": "text/html"},
         "routing": {
             "routing_method": "browser_fallback", "engine": "camoufox",

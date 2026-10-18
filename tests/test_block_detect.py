@@ -1,14 +1,17 @@
 """Tests for the spider-side block detector.
 
-These mirror the server-side `mimic.routing.httpcloak.is_blocked` tests so the
-SDK and Mimic stay in sync. The SDK adds bytes-input handling for binary
-content, which is the main thing the spider-side path needs to get right.
+``is_blocked`` delegates to the fetch layer's shared classifier (routing/diagnosis.py):
+blocked = the diagnosis class is one of block_detect.BLOCKED_CLASSES. Where the old
+signature/header heuristics and the classifier disagree, these tests follow the
+classifier and say so ("classifier:"). The SDK adds bytes-input handling for binary
+content and Scrapy-style headers.
 
 AAR-15.
 """
 import pytest
 
-from scrapy_calyprium.routing.block_detect import is_blocked
+from scrapy_calyprium.routing import diagnosis as dg
+from scrapy_calyprium.routing.block_detect import BLOCKED_CLASSES, diagnose, is_blocked
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +84,16 @@ class TestStatusCodes:
         body = "<html></html>"
         assert is_blocked(429, body) is True
 
-    def test_503_small_body_blocked(self):
+    def test_503_small_body_without_a_vendor_is_a_site_error(self):
+        # classifier: a bare 503 is the site's own error (retried later), not a block;
+        # was blocked by status alone.
         body = "<html></html>"
-        assert is_blocked(503, body) is True
+        assert is_blocked(503, body) is False
+        assert diagnose(503, body).cls == dg.ORIGIN_ERROR
+
+    def test_503_stub_from_a_bot_vendor_is_blocked(self):
+        h = {"Server": "cloudflare", "CF-RAY": "8a1b"}
+        assert is_blocked(503, "<html></html>", "text/html", h) is True
 
     def test_404_small_body_not_blocked(self):
         # 404 is a real not-found, not a bot block
@@ -126,9 +136,10 @@ class TestContentTypeGate:
         'access denied to unauthenticated bots. recaptcha not required."}]}'
     )
 
-    def test_json_marker_false_positive_without_content_type(self):
-        # Documents the pre-fix behavior: markers in a JSON body trip it.
-        assert is_blocked(200, self.JSON_WITH_MARKERS) is True
+    def test_json_markers_without_content_type_are_not_a_block(self):
+        # classifier: a JSON body is never a challenge page, even without a content type
+        # (the old signature list tripped on "automated access").
+        assert is_blocked(200, self.JSON_WITH_MARKERS) is False
 
     def test_json_marker_suppressed_with_json_content_type(self):
         assert (
@@ -143,9 +154,13 @@ class TestContentTypeGate:
     def test_xml_content_type_suppressed(self):
         assert is_blocked(200, "<a>access denied</a>", content_type="text/xml") is False
 
-    def test_error_status_still_blocks_regardless_of_content_type(self):
-        # A 403 is a block by status — the gate must NOT rescue error statuses.
-        assert is_blocked(403, '{"error":"forbidden"}', content_type="application/json") is True
+    def test_error_statuses_on_api_answers(self):
+        # classifier: a JSON 403 with no bot-vendor sign is the API refusing us (a wall,
+        # not retried), not a bot block; was blocked by status. A 429 is a rate limit.
+        assert is_blocked(403, '{"error":"forbidden"}', content_type="application/json") is False
+        assert diagnose(403, '{"error":"forbidden"}', "application/json").cls == dg.LOGIN_WALL
+        cf = {"Server": "cloudflare", "CF-RAY": "1"}
+        assert is_blocked(403, '{"error":"forbidden"}', "application/json", cf) is True
         assert is_blocked(429, b"", content_type="application/json") is True
 
     def test_html_content_type_still_runs_heuristics(self):
@@ -169,9 +184,13 @@ class TestWafHeaderGate:
         h = {"Server": "Microsoft-IIS/10.0", "Content-Type": "application/xml"}
         assert is_blocked(403, b"rate limited", headers=h) is False
 
-    def test_nginx_429_not_blocked(self):
+    def test_nginx_429_is_a_rate_limit(self):
+        # classifier: any 429 is rate_limited, which counts as blocked (its move is to slow
+        # down, never to solve); was not blocked without a WAF header.
         h = {"Server": "nginx", "Content-Type": "text/plain"}
-        assert is_blocked(429, b"too many requests", headers=h) is False
+        assert is_blocked(429, b"too many requests", headers=h) is True
+        d = diagnose(429, b"too many requests", headers=h)
+        assert (d.cls, d.info.move) == (dg.RATE_LIMITED, dg.SLOW_DOWN)
 
     def test_akamai_server_403_blocked(self):
         h = {"Server": "AkamaiGHost", "Content-Type": "text/html"}
@@ -205,7 +224,49 @@ class TestWafHeaderGate:
 
     def test_scrapy_style_list_of_bytes_headers(self):
         # Scrapy's Headers yields {bytes: [bytes]} — must normalise cleanly.
-        h = {b"Server": [b"Microsoft-IIS/10.0"]}
+        h = {b"Server": [b"Microsoft-IIS/10.0"], b"Content-Type": [b"application/xml"]}
         assert is_blocked(403, b"rate limited", headers=h) is False
         h2 = {b"Set-Cookie": [b"_abck=1~-1~2; Path=/"]}
         assert is_blocked(403, b"blocked", headers=h2) is True
+        assert diagnose(403, b"blocked", headers=h2).vendor == dg.AKAMAI
+
+    def test_bare_403_page_without_content_type_is_an_edge_deny(self):
+        # classifier: a small 403 page is a deny (low confidence without a vendor), even from
+        # IIS; the old header gate let it through when no WAF header was present.
+        h = {b"Server": [b"Microsoft-IIS/10.0"]}
+        d = diagnose(403, b"rate limited", headers=h)
+        assert (d.cls, d.confidence) == (dg.EDGE_DENY, "low")
+
+
+class TestClassifierDelegation:
+    """is_blocked is the shared classifier's verdict, nothing more."""
+
+    def test_blocked_classes_match_the_classifier(self):
+        for cls in dg.CLASSES:
+            assert (cls in BLOCKED_CLASSES) == dg.Diagnosis(cls).blocked, cls
+
+    @pytest.mark.parametrize("status,body,ctype", [
+        (404, "<html><title>Not found</title></html>", "text/html"),
+        (500, "<html>error</html>", "text/html"),
+        (451, "<html>legal</html>", "text/html"),
+        (401, "", "text/html"),
+    ])
+    def test_not_found_errors_and_walls_are_not_blocks(self, status, body, ctype):
+        assert is_blocked(status, body, ctype) is False
+
+    def test_vendor_words_on_a_real_page_are_not_a_block(self):
+        # classifier: a passive vendor tag on a real page is fine; the old signature list
+        # flagged any page mentioning "datadome" or "recaptcha".
+        body = ("<html><head><title>Widget | Shop</title><script src='https://js.datadome.co/"
+                "tags.js'></script></head><body><nav></nav><main>" + "<a href='/x'>x</a>" * 10
+                + "</main></body></html>")
+        assert is_blocked(200, body, "text/html") is False
+
+    def test_redirect_stub_is_not_a_soft_block(self):
+        d = diagnose(301, "<html>moved</html>", "text/html", {"Location": "/new"})
+        assert d.cls == dg.OK
+
+    def test_huge_document_is_not_decoded_whole(self):
+        pdf = b"%PDF-1.7\n" + b"\x00" * 5_000_000
+        assert diagnose(200, pdf).cls == dg.OK
+        assert diagnose(200, pdf, "application/pdf").cls == dg.OK

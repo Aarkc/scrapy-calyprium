@@ -13,7 +13,8 @@ from unittest import mock
 import pytest
 
 from scrapy_calyprium.routing import chrome_preset
-from scrapy_calyprium.routing.block_detect import challenge_family, is_blocked
+from scrapy_calyprium.routing import diagnosis as dg
+from scrapy_calyprium.routing.block_detect import challenge_family, diagnose, is_blocked
 from scrapy_calyprium.routing.chrome_preset import ensure_chrome_preset, replay_preset, sec_ch_ua
 from scrapy_calyprium.routing.domain_cache import DomainCache
 from scrapy_calyprium.routing.local_fetch import LocalFetchResult
@@ -65,7 +66,10 @@ class TestChallengeFamily:
         # Before: no "kasada" text, no known header or cookie -> read as a plain rate limit.
         assert is_blocked(429, KASADA, content_type="text/html", headers=KASADA_HEADERS) is True
         assert is_blocked(429, KASADA, content_type="text/html", headers={"content-type": "text/html"}) is True
-        assert is_blocked(429, b"slow down", content_type="text/html", headers={"server": "nginx"}) is False
+        # A plain 429 is a rate limit (blocked, but its move is to slow down, never a solve);
+        # Kasada's 429 is a challenge.
+        assert diagnose(429, b"slow down", "text/html", {"server": "nginx"}).cls == dg.RATE_LIMITED
+        assert diagnose(429, KASADA, "text/html", KASADA_HEADERS).cls == dg.CHALLENGE
 
 
 @pytest.mark.asyncio

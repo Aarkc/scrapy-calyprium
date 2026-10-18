@@ -5,8 +5,8 @@ Keeps a small, bounded sample of what the spider actually saw:
 * ``sample`` — the first ``SNAPSHOTS_SAMPLE`` successful HTML responses
   (content-type html, status < 400);
 * ``error`` / ``blocked`` — up to ``SNAPSHOTS_ERRORS`` responses with status
-  >= 400 or flagged by the SDK's block detection (``routing.block_detect``).
-  ``blocked`` when ``is_blocked()`` says so, ``error`` otherwise.
+  >= 400 or blocked by the attempt's diagnosis (the shared classifier, see ``_outcome``).
+  ``blocked`` when the diagnosis is a block, ``error`` otherwise.
 
 Each page is gzipped and uploaded through the same forge ``/s3`` gateway, with
 the same run credentials, as ``S3BatchPipeline``, next to the run's batches::
@@ -63,7 +63,7 @@ from scrapy.exceptions import NotConfigured
 
 from scrapy_calyprium._forge import ForgeAuth
 from scrapy_calyprium.pipelines.s3_batch import S3Config, make_s3_client, resolve_s3_config
-from scrapy_calyprium.routing.block_detect import is_blocked
+from scrapy_calyprium.routing.block_detect import BLOCKED_CLASSES, is_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,15 @@ def _header(headers: Any, name: str) -> str:
     if isinstance(value, bytes):
         return value.decode("latin-1", "replace")
     return value or ""
+
+
+def _meta_diagnosis(response: Any) -> Optional[Dict[str, Any]]:
+    """The attempt's diagnosis kept in meta (the Mimic middleware's, see ``_outcome``)."""
+    try:
+        diagnosis = response.meta.get("calyprium_diagnosis")
+    except AttributeError:  # a response with no request
+        return None
+    return diagnosis if isinstance(diagnosis, dict) and diagnosis.get("class") else None
 
 
 def _headers_dict(headers: Any) -> Optional[Dict[str, str]]:
@@ -229,10 +238,14 @@ class SnapshotRecorder:
         if status < 400 and not is_html:
             return None
         if self._errors < self.error_limit:
-            blocked = is_blocked(
-                status, response.body or b"", content_type or None,
-                _headers_dict(response.headers),
-            )
+            diagnosis = _meta_diagnosis(response)
+            if diagnosis is not None:
+                blocked = diagnosis["class"] in BLOCKED_CLASSES
+            else:
+                blocked = is_blocked(
+                    status, response.body or b"", content_type or None,
+                    _headers_dict(response.headers),
+                )
             if blocked:
                 return "blocked"
             if status >= 400:

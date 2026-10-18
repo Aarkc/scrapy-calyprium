@@ -15,7 +15,16 @@ request a spider pays for must produce exactly one:
   download path: ``veil_proxy`` (tier ``fast``, or ``residential`` when
   ``VEIL_PROXY_TYPE`` is residential) or ``direct``.
 * Transport errors (timeouts, resets) are traced by the Mimic middleware via
-  :meth:`CalypriumRequestTracer.trace_exception`, one span per failed attempt.
+  :meth:`CalypriumRequestTracer.trace_exception`, one span per failed attempt,
+  and so is a response the middleware retries (``response_received`` never
+  fires for it) via :meth:`CalypriumRequestTracer.trace_response`.
+
+A span's outcome (``status``) is the attempt's diagnosis (the fetch layer's
+shared classifier, see ``_outcome``): ``blocked`` iff its class is a block,
+``success`` for a fetched page, ``error`` / ``timeout`` otherwise. Each span
+also carries ``failure_class``, ``vendor`` and ``evidence`` (the diagnosis),
+``rung`` (Mimic's ladder rung, when it reports one) and ``attempt`` (the
+Calyprium retries made before it). An older Forge ignores the extra fields.
 
 Spans are buffered (bounded: beyond ``MAX_BUFFER`` new spans are dropped and
 counted) and POSTed to Forge's ``/jobs/spiders/{slug}/runs/{n}/traces``
@@ -48,7 +57,7 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
-from scrapy_calyprium import _trace
+from scrapy_calyprium import _outcome, _trace
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
@@ -101,7 +110,12 @@ def _escalated_tier(value: str, network: str) -> str:
     return "residential" if network == "residential" else "fast"
 
 
-def _outcome(status_code: int, blocked: bool = False) -> str:
+def _outcome_of(status_code: int, blocked: bool = False,
+                diagnosis: Optional[Dict[str, Any]] = None) -> str:
+    """A span's status: the diagnosis when there is one, else the status code (and a
+    routing ``blocked`` flag)."""
+    if diagnosis:
+        return _outcome.outcome(diagnosis, status_code)
     if blocked or status_code in _BLOCK_STATUSES:
         return "blocked"
     if 200 <= status_code < 400:
@@ -219,6 +233,9 @@ class CalypriumRequestTracer:
         escalation_reason: str = "",
         trace_ids: Optional[tuple] = None,
         start: Optional[float] = None,
+        diagnosis: Optional[Dict[str, Any]] = None,
+        rung: Optional[int] = None,
+        attempt: Optional[int] = None,
     ) -> None:
         """Buffer a span. Thread-safe — called from Scrapy's async context.
 
@@ -226,7 +243,10 @@ class CalypriumRequestTracer:
         only when known; Forge derives what is missing. ``trace_ids`` (trace id,
         attempt span id, request span id) place the attempt in its request's
         trace (default: the attempt current in this task, see ``_trace``);
-        ``start`` is when it began (epoch seconds)."""
+        ``start`` is when it began (epoch seconds). ``diagnosis`` (the attempt's,
+        see ``_outcome``) gives ``failure_class``/``vendor``/``evidence``;
+        ``rung`` is Mimic's ladder rung when known; ``attempt`` the Calyprium
+        retries before this attempt (default: the one current in this task)."""
         span = {
             "trace_id": trace_id,
             "parent_span_id": parent_span_id,
@@ -255,6 +275,17 @@ class CalypriumRequestTracer:
         ):
             if value:
                 span[key] = value
+        if isinstance(diagnosis, dict) and diagnosis.get("class"):
+            span["failure_class"] = str(diagnosis["class"])
+            for key in ("vendor", "evidence"):
+                if diagnosis.get(key):
+                    span[key] = str(diagnosis[key])[:200]
+        if rung is not None:
+            try:
+                span["rung"] = int(rung)
+            except (TypeError, ValueError):
+                pass
+        span["attempt"] = int(attempt if attempt is not None else _outcome.CURRENT_ATTEMPT.get())
         ids = trace_ids or _trace.ATTEMPT.get()
         if ids and len(ids) == 3:
             began = start if start is not None else time.time() - duration_ms / 1000
@@ -307,6 +338,8 @@ class CalypriumRequestTracer:
                          getattr(request, "url", "?"), exc)
 
     def trace_response(self, request, response) -> None:
+        """One span for a response (from ``response_received``, or from the Mimic
+        middleware for a response it retries instead of returning)."""
         if not self._should_trace(request):
             return
         if "cached" in (getattr(response, "flags", None) or ()):
@@ -314,11 +347,17 @@ class CalypriumRequestTracer:
         routing = self._routing(request)
         status_code = int(getattr(response, "status", 0) or 0)
         body = getattr(response, "body", b"") or b""
+        diagnosis = _outcome.for_response(request, response)
+        status = _outcome_of(status_code, bool(routing.get("blocked")), diagnosis)
         self._record(
             request, routing,
-            status=_outcome(status_code, bool(routing.get("blocked"))),
+            status=status,
             status_code=status_code,
             response_bytes=len(body) or int(routing.get("bytes") or 0),
+            # Mimic's own error (x-mimic-error) explains a failed attempt.
+            error_message="" if status == "success"
+            else str(request.meta.get(_outcome.FETCH_ERROR) or "")[:500],
+            diagnosis=diagnosis,
         )
 
     def trace_exception(self, request, exception: BaseException) -> None:
@@ -334,6 +373,7 @@ class CalypriumRequestTracer:
                 status="timeout" if timed_out else "error",
                 status_code=0, response_bytes=0,
                 error_message=f"{name}: {exception}"[:500],
+                diagnosis=_outcome.of_error(exception),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("CalypriumRequestTracer: exception trace failed: %s", exc)
@@ -366,6 +406,7 @@ class CalypriumRequestTracer:
                 "escalation_reason": str(mimic.get("escalation_reason") or ""),
                 "blocked": bool(mimic.get("blocked")),
                 "bytes": mimic.get("bytes") or 0,
+                "rung": mimic.get("rung"),
             }
         if meta.get("proxy"):
             return {"routing_method": "veil_proxy", "engine": "scrapy",
@@ -374,7 +415,8 @@ class CalypriumRequestTracer:
                 "network": "direct", "tier": "fast"}
 
     def _record(self, request, routing: Dict[str, Any], *, status: str,
-                status_code: int, response_bytes: int, error_message: str = "") -> None:
+                status_code: int, response_bytes: int, error_message: str = "",
+                diagnosis: Optional[Dict[str, Any]] = None) -> None:
         meta = request.meta
         t0 = meta.get("_calyprium_t0")
         if t0 is not None:
@@ -403,6 +445,9 @@ class CalypriumRequestTracer:
             network=routing.get("network", ""),
             escalated_from=routing.get("escalated_from", ""),
             escalation_reason=routing.get("escalation_reason", ""),
+            diagnosis=diagnosis,
+            rung=routing.get("rung"),
+            attempt=_outcome.attempt_number(request),
         )
 
     # -- Lifecycle ---------------------------------------------------------
