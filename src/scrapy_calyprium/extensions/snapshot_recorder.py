@@ -16,6 +16,13 @@ request also its ``request_body`` (form and JSON fields whose names look like cr
 redacted, then capped at ``SNAPSHOTS_MAX_REQUEST_BODY`` characters). A forge that predates the
 ``api`` kind (HTTP 400/422) is sent the report again without it, so pages are never lost.
 
+Every snapshot also names the ``callback`` that parsed it, so an offline repair test replays the
+page into the same code: PrismSitemapSpider's item wrappers are recorded as ``parse_item``. Pages
+handled by the SDK's own navigation (link discovery, Prism's URL listing) are never ``sample``s,
+and the SDK's internal requests (``meta['_internal']``: Prism's API, scans) are never saved:
+a discovery spider's first pages are listing pages, and a repair agent shown those wrote a fix
+for listing pages that the live run never sends to ``parse_item`` (canaan_parts, 2026-10-19).
+
 Each page is gzipped and uploaded through the same forge ``/s3`` gateway, with
 the same run credentials, as ``S3BatchPipeline``, next to the run's batches::
 
@@ -89,6 +96,25 @@ _API_TYPES = ("json", "xml")
 _SECRET_FIELD = re.compile(r"pass|secret|token|api[_-]?key|auth|session|cookie|credential|otp|pin$",
                            re.I)
 REDACTED = "[redacted]"
+# PrismSitemapSpider's wrappers that hand a response to the spider's parse_item.
+_ITEM_WRAPPERS = {
+    "_parse_and_maybe_refill": "parse_item",
+    "_parse_and_maybe_refill_targets": "parse_item",
+    "_parse_and_maybe_refill_recrawl": "parse_item",
+    "_discovery_parse": "parse_item",
+}
+# The SDK's own navigation callbacks: their pages are not what the spider's code parses.
+_NAVIGATION_CALLBACKS = {"_discovery_page", "_handle_prism_page", "_handle_discovery_seeds",
+                         "_handle_prism_scan"}
+
+
+def callback_name(request: Any) -> str:
+    """The name of the spider callback ``request`` goes to (``parse`` by default)."""
+    cb = getattr(request, "callback", None) if request is not None else None
+    if cb is None:
+        return "parse"
+    name = getattr(cb, "__name__", "") or ""
+    return _ITEM_WRAPPERS.get(name, name)
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CLOSE_TIMEOUT = 30.0
 REPORT_TIMEOUT = 10.0
@@ -104,6 +130,7 @@ class _Pending:
     method: str = "GET"
     content_type: str = ""
     request_body: Optional[str] = None
+    callback: str = "parse"
 
 
 def _redact(value: Any) -> Any:
@@ -293,8 +320,11 @@ class SnapshotRecorder:
             )
         return self._client
 
-    def _classify(self, response: Any) -> Optional[str]:
+    def _classify(self, response: Any, request: Any = None) -> Optional[str]:
         """The snapshot kind for ``response``, or None. Reactor thread: cheap."""
+        meta = getattr(request, "meta", None) or {}
+        if meta.get("_internal"):
+            return None  # the SDK's own requests (Prism's API, scans), not the site's
         if (self._samples >= self.sample_limit and self._errors >= self.error_limit
                 and self._apis >= self.api_limit):
             return None
@@ -318,6 +348,8 @@ class SnapshotRecorder:
             if status >= 400:
                 return "error"
         if status < 400 and is_html and self._samples < self.sample_limit:
+            if callback_name(request) in _NAVIGATION_CALLBACKS:
+                return None  # a listing page the SDK navigates, not one the spider parses
             return "sample"
         return None
 
@@ -333,7 +365,9 @@ class SnapshotRecorder:
     def _capture(self, response: Any, spider: Any, request: Any = None) -> None:
         if self._closed:
             return
-        kind = self._classify(response)
+        if request is None:
+            request = getattr(response, "request", None)
+        kind = self._classify(response, request)
         if kind is None:
             return
         body = response.body or b""
@@ -355,8 +389,6 @@ class SnapshotRecorder:
                 self._errors += 1
             if not self.spider_slug and spider is not None:
                 self.spider_slug = getattr(spider, "name", "") or ""
-        if request is None:
-            request = getattr(response, "request", None)
         pending = _Pending(
             url=response.url,
             status_code=int(response.status),
@@ -367,6 +399,7 @@ class SnapshotRecorder:
             content_type=_header(response.headers, b"Content-Type")[:200],
             request_body=request_body_for_snapshot(request, self.max_request_body)
             if request is not None else None,
+            callback=callback_name(request),
         )
         if self._executor is None:
             self._executor = futures.ThreadPoolExecutor(
@@ -401,6 +434,7 @@ class SnapshotRecorder:
                 "captured_at": pending.captured_at,
                 "method": pending.method,
                 "content_type": pending.content_type,
+                "callback": pending.callback,
             }
             if pending.request_body is not None:
                 entry["request_body"] = pending.request_body
@@ -459,7 +493,7 @@ class SnapshotRecorder:
             if status in (400, 422):
                 # A forge that predates the api kind and the request fields: send it the pages.
                 legacy = [{k: v for k, v in s.items()
-                           if k not in ("method", "content_type", "request_body")}
+                           if k not in ("method", "content_type", "request_body", "callback")}
                           for s in snapshots if s.get("kind") != "api"]
                 if legacy and len(legacy) <= len(snapshots):
                     logger.info("SnapshotRecorder: forge refused the report (%s); sending it "
