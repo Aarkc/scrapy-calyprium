@@ -144,6 +144,46 @@ class TestCapture:
         assert '"input":"KHS400JB"' in body and "s3cr3t" not in body and '"t"' not in body
         assert body.count("[redacted]") == 2
 
+    def test_internal_requests_are_never_saved(self):
+        """Prism's URL listing (JSON) and scans are the SDK's requests, not the site's."""
+        ext = make_ext()
+        req = Request("http://prism/api/domains/x/urls", meta={"_internal": True})
+        resp = TextResponse(url=req.url, status=200, body=b'{"urls": []}', request=req,
+                            headers={"Content-Type": "application/json"}, encoding="utf-8")
+        ext.response_received(resp, req, None)
+        close(ext)
+        assert ext._snapshots == []
+
+    def test_samples_name_their_callback_and_skip_sdk_navigation(self):
+        """A discovery spider's listing pages are not samples; its item pages are, recorded as
+        parse_item (the wrapper's name maps to the spider's callback)."""
+        class Spider:
+            def _discovery_page(self, response):
+                pass
+
+            def _discovery_parse(self, response):
+                pass
+
+            def parse_detail(self, response):
+                pass
+
+        sp = Spider()
+        ext = make_ext()
+
+        def page(url, cb):
+            req = Request(url, callback=cb)
+            return HtmlResponse(url=url, status=200, body=REAL_PAGE, request=req,
+                                headers={"Content-Type": "text/html"}, encoding="utf-8"), req
+
+        for url, cb in [("http://e/list", sp._discovery_page), ("http://e/p/1", sp._discovery_parse),
+                        ("http://e/d/2", sp.parse_detail), ("http://e/home", None)]:
+            resp, req = page(url, cb)
+            ext.response_received(resp, req, None)
+        close(ext)
+        got = {s["url"]: s["callback"] for s in ext._snapshots}
+        assert got == {"http://e/p/1": "parse_item", "http://e/d/2": "parse_detail",
+                       "http://e/home": "parse"}
+
     def test_api_limit(self):
         ext = make_ext({"SNAPSHOTS_API": 2})
         feed(ext, [_resp(body=b'{"n": %d}' % i, ctype=b"application/json",
@@ -263,8 +303,8 @@ class TestReport:
         assert sorted(s["kind"] for s in snaps) == ["error", "sample"]
         for s in snaps:
             assert set(s) == {"url", "status_code", "content_hash", "storage_key",
-                              "kind", "captured_at", "method", "content_type"}
-            assert s["method"] == "GET"
+                              "kind", "captured_at", "method", "content_type", "callback"}
+            assert s["method"] == "GET" and s["callback"] == "parse"
 
     def test_a_forge_without_the_api_kind_still_gets_the_pages(self):
         ext = make_ext()
