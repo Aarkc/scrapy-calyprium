@@ -106,16 +106,23 @@ class TestEnablement:
 
 
 class TestCapture:
-    def test_first_n_html_successes_are_samples(self):
+    def test_samples_are_spread_over_the_run(self):
+        """The 1st, 2nd, 3rd, 10th and 30th page: the first five alone were often one kind of
+        page (degson_parts' sitemap starts with news and events)."""
         fake = FakeS3()
         ext = make_ext(fake=fake)
         feed(ext, [_resp(url=f"http://example.com/{i}", body=REAL_PAGE + str(i).encode())
-                   for i in range(8)])
+                   for i in range(40)])
         close(ext)
         assert kinds(ext) == ["sample"] * 5
-        assert sorted(s["url"] for s in ext._snapshots) == [
-            f"http://example.com/{i}" for i in range(5)]
+        assert sorted((s["url"] for s in ext._snapshots), key=lambda u: int(u.rsplit("/", 1)[1])) == [
+            f"http://example.com/{i}" for i in (0, 1, 2, 9, 29)]
         assert len(fake.objects) == 5
+
+    def test_sample_positions(self):
+        assert sr.sample_positions(0) == []
+        assert sr.sample_positions(5) == [1, 2, 3, 10, 30]
+        assert sr.sample_positions(8) == [1, 2, 3, 10, 30, 100, 300, 1000]
 
     def test_a_json_success_is_an_api_snapshot_and_other_non_html_is_ignored(self):
         ext = make_ext()

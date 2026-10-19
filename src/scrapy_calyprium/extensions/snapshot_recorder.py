@@ -2,8 +2,10 @@
 
 Keeps a small, bounded sample of what the spider actually saw:
 
-* ``sample`` — the first ``SNAPSHOTS_SAMPLE`` successful HTML responses
-  (content-type html, status < 400);
+* ``sample`` — ``SNAPSHOTS_SAMPLE`` successful HTML responses (content-type html, status
+  < 400) spread over the run: the 1st, 2nd, 3rd, 10th, 30th, 100th... page that fits the size
+  cap. The first five alone were often one kind of page (a sitemap's news and event articles
+  for degson_parts, 2026-10-19), which a repair cannot fix anything from;
 * ``error`` / ``blocked`` — up to ``SNAPSHOTS_ERRORS`` responses with status
   >= 400 or blocked by the attempt's diagnosis (the shared classifier, see ``_outcome``).
   ``blocked`` when the diagnosis is a block, ``error`` otherwise;
@@ -106,6 +108,16 @@ _ITEM_WRAPPERS = {
 # The SDK's own navigation callbacks: their pages are not what the spider's code parses.
 _NAVIGATION_CALLBACKS = {"_discovery_page", "_handle_prism_page", "_handle_discovery_seeds",
                          "_handle_prism_scan"}
+
+
+def sample_positions(limit: int) -> List[int]:
+    """Which eligible pages (1-based) become samples: 1, 2, 3, then 10, 30, 100, 300, ..."""
+    out = [1, 2, 3][:max(0, limit)]
+    nxt = 10
+    while len(out) < limit:
+        out.append(nxt)
+        nxt = nxt * 3 if str(nxt).startswith("1") else nxt * 10 // 3
+    return out
 
 
 def callback_name(request: Any) -> str:
@@ -239,6 +251,8 @@ class SnapshotRecorder:
 
         self._lock = threading.Lock()
         self._samples = 0
+        self._sample_seen = 0  # eligible pages so far (see sample_positions)
+        self._positions = set(sample_positions(self.sample_limit))
         self._errors = 0
         self._apis = 0
         self._snapshots: List[Dict[str, Any]] = []
@@ -376,7 +390,8 @@ class SnapshotRecorder:
             return
         with self._lock:
             if kind == "sample":
-                if self._samples >= self.sample_limit:
+                self._sample_seen += 1
+                if self._samples >= self.sample_limit or self._sample_seen not in self._positions:
                     return
                 self._samples += 1
             elif kind == "api":
