@@ -30,6 +30,9 @@ dependencies = [
     "scrapy>=2.11.0",
     "httpx>=0.27.0",
     "boto3>=1.34.0",
+    # Spectre's Chrome identities accept br and zstd; Scrapy decodes them only with these.
+    "brotli>=1.1.0",
+    "zstandard>=0.22.0",
 ]
 
 [project.optional-dependencies]
