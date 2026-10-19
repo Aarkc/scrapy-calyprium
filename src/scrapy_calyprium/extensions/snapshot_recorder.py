@@ -6,7 +6,15 @@ Keeps a small, bounded sample of what the spider actually saw:
   (content-type html, status < 400);
 * ``error`` / ``blocked`` — up to ``SNAPSHOTS_ERRORS`` responses with status
   >= 400 or blocked by the attempt's diagnosis (the shared classifier, see ``_outcome``).
-  ``blocked`` when the diagnosis is a block, ``error`` otherwise.
+  ``blocked`` when the diagnosis is a block, ``error`` otherwise;
+* ``api`` — the first ``SNAPSHOTS_API`` successful JSON or XML responses: a spider that reads a
+  site through its API (vitrohm_parts POSTs part numbers to a search API) had none of those
+  saved, so a repair could not see what the API returns.
+
+Every snapshot carries its request's ``method`` and the response's ``content_type``; a non-GET
+request also its ``request_body`` (form and JSON fields whose names look like credentials are
+redacted, then capped at ``SNAPSHOTS_MAX_REQUEST_BODY`` characters). A forge that predates the
+``api`` kind (HTTP 400/422) is sent the report again without it, so pages are never lost.
 
 Each page is gzipped and uploaded through the same forge ``/s3`` gateway, with
 the same run credentials, as ``S3BatchPipeline``, next to the run's batches::
@@ -40,6 +48,8 @@ Settings:
     SNAPSHOTS_ENABLED        (default True)
     SNAPSHOTS_SAMPLE         (default 5)
     SNAPSHOTS_ERRORS         (default 5)
+    SNAPSHOTS_API            (default 5)
+    SNAPSHOTS_MAX_REQUEST_BODY (default 4096 characters)
     SNAPSHOTS_MAX_BYTES      (default 2 MB; larger bodies are skipped)
     SNAPSHOTS_CLOSE_TIMEOUT  (seconds to wait for pending uploads at close,
                               default 30)
@@ -48,14 +58,17 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import json
 import logging
 import os
+import re
 import threading
 from concurrent import futures
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode
 
 import httpx
 from scrapy import signals
@@ -69,6 +82,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE = 5
 DEFAULT_ERRORS = 5
+DEFAULT_API = 5
+DEFAULT_MAX_REQUEST_BODY = 4096
+_API_TYPES = ("json", "xml")
+# Request-body fields never stored: their names look like credentials.
+_SECRET_FIELD = re.compile(r"pass|secret|token|api[_-]?key|auth|session|cookie|credential|otp|pin$",
+                           re.I)
+REDACTED = "[redacted]"
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CLOSE_TIMEOUT = 30.0
 REPORT_TIMEOUT = 10.0
@@ -81,6 +101,43 @@ class _Pending:
     kind: str
     captured_at: str
     body: bytes
+    method: str = "GET"
+    content_type: str = ""
+    request_body: Optional[str] = None
+
+
+def _redact(value: Any) -> Any:
+    """``value`` with every field whose name looks like a credential replaced."""
+    if isinstance(value, dict):
+        return {k: (REDACTED if isinstance(k, str) and _SECRET_FIELD.search(k) else _redact(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
+def request_body_for_snapshot(request: Any, limit: int = DEFAULT_MAX_REQUEST_BODY) -> Optional[str]:
+    """A non-GET request's body as text, credentials redacted, capped at ``limit`` characters
+    (None for a GET or an empty body). JSON and form bodies are redacted field by field; any
+    other body that mentions a credential-like name is not stored at all."""
+    method = (getattr(request, "method", None) or "GET").upper()
+    raw = getattr(request, "body", b"") or b""
+    if method == "GET" or not raw:
+        return None
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        text = json.dumps(_redact(parsed), separators=(",", ":"), ensure_ascii=False)
+    elif "=" in text and not text.lstrip().startswith(("<", "{", "[")):
+        pairs = parse_qsl(text, keep_blank_values=True)
+        if pairs:
+            text = urlencode([(k, REDACTED if _SECRET_FIELD.search(k) else v) for k, v in pairs])
+    elif _SECRET_FIELD.search(text):
+        return REDACTED
+    return text[:limit]
 
 
 def _header(headers: Any, name: str) -> str:
@@ -133,6 +190,8 @@ class SnapshotRecorder:
         run_number: int,
         sample_limit: int = DEFAULT_SAMPLE,
         error_limit: int = DEFAULT_ERRORS,
+        api_limit: int = DEFAULT_API,
+        max_request_body: int = DEFAULT_MAX_REQUEST_BODY,
         max_bytes: int = DEFAULT_MAX_BYTES,
         close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
         crawler: Any = None,
@@ -144,6 +203,8 @@ class SnapshotRecorder:
         self.run_number = run_number
         self.sample_limit = max(0, sample_limit)
         self.error_limit = max(0, error_limit)
+        self.api_limit = max(0, api_limit)
+        self.max_request_body = max(0, max_request_body)
         self.max_bytes = max_bytes
         self.close_timeout = close_timeout
         self.crawler = crawler
@@ -152,6 +213,7 @@ class SnapshotRecorder:
         self._lock = threading.Lock()
         self._samples = 0
         self._errors = 0
+        self._apis = 0
         self._snapshots: List[Dict[str, Any]] = []
         self._uploaded: set = set()
         self._futures: List[futures.Future] = []
@@ -196,6 +258,9 @@ class SnapshotRecorder:
             run_number=run_number,
             sample_limit=settings.getint("SNAPSHOTS_SAMPLE", DEFAULT_SAMPLE),
             error_limit=settings.getint("SNAPSHOTS_ERRORS", DEFAULT_ERRORS),
+            api_limit=settings.getint("SNAPSHOTS_API", DEFAULT_API),
+            max_request_body=settings.getint("SNAPSHOTS_MAX_REQUEST_BODY",
+                                             DEFAULT_MAX_REQUEST_BODY),
             max_bytes=settings.getint("SNAPSHOTS_MAX_BYTES", DEFAULT_MAX_BYTES),
             close_timeout=settings.getfloat("SNAPSHOTS_CLOSE_TIMEOUT", DEFAULT_CLOSE_TIMEOUT),
             crawler=crawler,
@@ -230,13 +295,15 @@ class SnapshotRecorder:
 
     def _classify(self, response: Any) -> Optional[str]:
         """The snapshot kind for ``response``, or None. Reactor thread: cheap."""
-        if self._samples >= self.sample_limit and self._errors >= self.error_limit:
+        if (self._samples >= self.sample_limit and self._errors >= self.error_limit
+                and self._apis >= self.api_limit):
             return None
         status = int(getattr(response, "status", 0) or 0)
         content_type = _header(response.headers, b"Content-Type")
         is_html = "html" in content_type.lower()
         if status < 400 and not is_html:
-            return None
+            is_api = any(t in content_type.lower() for t in _API_TYPES)
+            return "api" if is_api and self._apis < self.api_limit else None
         if self._errors < self.error_limit:
             diagnosis = _meta_diagnosis(response)
             if diagnosis is not None:
@@ -258,12 +325,12 @@ class SnapshotRecorder:
 
     def response_received(self, response, request, spider) -> None:
         try:
-            self._capture(response, spider)
+            self._capture(response, spider, request)
         except Exception as exc:
             logger.debug("SnapshotRecorder: capture failed for %s: %s",
                          getattr(response, "url", "?"), exc)
 
-    def _capture(self, response: Any, spider: Any) -> None:
+    def _capture(self, response: Any, spider: Any, request: Any = None) -> None:
         if self._closed:
             return
         kind = self._classify(response)
@@ -278,18 +345,28 @@ class SnapshotRecorder:
                 if self._samples >= self.sample_limit:
                     return
                 self._samples += 1
+            elif kind == "api":
+                if self._apis >= self.api_limit:
+                    return
+                self._apis += 1
             else:
                 if self._errors >= self.error_limit:
                     return
                 self._errors += 1
             if not self.spider_slug and spider is not None:
                 self.spider_slug = getattr(spider, "name", "") or ""
+        if request is None:
+            request = getattr(response, "request", None)
         pending = _Pending(
             url=response.url,
             status_code=int(response.status),
             kind=kind,
             captured_at=datetime.now(timezone.utc).isoformat(),
             body=bytes(body),
+            method=(getattr(request, "method", None) or "GET").upper(),
+            content_type=_header(response.headers, b"Content-Type")[:200],
+            request_body=request_body_for_snapshot(request, self.max_request_body)
+            if request is not None else None,
         )
         if self._executor is None:
             self._executor = futures.ThreadPoolExecutor(
@@ -322,7 +399,11 @@ class SnapshotRecorder:
                 "storage_key": key,
                 "kind": pending.kind,
                 "captured_at": pending.captured_at,
+                "method": pending.method,
+                "content_type": pending.content_type,
             }
+            if pending.request_body is not None:
+                entry["request_body"] = pending.request_body
             with self._lock:
                 self._uploaded.add(content_hash)
                 self._snapshots.append(entry)
@@ -374,6 +455,19 @@ class SnapshotRecorder:
             response = self.auth.call(lambda h: httpx.post(
                 url, json={"snapshots": snapshots}, headers=h, timeout=REPORT_TIMEOUT,
             ))
+            status = getattr(response, "status_code", 0)
+            if status in (400, 422):
+                # A forge that predates the api kind and the request fields: send it the pages.
+                legacy = [{k: v for k, v in s.items()
+                           if k not in ("method", "content_type", "request_body")}
+                          for s in snapshots if s.get("kind") != "api"]
+                if legacy and len(legacy) <= len(snapshots):
+                    logger.info("SnapshotRecorder: forge refused the report (%s); sending it "
+                                "without the api snapshots", status)
+                    response = self.auth.call(lambda h: httpx.post(
+                        url, json={"snapshots": legacy}, headers=h, timeout=REPORT_TIMEOUT,
+                    ))
+                    snapshots = legacy
         except Exception as exc:
             logger.warning("SnapshotRecorder: reporting snapshots to forge failed: %s", exc)
             return False
