@@ -1,3 +1,10 @@
+## [1.35.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.0...v1.35.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **snapshots:** name each page's callback, sample only pages the spider parses ([00246d0](https://github.com/Aarkc/scrapy-calyprium/commit/00246d08ba7df23095698e899c7cad5a0b6f275c))
+
 # [1.35.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.34.0...v1.35.0) (2026-10-19)
 
 
