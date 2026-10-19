@@ -117,12 +117,39 @@ class TestCapture:
             f"http://example.com/{i}" for i in range(5)]
         assert len(fake.objects) == 5
 
-    def test_non_html_success_is_ignored(self):
+    def test_a_json_success_is_an_api_snapshot_and_other_non_html_is_ignored(self):
         ext = make_ext()
         feed(ext, [_resp(body=b'{"a": 1}', ctype=b"application/json"),
                    _resp(body=b"%PDF-1.7 ...", ctype=b"application/pdf")])
         close(ext)
-        assert ext._snapshots == []
+        assert kinds(ext) == ["api"]
+        (snap,) = ext._snapshots
+        assert snap["method"] == "GET" and snap["content_type"] == "application/json"
+        assert "request_body" not in snap
+
+    def test_api_snapshots_keep_their_post_request_redacted(self):
+        """vitrohm_parts POSTs part numbers to a search API: the answer is saved with the
+        request that fetched it, credential-like fields redacted."""
+        ext = make_ext()
+        api = "https://yageogroup.com/search/query/raw"
+        req = Request(api, method="POST",
+                      body=b'{"input": "KHS400JB", "apiKey": "s3cr3t", "setting": {"token": "t"}}')
+        resp = TextResponse(url=api, status=200, body=b'{"results": []}', request=req,
+                            headers={"Content-Type": "application/json"}, encoding="utf-8")
+        ext.response_received(resp, req, None)
+        close(ext)
+        (snap,) = ext._snapshots
+        assert snap["kind"] == "api" and snap["method"] == "POST"
+        body = snap["request_body"]
+        assert '"input":"KHS400JB"' in body and "s3cr3t" not in body and '"t"' not in body
+        assert body.count("[redacted]") == 2
+
+    def test_api_limit(self):
+        ext = make_ext({"SNAPSHOTS_API": 2})
+        feed(ext, [_resp(body=b'{"n": %d}' % i, ctype=b"application/json",
+                         url=f"http://example.com/api/{i}") for i in range(4)])
+        close(ext)
+        assert kinds(ext) == ["api", "api"]
 
     def test_errors_and_blocked(self):
         ext = make_ext()
@@ -236,7 +263,21 @@ class TestReport:
         assert sorted(s["kind"] for s in snaps) == ["error", "sample"]
         for s in snaps:
             assert set(s) == {"url", "status_code", "content_hash", "storage_key",
-                              "kind", "captured_at"}
+                              "kind", "captured_at", "method", "content_type"}
+            assert s["method"] == "GET"
+
+    def test_a_forge_without_the_api_kind_still_gets_the_pages(self):
+        ext = make_ext()
+        feed(ext, [_resp(), _resp(body=b'{"a": 1}', ctype=b"application/json",
+                                  url="http://example.com/api")])
+        responses = [mock.Mock(status_code=422), mock.Mock(status_code=200)]
+        with mock.patch.object(sr.httpx, "post", side_effect=responses) as post:
+            ext.spider_closed(None, "finished")
+        assert post.call_count == 2
+        retried = post.call_args_list[1].kwargs["json"]["snapshots"]
+        assert [s["kind"] for s in retried] == ["sample"]
+        assert set(retried[0]) == {"url", "status_code", "content_hash", "storage_key",
+                                   "kind", "captured_at"}
 
     def test_legacy_secret_auth_without_api_key(self, monkeypatch):
         monkeypatch.delenv("CALYPRIUM_API_KEY", raising=False)
