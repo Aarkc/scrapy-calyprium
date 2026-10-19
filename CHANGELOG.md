@@ -1,3 +1,10 @@
+## [1.35.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.1...v1.35.2) (2026-10-19)
+
+
+### Bug Fixes
+
+* **snapshots:** spread sample pages over the run instead of the first five ([0a42bb1](https://github.com/Aarkc/scrapy-calyprium/commit/0a42bb1b460329aa5452d4734deac5d4133b3a84))
+
 ## [1.35.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.0...v1.35.1) (2026-10-19)
 
 
