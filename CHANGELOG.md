@@ -1,3 +1,10 @@
+# [1.35.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.34.0...v1.35.0) (2026-10-19)
+
+
+### Features
+
+* **snapshots:** save api responses with the request that fetched them ([a571e9f](https://github.com/Aarkc/scrapy-calyprium/commit/a571e9fd1c53819e0c2286d73c83818f9516c652))
+
 # [1.34.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.33.0...v1.34.0) (2026-10-18)
 
 
