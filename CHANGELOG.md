@@ -1,3 +1,10 @@
+## [1.35.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.2...v1.35.3) (2026-10-19)
+
+
+### Bug Fixes
+
+* **spectre:** keep a spider's accept-encoding and advertise only decodable codings ([f7464e4](https://github.com/Aarkc/scrapy-calyprium/commit/f7464e4b1f1f4935d48f2e9075f90d53be74f98a))
+
 ## [1.35.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.1...v1.35.2) (2026-10-19)
 
 
