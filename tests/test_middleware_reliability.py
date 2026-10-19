@@ -92,6 +92,53 @@ def test_spectre_fingerprint_hash_rides_on_the_request():
     assert req.meta["spectre_fingerprint_hash"] == "h" * 64
 
 
+CHROME_FP = {
+    "fingerprint": {"id": "fp2", "name": "chrome-153"},
+    "headers": {"User-Agent": "Spectre-UA", "Accept-Encoding": "gzip, deflate, br, zstd"},
+}
+
+
+def _applied(mw, req, fp=CHROME_FP):
+    mw._cached_fingerprint = fp
+    mw.process_request(req, None)
+    return req.headers.get(b"Accept-Encoding")
+
+
+def test_fingerprint_encoding_is_cut_to_what_scrapy_decodes():
+    """Chrome's br and zstd reached sites while the runner had no decoder for them: the spider
+    got Brotli bytes (vitrohm, shindengen 2026-10-19)."""
+    assert _applied(_spectre(decodable=frozenset({"gzip", "deflate"})),
+                    Request("https://example.com/a")) == b"gzip, deflate"
+    assert _applied(_spectre(decodable=frozenset({"gzip", "deflate", "br", "zstd"})),
+                    Request("https://example.com/a")) == b"gzip, deflate, br, zstd"
+
+
+def test_spider_own_accept_encoding_is_kept_across_retries():
+    """everlight asked for identity; the fingerprint replaced it with br and the site obliged."""
+    mw = _spectre(decodable=frozenset({"gzip", "deflate", "br", "zstd"}))
+    req = Request("https://example.com/a", headers={"Accept-Encoding": "identity"})
+    assert _applied(mw, req) == b"identity"
+    retry = req.replace(dont_filter=True)   # carries the headers and meta of the first pass
+    assert _applied(mw, retry) == b"identity"
+    # A request without its own value: a retry takes the fingerprint's again, not last time's.
+    plain = Request("https://example.com/b")
+    plain.headers["Accept-Encoding"] = b"gzip, deflate"   # what HttpCompressionMiddleware set
+    plain.meta["spectre_own_accept_encoding"] = None      # recorded on its first pass
+    assert _applied(mw, plain) == b"gzip, deflate, br, zstd"
+
+
+def test_compression_turned_off_means_identity():
+    """A spider that disables HttpCompressionMiddleware decodes nothing, so nothing compressed
+    is asked for."""
+    from scrapy_calyprium.middleware.spectre import decodable_encodings
+    off = make_crawler({"DOWNLOADER_MIDDLEWARES": {
+        "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware": None}})
+    assert decodable_encodings(off.settings) == frozenset()
+    assert decodable_encodings(make_crawler({"COMPRESSION_ENABLED": False}).settings) == frozenset()
+    assert {"gzip", "deflate"} <= decodable_encodings(make_crawler().settings)
+    assert _applied(_spectre(decodable=frozenset()), Request("https://example.com/a")) == b"identity"
+
+
 def test_spectre_block_rotates_in_background():
     mw = _spectre()
     mw._cached_fingerprint = FP

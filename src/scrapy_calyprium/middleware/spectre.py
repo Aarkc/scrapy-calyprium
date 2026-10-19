@@ -30,6 +30,13 @@ requests went out with no UA at all). Failures back off exponentially instead
 of retrying a 10s call on every request. With ``SPECTRE_ROTATE_PER_REQUEST`` a
 new fingerprint is fetched in the background per request and applied as soon
 as it arrives.
+
+Accept-Encoding: a spider's own value (on the request before this middleware) is kept, and the
+fingerprint's is cut to the codings this crawl decodes (Scrapy's HttpCompressionMiddleware;
+none when the spider turned it off, then ``identity``). Chrome's ``gzip, deflate, br, zstd``
+used to replace a spider's ``identity`` and reach sites while the runner could not decode br or
+zstd, or the spider had switched decompression off: the spider got compressed bytes and 0 items
+(vitrohm, everlight, shindengen, 2026-10-19).
 """
 
 import logging
@@ -44,6 +51,46 @@ from scrapy.utils.defer import maybe_deferred_to_future
 from twisted.internet.threads import deferToThread
 
 logger = logging.getLogger(__name__)
+
+_COMPRESSION_MW = "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware"
+#: request.meta key: the spider's own Accept-Encoding (None when it set none), recorded on the
+#: first pass so a retry or a redirect, which carries the headers set last time, still knows it.
+OWN_ACCEPT_ENCODING = "spectre_own_accept_encoding"
+
+
+def scrapy_decodable_encodings() -> frozenset:
+    """The codings Scrapy's HttpCompressionMiddleware decodes here (br and zstd need brotli and
+    zstandard installed)."""
+    try:
+        from scrapy.downloadermiddlewares.httpcompression import ACCEPTED_ENCODINGS
+    except ImportError:  # pragma: no cover - every supported Scrapy has it
+        return frozenset({"gzip", "deflate"})
+    return frozenset(e.decode() if isinstance(e, bytes) else str(e) for e in ACCEPTED_ENCODINGS)
+
+
+def decodable_encodings(settings) -> frozenset:
+    """The codings this crawl decodes: none when the spider turned HttpCompressionMiddleware off
+    (``COMPRESSION_ENABLED`` false, or the middleware set to None)."""
+    if not settings.getbool("COMPRESSION_ENABLED", True):
+        return frozenset()
+    for key, value in settings.getwithbase("DOWNLOADER_MIDDLEWARES").items():
+        name = key if isinstance(key, str) else f"{key.__module__}.{key.__qualname__}"
+        if name == _COMPRESSION_MW and value is None:
+            return frozenset()
+    return scrapy_decodable_encodings()
+
+
+def accept_encoding_for(value, decodable: frozenset) -> str:
+    """``value`` (an Accept-Encoding) keeping only ``identity`` and the codings in ``decodable``;
+    ``identity`` when nothing is left."""
+    if isinstance(value, bytes):
+        value = value.decode("latin-1")
+    kept = []
+    for part in str(value).split(","):
+        coding = part.split(";", 1)[0].strip().lower()
+        if coding == "identity" or coding in decodable:
+            kept.append(part.strip())
+    return ", ".join(kept) or "identity"
 
 
 class SpectreMiddleware:
@@ -70,6 +117,7 @@ class SpectreMiddleware:
         os_family: Optional[str] = None,
         block_detection: bool = True,
         fallback_user_agent: Optional[str] = None,
+        decodable: Optional[frozenset] = None,
     ):
         self.service_url = service_url.rstrip("/")
         self.api_key = api_key
@@ -80,6 +128,8 @@ class SpectreMiddleware:
         self.browser_family = browser_family
         self.os_family = os_family
         self.block_detection = block_detection
+        # Codings a fingerprint may advertise (see accept_encoding_for).
+        self.decodable = scrapy_decodable_encodings() if decodable is None else decodable
 
         # Cached fingerprint for non-rotating mode
         self._cached_fingerprint: Optional[Dict] = None
@@ -137,6 +187,7 @@ class SpectreMiddleware:
             os_family=crawler.settings.get("SPECTRE_OS_FAMILY"),
             block_detection=crawler.settings.getbool("SPECTRE_BLOCK_DETECTION", True),
             fallback_user_agent=crawler.settings.get("SPECTRE_FALLBACK_USER_AGENT"),
+            decodable=decodable_encodings(crawler.settings),
         )
         crawler.signals.connect(middleware.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(middleware.spider_closed, signal=signals.spider_closed)
@@ -273,6 +324,10 @@ class SpectreMiddleware:
         if request.meta.get("_internal"):
             return None
 
+        if OWN_ACCEPT_ENCODING not in request.meta:
+            own = request.headers.get("Accept-Encoding")
+            request.meta[OWN_ACCEPT_ENCODING] = own.decode("latin-1") if own else None
+
         fingerprint_data = self._get_fingerprint_for_request(request)
         if not fingerprint_data:
             # Spectre down/slow: never send a request without a User-Agent.
@@ -284,6 +339,12 @@ class SpectreMiddleware:
         headers = fingerprint_data.get("headers", {})
         for header_name, header_value in headers.items():
             request.headers[header_name] = header_value
+        own_encoding = request.meta[OWN_ACCEPT_ENCODING]
+        if own_encoding:
+            request.headers["Accept-Encoding"] = own_encoding
+        elif "Accept-Encoding" in request.headers:
+            request.headers["Accept-Encoding"] = accept_encoding_for(
+                request.headers["Accept-Encoding"], self.decodable)
 
         request.headers.setdefault("User-Agent", self.fallback_user_agent)
 
