@@ -31,3 +31,12 @@ def test_the_contract_the_sdk_relies_on():
     assert {k: d[k] for k in ("class", "number", "side", "move", "retry_after")} == {
         "class": "rate_limited", "number": 5, "side": "ours", "move": "slow_down", "retry_after": 3.0}
     assert sorted(c.number for c in dg.CLASSES.values()) == list(range(17))
+
+
+def test_the_copy_has_what_block_detect_reads():
+    """VERSION 4 (Mimic PR #241) reads block pages served as success; block_detect.challenge_family
+    reads its akamai_reference and its Akamai 200 evidence."""
+    assert dg.VERSION >= 4
+    assert (dg.VERCEL, dg.FASTLY) == ("vercel", "fastly")
+    assert dg.akamai_reference("Reference&#32;&#35;18&#46;1a2b3c4d&#46;1700000000")
+    assert not dg.akamai_reference("<p>no reference here</p>")
