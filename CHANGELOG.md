@@ -1,3 +1,14 @@
+## [1.35.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.3...v1.35.4) (2026-10-23)
+
+
+### Bug Fixes
+
+* **routing:** carry a post's method and body on the local fetch ([8bea543](https://github.com/Aarkc/scrapy-calyprium/commit/8bea5436786f361a0461ae002818610efd25bb8d))
+* **routing:** exit every hop through the run's pinned country ([aa375cf](https://github.com/Aarkc/scrapy-calyprium/commit/aa375cf86726bf740acb0513abbd3059f01f2ef8))
+* **routing:** send a request's own headers on the local fetch ([e0093c1](https://github.com/Aarkc/scrapy-calyprium/commit/e0093c17555bdbcedb47f83cd28df2c727cba82a))
+* **routing:** wait for mimic's whole solve deadline ([17a8258](https://github.com/Aarkc/scrapy-calyprium/commit/17a8258f4405df1c327cee85a5a6d89be9c27e19))
+* **spectre:** keep the headers a spider sets over the fingerprint's ([0ecf0f4](https://github.com/Aarkc/scrapy-calyprium/commit/0ecf0f46d8e4e2620e706a5a9b2da6eb94e383e3))
+
 ## [1.35.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.2...v1.35.3) (2026-10-19)
 
 
