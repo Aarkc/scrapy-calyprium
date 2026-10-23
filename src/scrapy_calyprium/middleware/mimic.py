@@ -55,6 +55,8 @@ Settings:
     level: it falls back per request, a dead session is dropped and re-created
     lazily, and a blocked domain is escalated on its own, with decay.
 
+    MIMIC_SOLVE_DEADLINE_S: how long Mimic's /api/solve may run (Mimic's
+        SOLVE_DEADLINE_S, default 240); local-first solves wait that plus 30 s
     MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
     MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional). When
         absent, derived from VEIL_GATEWAY_URL with ``calyprium:<CALYPRIUM_API_KEY>``
@@ -152,7 +154,7 @@ try:
         LocalFetcher,
         is_local_fetch_available,
     )
-    from scrapy_calyprium.routing.solve_client import SolveClient
+    from scrapy_calyprium.routing.solve_client import SolveClient, solve_timeout_from_settings
     from scrapy_calyprium.routing.slot_stats import SlotStatsReporter
     _HAS_LOCAL_ROUTING = True
 except ImportError:
@@ -490,6 +492,8 @@ class MimicBrowserMiddleware:
             use_tessera = bool(tessera_url) and not self.policy.paid_solve_denied
             solve_service_url = tessera_url if use_tessera else self.service_url
             self._solve_backend = "tessera" if use_tessera else "mimic"
+            # Wait as long as Mimic may solve (MIMIC_SOLVE_DEADLINE_S + margin).
+            solve_timeout = solve_timeout_from_settings(self.crawler.settings)
             self._solve_client = SolveClient(
                 service_url=solve_service_url,
                 ip_health_url=self.service_url,  # IP reputation stays in mimic
@@ -499,6 +503,7 @@ class MimicBrowserMiddleware:
                 user_id=self.crawler.settings.get("FORGE_USER_ID")
                 or self.crawler.settings.get("MIMIC_USER_ID")
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
+                timeout=solve_timeout,
                 policy=self.policy,
             )
             tracer = self._find_tracer()
@@ -555,7 +560,7 @@ class MimicBrowserMiddleware:
             logger.info(
                 f"MimicMiddleware: local-first routing enabled "
                 f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
-                f"solve_backend={self._solve_backend}, "
+                f"solve_backend={self._solve_backend}, solve_timeout={solve_timeout:.0f}s, "
                 f"target_pool={pool_size}"
                 + (f" (from target_rpm={target_rpm}@{rpm_cap}rpm)" if target_rpm > 0 else "")
                 + (f", cookie_ttl={int(cookie_ttl)}s" if cookie_ttl > 0 else "")
