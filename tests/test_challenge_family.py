@@ -139,6 +139,7 @@ def _fake_httpcloak(monkeypatch):
         return name
 
     monkeypatch.setattr(chrome_preset, "_DERIVED", set())
+    monkeypatch.setattr(chrome_preset, "_REPLAY_PRESETS", {})
     monkeypatch.setitem(sys.modules, "httpcloak", types.SimpleNamespace(
         available_presets=lambda: {"chrome-latest-windows": {}, "chrome-150-windows": {}, "chrome-152-windows": {}},
         describe_preset=lambda name: json.dumps(base),
@@ -173,6 +174,7 @@ def test_replay_passes_other_presets_through(monkeypatch):
 
 def test_replay_keeps_the_name_when_httpcloak_cannot_derive(monkeypatch):
     monkeypatch.setattr(chrome_preset, "_DERIVED", set())
+    monkeypatch.setattr(chrome_preset, "_REPLAY_PRESETS", {})
     monkeypatch.setitem(sys.modules, "httpcloak", types.SimpleNamespace(
         available_presets=lambda: {"chrome-143-windows": {}}))  # an httpcloak without JSON presets
     assert replay_preset("chrome-153-windows") == "chrome-153-windows"
