@@ -136,6 +136,7 @@ def _make_router(
         proxy_url=proxy_url,
         solvers=solvers,
         target_pool_size=0,  # disable refill in tests
+        warmup_replay_delay_s=0.01,  # a refused fresh clearance's second replay, without the 2 s pause
     )
     return router
 

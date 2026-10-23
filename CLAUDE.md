@@ -47,7 +47,8 @@ which the Mimic middleware sets inside its own coroutine (never in a shared call
 (`stealth/mimic/mimic/routing/diagnosis.py`, standard library only): never edit it here, re-copy it
 when Mimic changes it (`tests/test_diagnosis_vendored.py` checks `VERSION` and the stdlib-only rule).
 `routing/block_detect.py` adapts SDK inputs to it (`diagnose()`), and `is_blocked()` is "the class is
-in `BLOCKED_CLASSES`". `_outcome.py` names the meta keys (`calyprium_diagnosis`, `calyprium_fetch_error`,
+in `BLOCKED_CLASSES`", so Mimic's block-page rules reach the SDK with the re-copy. `challenge_family()`
+(the `challenge_type` a solve names) follows Mimic's `challenge.classify_challenge` / `api_family_of`. `_outcome.py` names the meta keys (`calyprium_diagnosis`, `calyprium_fetch_error`,
 `calyprium_fallback_diagnosis`, `calyprium_attempt_number`, `calyprium_prior_class`,
 `calyprium_routing_method`). The Mimic middleware keeps each attempt's diagnosis (Mimic's
 `routing.diagnosis` when sent), retries by the diagnosis's move (`CALYPRIUM_RETRY_*`), traces a retried
@@ -64,7 +65,9 @@ This is the most complex subsystem. The flow per request:
 3. If blocked: call `SolveClient.solve()` → Mimic does a browser solve → returns cookies + UA + session_id.
 4. Cache the new slot, retry with cookies. Background refill loop keeps the pool at `target_pool_size`.
 
-Key constraint: **TLS preset must match the browser that earned the cookies.** Camoufox (Firefox) cookies must be replayed with a Firefox httpcloak preset, not Chrome. Cloudflare correlates JA3/JA4 fingerprint with cookies.
+Key constraint: **TLS preset must match the browser that earned the cookies.** Camoufox (Firefox) cookies must be replayed with a Firefox httpcloak preset, not Chrome. Cloudflare correlates JA3/JA4 fingerprint with cookies. A Chrome slot is replayed on the preset presenting its user agent's Chrome (`chrome_preset.replay_preset(preset, user_agent)`, applied in `LocalFetcher`, as Mimic does): Tessera names `chrome-latest-windows` (Chrome 152 in httpcloak 1.7.2) for its Chrome/155 user agent, so the replay becomes `chrome-155-windows`, derived from the newest bundled Windows preset.
+
+A fresh Cloudflare clearance (cf_clearance, never replayed) that Cloudflare refuses on its first post-solve replay is replayed once more after `SpiderAutoRouter.warmup_replay_delay_s` (2 s, Mimic's `NATIVE_REPLAY_RETRY_DELAY_S`) before the router gives up on it; that refusal counts on the slot, not against its IP.
 
 Every local fetch of a request sends the headers the spider set on it (`mimic._local_headers`: not the Spectre fingerprint's, which `meta["spectre_fingerprint_headers"]` names, nor Scrapy's automatic Referer, see `_headers.py`). The fetcher keeps its identity: `local_fetch._OWNED_HEADERS` (User-Agent, client hints, Accept-Encoding, connection and proxy headers) are never taken from the request, and a request's Cookie header joins the slot's cookies. A request other than a GET (a storefront's GraphQL or search POST) sends its method and body on the light fetch and every replay; its solve loads a page (`auto._solve_url`: the URL itself, or the homepage for an API endpoint), since `/api/solve` only opens a URL.
 

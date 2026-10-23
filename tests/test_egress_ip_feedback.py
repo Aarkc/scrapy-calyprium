@@ -116,6 +116,7 @@ def _make_router(fetcher=None, solve=None, cache=None):
         cache=cache or DomainCache(),
         solve_client=solve or FakeSolveClient(),
         proxy_url=None,
+        warmup_replay_delay_s=0.01,  # a refused fresh clearance's second replay, without the 2 s pause
     )
 
 
@@ -271,8 +272,8 @@ class TestRouterReportsIPOutcome:
     @pytest.mark.asyncio
     async def test_post_solve_block_reports_ip_outcome(self):
         fetcher = FakeFetcher()
-        # Light fetch blocked → solve → replay also blocked
-        fetcher.queue(_blocked_403(), _blocked_403())
+        # Light fetch blocked → solve → replay also blocked (and its warm-up replay)
+        fetcher.queue(_blocked_403(), _blocked_403(), _blocked_403())
         solve = FakeSolveClient()
         solve.queue(_solve_result_with_egress("203.0.113.10"))
         router = _make_router(fetcher=fetcher, solve=solve)
@@ -293,7 +294,7 @@ class TestRouterReportsIPOutcome:
     async def test_no_egress_ip_skips_report(self):
         # When Mimic returns egress_ip=None, the spider should not report
         fetcher = FakeFetcher()
-        fetcher.queue(_blocked_403(), _blocked_403())
+        fetcher.queue(_blocked_403(), _blocked_403(), _blocked_403())  # light, replay, warm-up replay
         solve = FakeSolveClient()
         solve.queue(_solve_result_with_egress(None))
         router = _make_router(fetcher=fetcher, solve=solve)
@@ -328,8 +329,9 @@ class TestRouterReportsIPOutcome:
         fetcher = FakeFetcher()
         # With MAX_SLOT_FAILURES=1, the cookie replay 403 immediately kills
         # the slot. Router then: light fetch → blocked → solve → replay.
-        # Queue responses for the full fall-through path.
-        fetcher.queue(_blocked_403(), _blocked_403(), _blocked_403())
+        # Queue responses for the full fall-through path (the solve's fresh clearance
+        # is replayed twice: once more after the warm-up pause).
+        fetcher.queue(_blocked_403(), _blocked_403(), _blocked_403(), _blocked_403())
         solve = FakeSolveClient()
         # Solve must succeed so the router gets to replay; that replay's
         # 403 produces another IP report against the NEW egress IP.

@@ -295,7 +295,8 @@ async def test_the_middleware_slows_down_a_local_rate_limit():
 async def test_a_refused_clearance_is_named():
     fetcher, solve = FakeFetcher(), FakeSolveClient()
     fetcher.queue(_local(403, CF_CHALLENGE, {"server": "cloudflare"}),
-                  _local(403, CF_CHALLENGE, {"server": "cloudflare"}))
+                  _local(403, CF_CHALLENGE, {"server": "cloudflare"}),
+                  _local(403, CF_CHALLENGE, {"server": "cloudflare"}))  # refused after the warm-up too
     solve.queue(_solve_ok())
     router = _make_router(fetcher=fetcher, solve=solve)
     result = await router.fetch(URL, domain="shop.example")
