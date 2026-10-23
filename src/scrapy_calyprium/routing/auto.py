@@ -397,10 +397,15 @@ class SpiderAutoRouter:
             # and escalates through the solve flow if blocked.
             self.cache._entries.pop(domain, None)
 
-    async def fetch(self, url: str, *, domain: str) -> RouteResult:
+    async def fetch(
+        self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
+    ) -> RouteResult:
+        """Fetch ``url`` by the local route. ``headers`` are the request's own (the spider's
+        X-Api-Key, Referer, ...): every local fetch of it sends them, the fetcher keeping its
+        browser identity (see local_fetch._OWNED_HEADERS)."""
         start_time = time.monotonic()
         trace_id = uuid.uuid4().hex
-        result = await self._fetch_inner(url, domain=domain)
+        result = await self._fetch_inner(url, domain=domain, headers=headers)
         if result.diagnosis is None:
             if result.fetch is not None:
                 result.diagnosis = _diagnose_fetch(result.fetch, url)
@@ -441,7 +446,9 @@ class SpiderAutoRouter:
             result.trace_id = trace_id
         return result
 
-    async def _fetch_inner(self, url: str, *, domain: str) -> RouteResult:
+    async def _fetch_inner(
+        self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
+    ) -> RouteResult:
         # No "heavy" bail-out.  When every slot is dead the right move is to
         # solve again with a fresh IP, not to fall through to the legacy
         # browser path (which also gets 403 without cookies).
@@ -458,9 +465,11 @@ class SpiderAutoRouter:
         # an UnboundLocalError at the solve step.
         result = None
         transport_error = None
+        # The request's own headers ride on every fetch of it (a plain GET sends none).
+        own = {"extra_headers": headers} if headers else {}
         try:
             light_result = await self.fetcher.fetch(
-                url=url, proxy_url=self.proxy_url,
+                url=url, proxy_url=self.proxy_url, **own,
             )
         except LocalFetchError as exc:
             light_result = None
@@ -533,6 +542,7 @@ class SpiderAutoRouter:
                         proxy_session_id=slot.proxy_session_id,
                         provider=slot.provider,
                         preset=slot.preset,
+                        **own,
                     )
                 except LocalFetchError as exc:
                     logger.info(
@@ -659,13 +669,13 @@ class SpiderAutoRouter:
                             "AutoRouter: %s solve coalesced — reusing pristine slot",
                             domain,
                         )
-                        return await self._replay_with_slot(url, domain, slot, result)
+                        return await self._replay_with_slot(url, domain, slot, result, own)
 
                 # We hold the lock — one solve, no parallel fan-out.
                 winning_slot = await self._try_one_solve(domain, url)
 
             if winning_slot is not None:
-                return await self._replay_with_slot(url, domain, winning_slot, result)
+                return await self._replay_with_slot(url, domain, winning_slot, result, own)
 
             if attempt < 2:
                 await asyncio.sleep(2)
@@ -714,8 +724,9 @@ class SpiderAutoRouter:
         self._ensure_refill_task(domain)
         return slot
 
-    async def _replay_with_slot(self, url, domain, slot, original_result):
-        """Replay a URL with a cookie slot. Returns RouteResult."""
+    async def _replay_with_slot(self, url, domain, slot, original_result, own=None):
+        """Replay a URL with a cookie slot (``own``: the request's own fetch arguments, its
+        headers). Returns RouteResult."""
         self.cache.record_request(domain, slot.slot_id)
         slot.in_flight += 1  # busy until the fetch completes (see CookieSlot)
         try:
@@ -728,6 +739,7 @@ class SpiderAutoRouter:
                     proxy_session_id=slot.proxy_session_id,
                     provider=slot.provider,
                     preset=slot.preset,
+                    **(own or {}),
                 )
             finally:
                 slot.in_flight -= 1

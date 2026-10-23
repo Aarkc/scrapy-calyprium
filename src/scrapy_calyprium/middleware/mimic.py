@@ -24,7 +24,9 @@ Settings:
         attempted via in-process httpcloak with cached cookies from a per-spider
         domain cache. Mimic /api/solve is called only when local fetch hits
         a challenge. Falls back to the existing /api/fetch + /api/session
-        browser path on unrecoverable failure. Default: False.
+        browser path on unrecoverable failure. Default: False. Every local fetch
+        sends the headers the spider set on the request (not the fingerprint's;
+        the fetcher keeps its User-Agent, client hints and codings).
     MIMIC_ESCALATION_TTL: seconds a domain stays escalated to ``maximum``
         stealth after a blocked Mimic response (default: 600)
     MIMIC_TRANSPORT_RETRIES: retries for transport errors (timeouts,
@@ -74,7 +76,7 @@ from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
-from scrapy_calyprium import _outcome, _trace, _wait
+from scrapy_calyprium import _headers, _outcome, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 from scrapy_calyprium.routing import diagnosis as dg
@@ -89,6 +91,32 @@ _DROP_HEADERS = frozenset((
 ))
 # meta flag: the request already had its one fix_ours retry
 _FIX_OURS_RETRIED = "calyprium_fix_ours_retried"
+# SpectreMiddleware's meta key naming the headers its fingerprint set (spectre.FINGERPRINT_HEADERS)
+_FINGERPRINT_HEADERS = "spectre_fingerprint_headers"
+
+
+def _header_text(value: bytes) -> str:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return value.decode("latin-1")
+
+
+def _local_headers(request) -> Dict[str, str]:
+    """The request's own headers, for the local fetch: the ones the spider set, not the device
+    fingerprint's (SpectreMiddleware names them) and not Scrapy's automatic Referer. The
+    fetcher drops what would break its browser identity (local_fetch._OWNED_HEADERS)."""
+    fingerprint = {str(n).lower() for n in request.meta.get(_FINGERPRINT_HEADERS) or ()}
+    if _headers.scrapy_referer(request):
+        fingerprint.add("referer")
+    out: Dict[str, str] = {}
+    for key, values in request.headers.items():
+        name = _header_text(key) if isinstance(key, bytes) else str(key)
+        if not values or name.lower() in fingerprint:
+            continue
+        sep = "; " if name.lower() == "cookie" else ", "
+        out[name] = sep.join(_header_text(v) if isinstance(v, bytes) else str(v) for v in values)
+    return out
 
 
 def _mimic_headers(env: Any) -> Optional[Dict[str, Any]]:
@@ -748,7 +776,8 @@ class MimicBrowserMiddleware:
             return None
 
         try:
-            result = await self._local_router.fetch(request.url, domain=domain)
+            result = await self._local_router.fetch(
+                request.url, domain=domain, headers=_local_headers(request))
         except Exception as e:
             logger.warning(
                 f"MimicMiddleware: local route raised for {request.url}: {e}; "

@@ -34,7 +34,7 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 from scrapy_calyprium.routing.chrome_preset import replay_preset
@@ -160,6 +160,59 @@ def _build_cookie_header(cookies: List[Dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# A request's own headers
+# ---------------------------------------------------------------------------
+
+#: Headers the fetcher owns, never taken from ``extra_headers``: the browser identity the TLS and
+#: HTTP/2 fingerprint belongs to (a cookie slot's User-Agent, the preset's client hints, the
+#: codings the backend decodes), the connection itself (forbidden on HTTP/2), and the proxy
+#: credentials, which are the gateway's and never the site's.
+_OWNED_HEADERS = frozenset({
+    "user-agent", "accept-encoding",
+    "host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te",
+    "trailer", "upgrade", "http2-settings", "content-length",
+    "proxy-authorization", "proxy-authenticate",
+})
+_OWNED_PREFIXES = ("sec-ch-ua", "x-veil-")
+
+
+def _request_headers(extra_headers: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], str]:
+    """``extra_headers`` the fetch may send, and the request's own Cookie header (merged with
+    the slot's cookies rather than replacing them). Both backends put a name the preset knows
+    (Accept, Referer, ...) where the browser would and append the others, so the preset's
+    header order holds."""
+    own: Dict[str, str] = {}
+    cookie = ""
+    for name, value in (extra_headers or {}).items():
+        key = str(name).lower()
+        if value is None:
+            continue
+        if key == "cookie":
+            cookie = str(value)
+        elif key not in _OWNED_HEADERS and not key.startswith(_OWNED_PREFIXES):
+            own[str(name)] = str(value)
+    return own, cookie
+
+
+def _cookie_pairs(header: str) -> List[Dict]:
+    pairs = []
+    for part in header.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip():
+            pairs.append({"name": name.strip(), "value": value.strip()})
+    return pairs
+
+
+def _merge_cookies(cookies: Optional[List[Dict]], header: str) -> List[Dict]:
+    """The slot's cookies, then the request's own (a name the slot has keeps the slot's value:
+    the clearance is what the replay is for)."""
+    merged = [c for c in (cookies or []) if c.get("name") and "value" in c]
+    names = {c["name"] for c in merged}
+    merged.extend(c for c in _cookie_pairs(header) if c["name"] not in names)
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # LocalFetcher
 # ---------------------------------------------------------------------------
 
@@ -261,7 +314,10 @@ class LocalFetcher:
                 firefox-latest; curl_cffi: chrome120, etc.). Defaults to the
                 fetcher's default_preset.
             timeout: request timeout in seconds.
-            extra_headers: additional headers to send.
+            extra_headers: the request's own headers (a spider's X-Api-Key, Referer,
+                JSON Accept, ...). The browser identity, the codings, the connection
+                and proxy headers stay the fetcher's (see ``_OWNED_HEADERS``); a
+                Cookie header joins the slot's cookies.
 
         Returns:
             LocalFetchResult with `body` as raw bytes.
@@ -348,11 +404,12 @@ class LocalFetcher:
         if proxy_session_id and proxy_url:
             effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
 
+        own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
         if user_agent:
             headers["User-Agent"] = user_agent
         if cookies:
-            headers["Cookie"] = _build_cookie_header(cookies)
+            headers["Cookie"] = _build_cookie_header(_merge_cookies(cookies, own_cookie))
             # Disable compression to avoid httpcloak decompression errors
             # (the server-side fetcher does the same — see AAR-12 sibling).
             headers["Accept-Encoding"] = "identity"
@@ -363,8 +420,9 @@ class LocalFetcher:
                 [c.get("name") for c in cookies[:10]],
                 (user_agent or "")[:60], proxy_session_id,
             )
-        if extra_headers:
-            headers.update(extra_headers)
+        elif own_cookie:
+            headers["Cookie"] = own_cookie
+        headers.update(own_headers)
 
         start = time.time()
 
@@ -500,16 +558,17 @@ class LocalFetcher:
         if effective_proxy:
             proxies = {"http": effective_proxy, "https": effective_proxy}
 
+        own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
         if user_agent:
             headers["User-Agent"] = user_agent
-        if extra_headers:
-            headers.update(extra_headers)
+        headers.update(own_headers)
 
         cookies_dict = None
         cookie_names = []
-        if cookies:
-            cookies_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
+        if cookies or own_cookie:
+            # one Cookie header: curl_cffi would send a Cookie header beside its cookie jar's
+            cookies_dict = {c["name"]: c["value"] for c in _merge_cookies(cookies, own_cookie)}
             cookie_names = list(cookies_dict.keys())
 
         if cookies:
