@@ -1,3 +1,13 @@
+## [1.35.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.4...v1.35.5) (2026-10-23)
+
+
+### Bug Fixes
+
+* **routing:** name fastly, aws waf and akamai's 200 pages in challenge_family ([080a726](https://github.com/Aarkc/scrapy-calyprium/commit/080a72674c1e5823b8e7e01adcde83c8ecce50d4))
+* **routing:** re-copy mimic's failure classifier at version 4 ([3be618a](https://github.com/Aarkc/scrapy-calyprium/commit/3be618a4d2a04dd03de3eee03db5304b75aa3993)), closes [#241](https://github.com/Aarkc/scrapy-calyprium/issues/241)
+* **routing:** replay a clearance on the preset of its user agent's chrome ([3dc6e9b](https://github.com/Aarkc/scrapy-calyprium/commit/3dc6e9b4345f40c35ca21a74ed9a0b54a767a068))
+* **routing:** replay a fresh cloudflare clearance once more after a warm-up pause ([40ed1b9](https://github.com/Aarkc/scrapy-calyprium/commit/40ed1b9ffe50e6e566f98766148977dbcbdad377))
+
 ## [1.35.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.3...v1.35.4) (2026-10-23)
 
 
