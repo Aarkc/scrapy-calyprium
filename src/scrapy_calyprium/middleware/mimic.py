@@ -323,13 +323,15 @@ class MimicBrowserMiddleware:
                 "CALYPRIUM_API_KEY or MIMIC_API_KEY must be configured"
             )
 
+        policy = RunPolicy.from_settings(crawler.settings)
         middleware = cls(
             service_url=service_url,
             api_key=api_key,
             stealth_level=crawler.settings.get("MIMIC_STEALTH_LEVEL", "moderate"),
             browser_engine=crawler.settings.get("MIMIC_BROWSER_ENGINE"),
             use_proxy=crawler.settings.getbool("MIMIC_USE_PROXY", False),
-            proxy_country=crawler.settings.get("MIMIC_PROXY_COUNTRY"),
+            # VEIL_COUNTRY or MIMIC_PROXY_COUNTRY: the exit of every hop (see _policy)
+            proxy_country=policy.country,
             use_spectre=crawler.settings.getbool("MIMIC_USE_SPECTRE", True),
             spectre_profile_id=crawler.settings.get("MIMIC_SPECTRE_PROFILE_ID"),
             spectre_session_id=crawler.settings.get("MIMIC_SPECTRE_SESSION_ID"),
@@ -338,7 +340,7 @@ class MimicBrowserMiddleware:
             target_domain=crawler.settings.get("MIMIC_TARGET_DOMAIN"),
         )
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
-        middleware.policy = RunPolicy.from_settings(crawler.settings)
+        middleware.policy = policy
         middleware.escalation_ttl = crawler.settings.getfloat("MIMIC_ESCALATION_TTL", 600.0)
         builtin_retry = _builtin_retry_active(crawler.settings)
         middleware.transport_retries = (

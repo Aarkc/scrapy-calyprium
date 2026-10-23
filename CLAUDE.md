@@ -90,7 +90,7 @@ Each `CookieSlot` in the `DomainCache` has:
 | `VEIL_PROVIDER` | Upstream proxy provider (e.g. `webshare_rotating`) |
 | `VEIL_GATEWAY_URL` | Veil proxy gateway URL |
 | `RECRAWL_TRACKING_ENABLED` | Filter out recently-crawled URLs via Forge freshness API |
-| `SPIDER_ID`, `RUN_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy` |
+| `SPIDER_ID`, `RUN_ID`, `MIMIC_ALLOW_PAID_SOLVE`, `MIMIC_PAID_SOLVE_MODE`, `MIMIC_ALLOWED_ENGINES`, `VEIL_ALLOWED_PROVIDERS`, `VEIL_COUNTRY` (or `MIMIC_PROXY_COUNTRY`) | Profile policy from forge; forwarded to Veil (username params) and Mimic/Tessera (request fields) via `_policy.RunPolicy`. The country is one resolution for every hop; a solve's own country (Mimic's `SolveResponse.country`) rides on its slot and replaces the run's on the slot's replays |
 | `VEIL_PROXY_TYPE` | Veil username `-type_`; also the tier (`fast` / `residential`) `CalypriumRequestTracer` puts on Veil-path spans |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
 | `CALYPRIUM_RETRY_ENABLED`, `CALYPRIUM_RETRY_TIMES`, `CALYPRIUM_RETRY_DELAY`, `CALYPRIUM_RETRY_MAX_DELAY` | Calyprium retry in `MimicBrowserMiddleware` (on by default; 2 retries, 5 s base, 60 s cap) |

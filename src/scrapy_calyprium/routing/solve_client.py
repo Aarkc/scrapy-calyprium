@@ -6,6 +6,7 @@ a challenge and we need a real browser solve to earn fresh clearance cookies.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -44,6 +45,12 @@ def solve_timeout_from_settings(settings: Any) -> float:
     return deadline + SOLVE_DEADLINE_MARGIN_S
 
 
+def _country(value: Any) -> Optional[str]:
+    """A solve's exit country as the gateway username takes it (``country_<cc>``), or None."""
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[a-z0-9_]{2,16}", text) else None
+
+
 def _describe(exc: BaseException) -> str:
     """The exception's type and message: httpx's timeouts carry no message, and
     a bare "transport error:" said nothing."""
@@ -70,6 +77,10 @@ class SolveResult:
     egress_ip: Optional[str] = None
     # Veil provider used for the solve — replay must use the same provider
     provider: Optional[str] = None
+    # Exit country the solve left through (Mimic's SolveResponse.country): replays
+    # leave through the same one (gateway ``-country_<cc>``), or the clearance meets
+    # another IP. None when the solver does not say (the run's country then holds).
+    country: Optional[str] = None
 
 
 class SolveError(Exception):
@@ -232,6 +243,7 @@ class SolveClient:
             learned_rpm_cap=data.get("learned_rpm_cap"),
             egress_ip=data.get("egress_ip"),
             provider=data.get("provider"),
+            country=_country(data.get("country")),
         )
 
     async def report_ip_outcome(

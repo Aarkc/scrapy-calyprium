@@ -308,6 +308,7 @@ class SpiderAutoRouter:
                 preset=solve.preset,
                 egress_ip=solve.egress_ip,
                 provider=solve.provider,
+                country=solve.country,
             )
             entry = self.cache.get(domain)
             new_live = len(entry.live_slots()) if entry else 0
@@ -577,6 +578,7 @@ class SpiderAutoRouter:
                         proxy_url=self.proxy_url,
                         proxy_session_id=slot.proxy_session_id,
                         provider=slot.provider,
+                        country=slot.country,
                         preset=slot.preset,
                         **own,
                     )
@@ -753,6 +755,7 @@ class SpiderAutoRouter:
             preset=solve.preset,
             egress_ip=solve.egress_ip,
             provider=solve.provider,
+            country=solve.country,
         )
         logger.info(
             "AutoRouter: solve succeeded for %s (egress_ip=%s)",
@@ -775,6 +778,7 @@ class SpiderAutoRouter:
                     proxy_url=self.proxy_url,
                     proxy_session_id=slot.proxy_session_id,
                     provider=slot.provider,
+                    country=slot.country,
                     preset=slot.preset,
                     **(own or {}),
                 )

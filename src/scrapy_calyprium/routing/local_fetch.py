@@ -130,19 +130,27 @@ def _inject_proxy_session(
     proxy_url: str,
     proxy_session_id: str,
     provider: Optional[str] = None,
+    country: Optional[str] = None,
 ) -> str:
-    """Inject sticky proxy session and provider into the proxy URL username.
+    """Inject sticky proxy session, provider and country into the proxy URL username.
 
-    Encodes the provider (e.g. webshare_rotating) and session id into the
-    gateway proxy username so the Veil gateway routes through the correct
-    upstream with sticky IP pinning.
+    Encodes the provider (e.g. webshare_rotating), the exit country and the
+    session id into the gateway proxy username, as the solve dialled them
+    (``-p_<provider>[-country_<cc>]-session_<id>``), so the Veil gateway routes
+    through the same upstream and IP that earned the clearance. The solve's
+    country replaces the run's (``-country_<cc>`` from the policy): one exit.
     """
     parsed = urlparse(proxy_url)
     if not parsed.username:
         return proxy_url
     parts = [parsed.username]
+    if country:
+        base, *params = parsed.username.split("-")
+        parts = [base, *(p for p in params if not p.startswith(("country_", "c_")))]
     if provider:
         parts.append(f"p_{provider}")
+    if country:
+        parts.append(f"country_{country}")
     parts.append(f"session_{proxy_session_id}")
     new_user = "-".join(parts)
     netloc = f"{new_user}:{parsed.password}@{parsed.hostname}"
@@ -299,6 +307,7 @@ class LocalFetcher:
         extra_headers: Optional[Dict[str, str]] = None,
         method: str = "GET",
         body: Optional[bytes] = None,
+        country: Optional[str] = None,
     ) -> LocalFetchResult:
         """Perform a single HTTP request (a GET unless ``method`` says otherwise) and
         return raw bytes.
@@ -313,6 +322,8 @@ class LocalFetcher:
             proxy_session_id: optional sticky-session id, injected into the
                 proxy URL so the upstream gateway routes to the same IP that
                 earned the cookies.
+            country: the exit country the cookies were earned through (a
+                slot's), pinned with the session in place of the run's.
             preset: TLS fingerprint preset (httpcloak: chrome-143,
                 firefox-latest; curl_cffi: chrome120, etc.). Defaults to the
                 fetcher's default_preset.
@@ -351,6 +362,7 @@ class LocalFetcher:
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
                 provider=provider,
+                country=country,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
@@ -365,6 +377,7 @@ class LocalFetcher:
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
                 provider=provider,
+                country=country,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
@@ -402,6 +415,7 @@ class LocalFetcher:
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
         provider: Optional[str] = None,
+        country: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
@@ -415,7 +429,8 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
+            effective_proxy = _inject_proxy_session(
+                proxy_url, proxy_session_id, provider=provider, country=country)
 
         own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
@@ -541,6 +556,7 @@ class LocalFetcher:
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
         provider: Optional[str] = None,
+        country: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
@@ -570,7 +586,8 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
+            effective_proxy = _inject_proxy_session(
+                proxy_url, proxy_session_id, provider=provider, country=country)
 
         proxies = None
         if effective_proxy:
