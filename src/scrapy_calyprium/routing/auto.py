@@ -765,8 +765,8 @@ class SpiderAutoRouter:
         return slot
 
     async def _replay_with_slot(self, url, domain, slot, original_result, own=None):
-        """Replay a URL with a cookie slot (``own``: the request's own fetch arguments, its
-        headers). Returns RouteResult."""
+        """Replay a URL with a cookie slot (``own``: the request's own fetch arguments: its
+        headers, and the method and body of anything but a GET). Returns RouteResult."""
         self.cache.record_request(domain, slot.slot_id)
         slot.in_flight += 1  # busy until the fetch completes (see CookieSlot)
         try:
