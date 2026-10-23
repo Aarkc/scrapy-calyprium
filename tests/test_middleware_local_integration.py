@@ -36,7 +36,7 @@ class FakeRouter:
     def queue(self, *items):
         self.results.extend(items)
 
-    async def fetch(self, url, *, domain, headers=None):
+    async def fetch(self, url, *, domain, headers=None, **kwargs):
         self.fetch_calls.append((url, domain))
         self.headers.append(headers)
         return self.results.pop(0)

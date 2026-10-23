@@ -26,7 +26,8 @@ Settings:
         a challenge. Falls back to the existing /api/fetch + /api/session
         browser path on unrecoverable failure. Default: False. Every local fetch
         sends the headers the spider set on the request (not the fingerprint's;
-        the fetcher keeps its User-Agent, client hints and codings).
+        the fetcher keeps its User-Agent, client hints and codings), and a POST
+        its method and body (the solve loads a page, then the POST is replayed).
     MIMIC_ESCALATION_TTL: seconds a domain stays escalated to ``maximum``
         stealth after a blocked Mimic response (default: 600)
     MIMIC_TRANSPORT_RETRIES: retries for transport errors (timeouts,
@@ -775,9 +776,14 @@ class MimicBrowserMiddleware:
         if not domain:
             return None
 
+        # The request as made: its own headers, and the method and body of anything but a GET
+        # (a storefront's GraphQL or search POST is fetched, solved and replayed locally too).
+        route_kwargs: Dict[str, Any] = {"headers": _local_headers(request)}
+        method = (request.method or "GET").upper()
+        if method != "GET":
+            route_kwargs.update(method=method, body=request.body)
         try:
-            result = await self._local_router.fetch(
-                request.url, domain=domain, headers=_local_headers(request))
+            result = await self._local_router.fetch(request.url, domain=domain, **route_kwargs)
         except Exception as e:
             logger.warning(
                 f"MimicMiddleware: local route raised for {request.url}: {e}; "

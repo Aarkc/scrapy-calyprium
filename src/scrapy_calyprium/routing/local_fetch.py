@@ -297,8 +297,11 @@ class LocalFetcher:
         preset: Optional[str] = None,
         timeout: Optional[int] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        method: str = "GET",
+        body: Optional[bytes] = None,
     ) -> LocalFetchResult:
-        """Perform a single HTTP GET and return raw bytes.
+        """Perform a single HTTP request (a GET unless ``method`` says otherwise) and
+        return raw bytes.
 
         Args:
             url: target URL
@@ -318,6 +321,9 @@ class LocalFetcher:
                 JSON Accept, ...). The browser identity, the codings, the connection
                 and proxy headers stay the fetcher's (see ``_OWNED_HEADERS``); a
                 Cookie header joins the slot's cookies.
+            method: the request's method; anything but GET sends ``body`` (raw bytes,
+                as the spider made them: a GraphQL query, a search form).
+            body: the request body, for a method other than GET.
 
         Returns:
             LocalFetchResult with `body` as raw bytes.
@@ -329,6 +335,7 @@ class LocalFetcher:
         """
         effective_preset = preset or self.default_preset
         effective_timeout = timeout or self.timeout
+        method = (method or "GET").upper()
 
         # Pick the best backend per-request. Firefox presets should use
         # curl_cffi because httpcloak's Firefox presets are fake (Chrome
@@ -347,6 +354,8 @@ class LocalFetcher:
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
+                method=method,
+                body=body,
             )
         elif backend == "curl_cffi":
             return await self._fetch_curl_cffi(
@@ -359,6 +368,8 @@ class LocalFetcher:
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
+                method=method,
+                body=body,
             )
         else:
             raise LocalFetchError(f"Unknown backend state: {backend}")
@@ -394,6 +405,8 @@ class LocalFetcher:
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
+        method: str = "GET",
+        body: Optional[bytes] = None,
     ) -> LocalFetchResult:
         import time
 
@@ -435,6 +448,9 @@ class LocalFetcher:
                 preset=preset, proxy=effective_proxy, timeout=timeout
             )
             try:
+                if method != "GET":
+                    # the preset's headers as for a fetch(): known names in place, body as made
+                    return session.request(method, url, data=body, headers=headers or None)
                 if headers:
                     return session.get(url, headers=headers)
                 return session.get(url)
@@ -528,6 +544,8 @@ class LocalFetcher:
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
+        method: str = "GET",
+        body: Optional[bytes] = None,
     ) -> LocalFetchResult:
         import time
 
@@ -582,13 +600,24 @@ class LocalFetcher:
         start = time.time()
         try:
             async with AsyncSession(impersonate=impersonate) as session:
-                response = await session.get(
-                    url,
-                    headers=headers or None,
-                    cookies=cookies_dict,
-                    proxies=proxies,
-                    timeout=timeout,
-                )
+                if method != "GET":
+                    response = await session.request(
+                        method,
+                        url,
+                        data=body,
+                        headers=headers or None,
+                        cookies=cookies_dict,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
+                else:
+                    response = await session.get(
+                        url,
+                        headers=headers or None,
+                        cookies=cookies_dict,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
         except Exception as exc:  # noqa: BLE001
             raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
 

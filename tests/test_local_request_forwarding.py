@@ -269,3 +269,138 @@ async def test_curl_cffi_sends_the_spider_headers_and_one_cookie_jar(monkeypatch
     assert headers["x-api-key"] == "k1" and headers["accept"] == "application/json"
     assert "cookie" not in headers  # curl_cffi would send it beside its cookie jar
     assert call["cookies"] == {"cf_clearance": "clear", "lang": "de"}
+
+
+# ---------------------------------------------------------------------------
+# A POST (a storefront's read-only GraphQL or search API) goes the same way.
+# Express, Home Depot, Levi's, O'Reilly, Sigma-Aldrich and Tokopedia serve product data only from
+# a POST API behind Akamai or Cloudflare: the local route fetched its URL with a GET, so the
+# POST was never sent, solved or replayed with the domain's cookies.
+# ---------------------------------------------------------------------------
+
+GRAPHQL = "https://www.example.com/graphql"
+QUERY = b'{"operationName":"Product","variables":{"id":"\xc3\xa9-1"},"query":"{ product { name } }"}'
+
+
+def _graphql_post():
+    from scrapy.http import JsonRequest
+    request = JsonRequest(GRAPHQL, method="POST", headers={"X-Api-Key": "k1"})
+    request = request.replace(body=QUERY)
+    return request
+
+
+def _assert_the_post(call):
+    assert call["via"] == "request" and call["method"] == "POST"
+    assert call["url"] == GRAPHQL
+    assert call["body"] == QUERY
+    sent = _sent(call)
+    assert sent["content-type"] == "application/json"
+    assert sent["x-api-key"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_a_post_goes_through_the_light_path(httpcloak):
+    download = _stack(_router())
+    response = await download(_graphql_post())
+    assert response.status == 200
+    (call,) = httpcloak.calls
+    _assert_the_post(call)
+
+
+@pytest.mark.asyncio
+async def test_a_post_is_replayed_on_a_solved_slot(httpcloak):
+    """The solve loads the site's homepage (a GET of an API path is no page); the POST is then
+    replayed with the slot's cookies, User-Agent and preset."""
+    httpcloak.responses = [FakeResponse(403, CHALLENGE), FakeResponse()]
+    solve = FakeSolve(_solved(preset="chrome-146"))
+    download = _stack(_router(solve=solve))
+    response = await download(_graphql_post())
+    assert response.status == 200
+    assert solve.calls[0]["target_url"] == "https://www.example.com/"
+    light, replay = httpcloak.calls
+    _assert_the_post(light)
+    _assert_the_post(replay)
+    sent = _sent(replay)
+    assert sent["user-agent"] == "Slot-UA" and sent["cookie"] == "cf_clearance=clear"
+    assert replay["preset"] == "chrome-146"
+    assert "-p_iproyal_static-session_sess1:" in replay["proxy"]
+
+
+@pytest.mark.asyncio
+async def test_a_post_is_replayed_on_a_cookie_slot(httpcloak):
+    cache = DomainCache()
+    cache.set_cookies_from_solve(domain="www.example.com", cookies=[{"name": "_abck",
+                                 "value": "a"}], user_agent="Slot-UA", proxy_session_id="s1",
+                                 preset="chrome-143")
+    httpcloak.responses = [FakeResponse(403, CHALLENGE), FakeResponse()]
+    download = _stack(_router(cache=cache))
+    await download(_graphql_post())
+    light, replay = httpcloak.calls
+    _assert_the_post(replay)
+    assert _sent(replay)["cookie"] == "_abck=a"
+
+
+@pytest.mark.asyncio
+async def test_post_body_and_headers_reach_httpcloak_unchanged(httpcloak):
+    from scrapy_calyprium.routing.local_fetch import LocalFetcher
+    body = b"\x00\xff" + QUERY  # bytes as made, never decoded
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Origin": "https://www.example.com", "Referer": "https://www.example.com/p/1"}
+    fetcher = LocalFetcher(default_preset="chrome-143", timeout=30, backend="httpcloak")
+    await fetcher.fetch(GRAPHQL, method="post", body=body, extra_headers=headers)
+    (call,) = httpcloak.calls
+    assert call["method"] == "POST" and call["body"] == body
+    assert call["headers"] == headers
+
+
+def test_a_form_post_solves_on_its_own_page():
+    from scrapy_calyprium.routing.auto import _solve_url
+    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    assert _solve_url("https://shop.example/search", "POST", form) == "https://shop.example/search"
+    assert _solve_url("https://shop.example/p/1?x=1", "GET", {}) == "https://shop.example/p/1?x=1"
+    for url, headers in [
+        ("https://shop.example/api/products", form),
+        ("https://shop.example/federation-gateway/graphql?opname=x", {}),
+        ("https://gql.shop.example/graphql/PDP", {}),
+        ("https://shop.example/nextgen-webhooks/", {"content-type": "application/json"}),
+    ]:
+        host = url.split("/")[2]
+        assert _solve_url(url, "POST", headers) == f"https://{host}/", url
+
+
+@pytest.mark.asyncio
+async def test_curl_cffi_sends_the_post(monkeypatch):
+    import scrapy_calyprium.routing.local_fetch as lf
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = OK_HTML
+        headers = {"content-type": "application/json"}
+        url = GRAPHQL
+
+    class AsyncSession:
+        def __init__(self, impersonate=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            calls.append({"method": "GET", "url": url, **kwargs})
+            return Response()
+
+        async def request(self, method, url, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            return Response()
+
+    monkeypatch.setattr(lf, "_CURL_CFFI_ASYNC", AsyncSession)
+    fetcher = lf.LocalFetcher(default_preset="firefox-135", timeout=30, backend="curl_cffi")
+    await fetcher.fetch(GRAPHQL, preset="firefox-135", method="POST", body=QUERY,
+                        extra_headers={"Content-Type": "application/json"})
+    (call,) = calls
+    assert call["method"] == "POST" and call["data"] == QUERY
+    assert call["headers"]["Content-Type"] == "application/json"

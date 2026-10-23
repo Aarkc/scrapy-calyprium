@@ -66,7 +66,7 @@ This is the most complex subsystem. The flow per request:
 
 Key constraint: **TLS preset must match the browser that earned the cookies.** Camoufox (Firefox) cookies must be replayed with a Firefox httpcloak preset, not Chrome. Cloudflare correlates JA3/JA4 fingerprint with cookies.
 
-Every local fetch of a request sends the headers the spider set on it (`mimic._local_headers`: not the Spectre fingerprint's, which `meta["spectre_fingerprint_headers"]` names, nor Scrapy's automatic Referer, see `_headers.py`). The fetcher keeps its identity: `local_fetch._OWNED_HEADERS` (User-Agent, client hints, Accept-Encoding, connection and proxy headers) are never taken from the request, and a request's Cookie header joins the slot's cookies.
+Every local fetch of a request sends the headers the spider set on it (`mimic._local_headers`: not the Spectre fingerprint's, which `meta["spectre_fingerprint_headers"]` names, nor Scrapy's automatic Referer, see `_headers.py`). The fetcher keeps its identity: `local_fetch._OWNED_HEADERS` (User-Agent, client hints, Accept-Encoding, connection and proxy headers) are never taken from the request, and a request's Cookie header joins the slot's cookies. A request other than a GET (a storefront's GraphQL or search POST) sends its method and body on the light fetch and every replay; its solve loads a page (`auto._solve_url`: the URL itself, or the homepage for an API endpoint), since `/api/solve` only opens a URL.
 
 ### Cookie Slot Lifecycle
 

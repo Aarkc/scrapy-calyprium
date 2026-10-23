@@ -37,6 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 from scrapy_calyprium import _outcome
 from scrapy_calyprium.routing import diagnosis as dg
@@ -74,6 +75,31 @@ class RouteResult:
     # Why the fetch ended as it did (the shared classifier's verdict on `fetch`, or on the
     # transport error when there is no response). Filled by fetch() when left None.
     diagnosis: Optional[dg.Diagnosis] = None
+
+
+#: Path segments (and host names) of an API endpoint: a browser has no page to load there.
+_API_SEGMENTS = frozenset({"api", "apis", "graphql", "gql", "rest", "rpc", "ajax", "services"})
+
+
+def _solve_url(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None) -> str:
+    """The page a solve loads for a request. Mimic's /api/solve opens a URL in a browser (a GET):
+    a GET solves on its own URL, a POST to a page (a search form) on that page, and a POST to an
+    API (a JSON or GraphQL body, or an api / graphql path) on the site's homepage, whose
+    clearance cookies are the host's. The request itself is then replayed as it was made."""
+    if (method or "GET").upper() in ("GET", "HEAD"):
+        return url
+    parsed = urlparse(url)
+    ctype = next((str(v).lower() for k, v in (headers or {}).items()
+                  if str(k).lower() == "content-type"), "")
+    segments = [seg.lower() for seg in parsed.path.split("/") if seg]
+    api = (
+        "json" in ctype or "graphql" in ctype
+        or (parsed.hostname or "").split(".")[0] in _API_SEGMENTS
+        or any(seg in _API_SEGMENTS or "graphql" in seg or seg.endswith(".json") for seg in segments)
+    )
+    if not api or not parsed.netloc:
+        return url
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}/"
 
 
 def _diagnose_fetch(fetch: LocalFetchResult, url: Optional[str] = None) -> dg.Diagnosis:
@@ -399,13 +425,18 @@ class SpiderAutoRouter:
 
     async def fetch(
         self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
+        method: str = "GET", body: Optional[bytes] = None,
     ) -> RouteResult:
         """Fetch ``url`` by the local route. ``headers`` are the request's own (the spider's
         X-Api-Key, Referer, ...): every local fetch of it sends them, the fetcher keeping its
-        browser identity (see local_fetch._OWNED_HEADERS)."""
+        browser identity (see local_fetch._OWNED_HEADERS). A ``method`` other than GET (a
+        storefront's GraphQL or search POST) sends ``body``: the light fetch and every replay
+        send the request as made; the solve loads a page (see ``_solve_url``). The route may
+        send a request more than once, so it is for requests that read, not ones that order."""
         start_time = time.monotonic()
         trace_id = uuid.uuid4().hex
-        result = await self._fetch_inner(url, domain=domain, headers=headers)
+        result = await self._fetch_inner(url, domain=domain, headers=headers, method=method,
+                                         body=body)
         if result.diagnosis is None:
             if result.fetch is not None:
                 result.diagnosis = _diagnose_fetch(result.fetch, url)
@@ -448,6 +479,7 @@ class SpiderAutoRouter:
 
     async def _fetch_inner(
         self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
+        method: str = "GET", body: Optional[bytes] = None,
     ) -> RouteResult:
         # No "heavy" bail-out.  When every slot is dead the right move is to
         # solve again with a fresh IP, not to fall through to the legacy
@@ -465,8 +497,12 @@ class SpiderAutoRouter:
         # an UnboundLocalError at the solve step.
         result = None
         transport_error = None
-        # The request's own headers ride on every fetch of it (a plain GET sends none).
-        own = {"extra_headers": headers} if headers else {}
+        # The request as made rides on every fetch of it: its own headers, and the method
+        # and body of anything but a GET (a plain GET's fetches are exactly as they were).
+        method = (method or "GET").upper()
+        own: Dict = {"extra_headers": headers} if headers else {}
+        if method != "GET":
+            own.update(method=method, body=body)
         try:
             light_result = await self.fetcher.fetch(
                 url=url, proxy_url=self.proxy_url, **own,
@@ -671,8 +707,9 @@ class SpiderAutoRouter:
                         )
                         return await self._replay_with_slot(url, domain, slot, result, own)
 
-                # We hold the lock — one solve, no parallel fan-out.
-                winning_slot = await self._try_one_solve(domain, url)
+                # We hold the lock — one solve, no parallel fan-out. A solve loads a page;
+                # the request (a POST too) is replayed as made.
+                winning_slot = await self._try_one_solve(domain, _solve_url(url, method, headers))
 
             if winning_slot is not None:
                 return await self._replay_with_slot(url, domain, winning_slot, result, own)
