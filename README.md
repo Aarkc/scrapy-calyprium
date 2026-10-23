@@ -142,6 +142,7 @@ All middleware requires a valid API key. Set it via:
 | `MIMIC_USE_PROXY` | Route browser through proxy | `False` |
 | `MIMIC_ALL_REQUESTS` | Render all requests via browser | `False` |
 | `MIMIC_USE_SPECTRE` | Use device fingerprints | `True` |
+| `MIMIC_SOLVE_DEADLINE_S` | How long Mimic's `/api/solve` may run (Mimic's `SOLVE_DEADLINE_S`); local-first solves wait this plus 30 s | `240` |
 | `CALYPRIUM_RETRY_ENABLED` | Retry attempts whose diagnosis says so | `True` |
 | `CALYPRIUM_RETRY_TIMES` | Retries per request | `2` |
 | `CALYPRIUM_RETRY_DELAY` | Seconds before a `retry_later`; base of the `slow_down` backoff | `5` |

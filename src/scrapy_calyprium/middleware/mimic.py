@@ -24,7 +24,10 @@ Settings:
         attempted via in-process httpcloak with cached cookies from a per-spider
         domain cache. Mimic /api/solve is called only when local fetch hits
         a challenge. Falls back to the existing /api/fetch + /api/session
-        browser path on unrecoverable failure. Default: False.
+        browser path on unrecoverable failure. Default: False. Every local fetch
+        sends the headers the spider set on the request (not the fingerprint's;
+        the fetcher keeps its User-Agent, client hints and codings), and a POST
+        its method and body (the solve loads a page, then the POST is replayed).
     MIMIC_ESCALATION_TTL: seconds a domain stays escalated to ``maximum``
         stealth after a blocked Mimic response (default: 600)
     MIMIC_TRANSPORT_RETRIES: retries for transport errors (timeouts,
@@ -55,6 +58,8 @@ Settings:
     level: it falls back per request, a dead session is dropped and re-created
     lazily, and a blocked domain is escalated on its own, with decay.
 
+    MIMIC_SOLVE_DEADLINE_S: how long Mimic's /api/solve may run (Mimic's
+        SOLVE_DEADLINE_S, default 240); local-first solves wait that plus 30 s
     MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
     MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional). When
         absent, derived from VEIL_GATEWAY_URL with ``calyprium:<CALYPRIUM_API_KEY>``
@@ -72,7 +77,7 @@ from scrapy import signals
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
-from scrapy_calyprium import _outcome, _trace, _wait
+from scrapy_calyprium import _headers, _outcome, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 from scrapy_calyprium.routing import diagnosis as dg
@@ -87,6 +92,32 @@ _DROP_HEADERS = frozenset((
 ))
 # meta flag: the request already had its one fix_ours retry
 _FIX_OURS_RETRIED = "calyprium_fix_ours_retried"
+# SpectreMiddleware's meta key naming the headers its fingerprint set (spectre.FINGERPRINT_HEADERS)
+_FINGERPRINT_HEADERS = "spectre_fingerprint_headers"
+
+
+def _header_text(value: bytes) -> str:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return value.decode("latin-1")
+
+
+def _local_headers(request) -> Dict[str, str]:
+    """The request's own headers, for the local fetch: the ones the spider set, not the device
+    fingerprint's (SpectreMiddleware names them) and not Scrapy's automatic Referer. The
+    fetcher drops what would break its browser identity (local_fetch._OWNED_HEADERS)."""
+    fingerprint = {str(n).lower() for n in request.meta.get(_FINGERPRINT_HEADERS) or ()}
+    if _headers.scrapy_referer(request):
+        fingerprint.add("referer")
+    out: Dict[str, str] = {}
+    for key, values in request.headers.items():
+        name = _header_text(key) if isinstance(key, bytes) else str(key)
+        if not values or name.lower() in fingerprint:
+            continue
+        sep = "; " if name.lower() == "cookie" else ", "
+        out[name] = sep.join(_header_text(v) if isinstance(v, bytes) else str(v) for v in values)
+    return out
 
 
 def _mimic_headers(env: Any) -> Optional[Dict[str, Any]]:
@@ -152,7 +183,7 @@ try:
         LocalFetcher,
         is_local_fetch_available,
     )
-    from scrapy_calyprium.routing.solve_client import SolveClient
+    from scrapy_calyprium.routing.solve_client import SolveClient, solve_timeout_from_settings
     from scrapy_calyprium.routing.slot_stats import SlotStatsReporter
     _HAS_LOCAL_ROUTING = True
 except ImportError:
@@ -292,13 +323,15 @@ class MimicBrowserMiddleware:
                 "CALYPRIUM_API_KEY or MIMIC_API_KEY must be configured"
             )
 
+        policy = RunPolicy.from_settings(crawler.settings)
         middleware = cls(
             service_url=service_url,
             api_key=api_key,
             stealth_level=crawler.settings.get("MIMIC_STEALTH_LEVEL", "moderate"),
             browser_engine=crawler.settings.get("MIMIC_BROWSER_ENGINE"),
             use_proxy=crawler.settings.getbool("MIMIC_USE_PROXY", False),
-            proxy_country=crawler.settings.get("MIMIC_PROXY_COUNTRY"),
+            # VEIL_COUNTRY or MIMIC_PROXY_COUNTRY: the exit of every hop (see _policy)
+            proxy_country=policy.country,
             use_spectre=crawler.settings.getbool("MIMIC_USE_SPECTRE", True),
             spectre_profile_id=crawler.settings.get("MIMIC_SPECTRE_PROFILE_ID"),
             spectre_session_id=crawler.settings.get("MIMIC_SPECTRE_SESSION_ID"),
@@ -307,7 +340,7 @@ class MimicBrowserMiddleware:
             target_domain=crawler.settings.get("MIMIC_TARGET_DOMAIN"),
         )
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
-        middleware.policy = RunPolicy.from_settings(crawler.settings)
+        middleware.policy = policy
         middleware.escalation_ttl = crawler.settings.getfloat("MIMIC_ESCALATION_TTL", 600.0)
         builtin_retry = _builtin_retry_active(crawler.settings)
         middleware.transport_retries = (
@@ -490,6 +523,8 @@ class MimicBrowserMiddleware:
             use_tessera = bool(tessera_url) and not self.policy.paid_solve_denied
             solve_service_url = tessera_url if use_tessera else self.service_url
             self._solve_backend = "tessera" if use_tessera else "mimic"
+            # Wait as long as Mimic may solve (MIMIC_SOLVE_DEADLINE_S + margin).
+            solve_timeout = solve_timeout_from_settings(self.crawler.settings)
             self._solve_client = SolveClient(
                 service_url=solve_service_url,
                 ip_health_url=self.service_url,  # IP reputation stays in mimic
@@ -499,6 +534,7 @@ class MimicBrowserMiddleware:
                 user_id=self.crawler.settings.get("FORGE_USER_ID")
                 or self.crawler.settings.get("MIMIC_USER_ID")
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
+                timeout=solve_timeout,
                 policy=self.policy,
             )
             tracer = self._find_tracer()
@@ -555,7 +591,7 @@ class MimicBrowserMiddleware:
             logger.info(
                 f"MimicMiddleware: local-first routing enabled "
                 f"(backend={fetcher.backend}, preset={preset}, proxy={'yes' if proxy_url else 'no'}, "
-                f"solve_backend={self._solve_backend}, "
+                f"solve_backend={self._solve_backend}, solve_timeout={solve_timeout:.0f}s, "
                 f"target_pool={pool_size}"
                 + (f" (from target_rpm={target_rpm}@{rpm_cap}rpm)" if target_rpm > 0 else "")
                 + (f", cookie_ttl={int(cookie_ttl)}s" if cookie_ttl > 0 else "")
@@ -742,8 +778,14 @@ class MimicBrowserMiddleware:
         if not domain:
             return None
 
+        # The request as made: its own headers, and the method and body of anything but a GET
+        # (a storefront's GraphQL or search POST is fetched, solved and replayed locally too).
+        route_kwargs: Dict[str, Any] = {"headers": _local_headers(request)}
+        method = (request.method or "GET").upper()
+        if method != "GET":
+            route_kwargs.update(method=method, body=request.body)
         try:
-            result = await self._local_router.fetch(request.url, domain=domain)
+            result = await self._local_router.fetch(request.url, domain=domain, **route_kwargs)
         except Exception as e:
             logger.warning(
                 f"MimicMiddleware: local route raised for {request.url}: {e}; "

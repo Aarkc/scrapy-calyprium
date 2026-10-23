@@ -37,11 +37,19 @@ none when the spider turned it off, then ``identity``). Chrome's ``gzip, deflate
 used to replace a spider's ``identity`` and reach sites while the runner could not decode br or
 zstd, or the spider had switched decompression off: the spider got compressed bytes and 0 items
 (vitrohm, everlight, shindengen, 2026-10-19).
+
+A header the spider set on its Request wins over the fingerprint's, except the browser identity
+(User-Agent and its client hints), which is always the fingerprint's. The fingerprint's Referer
+(``https://www.google.com/``) used to replace a spider's own, and a site key that answers only its
+own page's Referer refused the request (heremaps, 2026-10-22). Scrapy's automatic Referer (the
+parent page, see ``scrapy_calyprium._headers``) is still replaced, as before.
+``meta[FINGERPRINT_HEADERS]`` names the headers whose values are the fingerprint's, so the local
+fetch path sends only the spider's.
 """
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from urllib.parse import urlparse
 
 import httpx
@@ -50,12 +58,20 @@ from scrapy.exceptions import NotConfigured
 from scrapy.utils.defer import maybe_deferred_to_future
 from twisted.internet.threads import deferToThread
 
+from scrapy_calyprium._headers import scrapy_referer
+
 logger = logging.getLogger(__name__)
 
 _COMPRESSION_MW = "scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware"
 #: request.meta key: the spider's own Accept-Encoding (None when it set none), recorded on the
 #: first pass so a retry or a redirect, which carries the headers set last time, still knows it.
 OWN_ACCEPT_ENCODING = "spectre_own_accept_encoding"
+#: request.meta key: the (lower-case) names of the request's headers whose values a fingerprint set,
+#: refreshed on every pass. The local fetch path forwards the other headers, the spider's own.
+FINGERPRINT_HEADERS = "spectre_fingerprint_headers"
+#: Fingerprint headers a spider's value never replaces: the browser identity (a spider's own
+#: User-Agent next to the fingerprint's client hints would contradict itself).
+IDENTITY_HEADERS = frozenset({"user-agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"})
 
 
 def scrapy_decodable_encodings() -> frozenset:
@@ -143,6 +159,10 @@ class SpectreMiddleware:
         from scrapy_calyprium._config import CalypriumConfig
 
         self.fallback_user_agent = fallback_user_agent or CalypriumConfig.user_agent
+        # Every value a fingerprint has put on a request, by lower-case header name. A value not
+        # among them is the spider's own; retries and redirects carry the last pass's values, so
+        # their source is told by value, not by request meta (a spider often copies meta).
+        self._applied: Dict[str, Set[bytes]] = {}
         # Background resolution state (reactor thread only).
         self._refresh_in_flight = False
         self._retry_at = 0.0
@@ -319,6 +339,22 @@ class SpectreMiddleware:
             self._refresh(domain)
         return fingerprint
 
+    def _spider_set(self, request, name: str) -> bool:
+        """True when the request's ``name`` header is one the spider set (it wins over the
+        fingerprint's): not the browser identity, not a value a fingerprint put there, and not
+        Scrapy's automatic Referer."""
+        key = name.lower()
+        if key in IDENTITY_HEADERS or key == "accept-encoding":  # Accept-Encoding: see below
+            return False
+        value = request.headers.get(name)
+        if value is None or value in self._applied.get(key, ()):
+            return False
+        return not (key == "referer" and scrapy_referer(request))
+
+    def _mark_fingerprint_headers(self, request) -> None:
+        request.meta[FINGERPRINT_HEADERS] = sorted(
+            key for key, values in self._applied.items() if request.headers.get(key) in values)
+
     def process_request(self, request, spider):
         """Apply device fingerprint headers to the request."""
         if request.meta.get("_internal"):
@@ -333,20 +369,27 @@ class SpectreMiddleware:
             # Spectre down/slow: never send a request without a User-Agent.
             request.headers.setdefault("User-Agent", self.fallback_user_agent)
             request.meta["spectre_fallback_ua"] = True
+            self._mark_fingerprint_headers(request)
             return None
 
-        # Apply headers from fingerprint
+        # Apply headers from fingerprint; a header the spider set keeps its value.
         headers = fingerprint_data.get("headers", {})
         for header_name, header_value in headers.items():
+            if self._spider_set(request, header_name):
+                continue
             request.headers[header_name] = header_value
+            # values grow with the fingerprints seen, a bounded set (Spectre's pool)
+            self._applied.setdefault(header_name.lower(), set()).add(request.headers[header_name])
         own_encoding = request.meta[OWN_ACCEPT_ENCODING]
         if own_encoding:
             request.headers["Accept-Encoding"] = own_encoding
         elif "Accept-Encoding" in request.headers:
             request.headers["Accept-Encoding"] = accept_encoding_for(
                 request.headers["Accept-Encoding"], self.decodable)
+            self._applied.setdefault("accept-encoding", set()).add(request.headers["Accept-Encoding"])
 
         request.headers.setdefault("User-Agent", self.fallback_user_agent)
+        self._mark_fingerprint_headers(request)
 
         # Store fingerprint info in request meta for tracking/debugging
         fingerprint = fingerprint_data.get("fingerprint", {})

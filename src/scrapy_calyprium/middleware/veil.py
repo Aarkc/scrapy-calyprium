@@ -13,7 +13,8 @@ Settings:
     VEIL_PROXY_TYPE: Optional proxy type (datacenter, residential, residential_rotating)
     SPIDER_ID / RUN_ID / VEIL_ALLOWED_PROVIDERS / VEIL_COUNTRY: profile policy
         and attribution, encoded as -spider_<id> / -run_<id> / -ap_<a.b> /
-        -country_<cc> username params (AAR-62, Phase 5)
+        -country_<cc> username params (AAR-62, Phase 5); MIMIC_PROXY_COUNTRY
+        pins the country when VEIL_COUNTRY is not set
 """
 
 import base64

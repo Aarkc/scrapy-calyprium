@@ -119,6 +119,8 @@ class CookieSlot:
     # Veil provider used for the solve — replay must route through the same
     # provider so cookies stay valid for the upstream IP.
     provider: Optional[str] = None
+    # Exit country the solve used, when the solver said: replays pin it too.
+    country: Optional[str] = None
     # Number of replay requests currently in flight on this cookie. Cloudflare
     # flags a cf_clearance that issues concurrent requests as bot-like and
     # blocks it early (an isolated cookie sustains ~170+ requests; one hit by
@@ -160,6 +162,8 @@ class CookieSlot:
             "success_count": self.success_count,
             "block_count": self.block_count,
             "egress_ip": self.egress_ip,
+            "provider": self.provider,
+            "country": self.country,
         }
 
     @classmethod
@@ -363,6 +367,7 @@ class DomainCache:
         preset: str = "chrome-latest",
         egress_ip: Optional[str] = None,
         provider: Optional[str] = None,
+        country: Optional[str] = None,
     ) -> CookieSlot:
         """Add a new cookie slot from a Mimic /api/solve response."""
         entry = self._entries.get(domain)
@@ -393,6 +398,7 @@ class DomainCache:
             preset=preset,
             egress_ip=egress_ip,
             provider=provider,
+            country=country,
         )
         entry.slots.append(slot)
         if len(entry.slots) > MAX_SLOTS_PER_DOMAIN:

@@ -6,8 +6,10 @@ a challenge and we need a real browser solve to earn fresh clearance cookies.
 from __future__ import annotations
 
 import logging
+import re
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -15,6 +17,45 @@ from scrapy_calyprium import _trace
 from scrapy_calyprium._policy import RunPolicy
 
 logger = logging.getLogger(__name__)
+
+#: Mimic's ``SOLVE_DEADLINE_S``: how long one /api/solve may run, every fresh-IP
+#: browser attempt included. A run whose Mimic is configured otherwise says so
+#: with the ``MIMIC_SOLVE_DEADLINE_S`` setting.
+DEFAULT_SOLVE_DEADLINE_S = 240.0
+#: Waited on top of the deadline: Mimic checks it only between attempts, so
+#: the last attempt (and the reply) can run past it.
+SOLVE_DEADLINE_MARGIN_S = 30.0
+#: A solve service that cannot even be reached is not solving.
+SOLVE_CONNECT_TIMEOUT_S = 15.0
+
+
+def solve_timeout_from_settings(settings: Any) -> float:
+    """Seconds to wait for /api/solve: ``MIMIC_SOLVE_DEADLINE_S`` (Mimic's
+    ``SOLVE_DEADLINE_S``, default 240) plus a margin. Waiting less abandons
+    solves Mimic is still running: they pile up on its browser pool while the
+    spider retries (the old fixed 90 s did that)."""
+    deadline = DEFAULT_SOLVE_DEADLINE_S
+    if settings is not None:
+        try:
+            deadline = float(settings.getfloat("MIMIC_SOLVE_DEADLINE_S", DEFAULT_SOLVE_DEADLINE_S))
+        except (AttributeError, TypeError, ValueError):
+            deadline = DEFAULT_SOLVE_DEADLINE_S
+    if deadline <= 0:
+        deadline = DEFAULT_SOLVE_DEADLINE_S
+    return deadline + SOLVE_DEADLINE_MARGIN_S
+
+
+def _country(value: Any) -> Optional[str]:
+    """A solve's exit country as the gateway username takes it (``country_<cc>``), or None."""
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[a-z0-9_]{2,16}", text) else None
+
+
+def _describe(exc: BaseException) -> str:
+    """The exception's type and message: httpx's timeouts carry no message, and
+    a bare "transport error:" said nothing."""
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 @dataclass
@@ -36,6 +77,10 @@ class SolveResult:
     egress_ip: Optional[str] = None
     # Veil provider used for the solve — replay must use the same provider
     provider: Optional[str] = None
+    # Exit country the solve left through (Mimic's SolveResponse.country): replays
+    # leave through the same one (gateway ``-country_<cc>``), or the clearance meets
+    # another IP. None when the solver does not say (the run's country then holds).
+    country: Optional[str] = None
 
 
 class SolveError(Exception):
@@ -55,7 +100,7 @@ class SolveClient:
         api_key: Optional[str] = None,
         service_secret: Optional[str] = None,
         user_id: Optional[str] = None,
-        timeout: float = 90.0,
+        timeout: float = DEFAULT_SOLVE_DEADLINE_S + SOLVE_DEADLINE_MARGIN_S,
         ip_health_url: Optional[str] = None,
         policy: Optional[RunPolicy] = None,
     ):
@@ -90,7 +135,8 @@ class SolveClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(
+                self.timeout, connect=min(self.timeout, SOLVE_CONNECT_TIMEOUT_S)))
         return self._client
 
     async def close(self):
@@ -134,11 +180,16 @@ class SolveClient:
             body["challenge_type"] = challenge_type
 
         url = f"{self.service_url}/api/solve"
+        started = time.monotonic()
         try:
             response = await client.post(url, json=body, headers=self._build_headers())
         except httpx.HTTPError as exc:
-            logger.warning("SolveClient: transport error for %s: %s", domain, exc)
-            raise SolveError(f"transport error: {exc}") from exc
+            reason = _describe(exc)
+            logger.warning(
+                "SolveClient: transport error for %s after %.0fs (timeout %.0fs): %s",
+                domain, time.monotonic() - started, self.timeout, reason,
+            )
+            raise SolveError(f"transport error: {reason}") from exc
 
         if response.status_code == 403:
             try:
@@ -192,6 +243,7 @@ class SolveClient:
             learned_rpm_cap=data.get("learned_rpm_cap"),
             egress_ip=data.get("egress_ip"),
             provider=data.get("provider"),
+            country=_country(data.get("country")),
         )
 
     async def report_ip_outcome(

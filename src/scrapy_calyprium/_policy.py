@@ -17,8 +17,14 @@ Setting                    Forwarded as
 ``MIMIC_PAID_SOLVE_MODE``  Mimic ``paid_solve_mode`` (off | token | all)
 ``MIMIC_ALLOWED_ENGINES``  Mimic ``allowed_engines``; clamps ``engine_hint``
 ``VEIL_ALLOWED_PROVIDERS`` Veil ``-ap_<a.b.c>`` (dot-joined)
-``VEIL_COUNTRY``           Veil ``-country_<cc>``; Mimic solve ``country``
+``VEIL_COUNTRY``           Veil ``-country_<cc>``; Mimic solve ``country``;
+                           Mimic fetch / session ``proxy_country``
+``MIMIC_PROXY_COUNTRY``    the same, when ``VEIL_COUNTRY`` is not set
 =========================  ===============================================
+
+The exit country is one setting for every hop: a spider pinned to ``us`` by
+either name leaves through the US on the plain proxy path, the local fetch,
+its solves and their replays, and Mimic's own fetches.
 """
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ POLICY_SETTINGS = (
     "MIMIC_ALLOWED_ENGINES",
     "VEIL_ALLOWED_PROVIDERS",
     "VEIL_COUNTRY",
+    "MIMIC_PROXY_COUNTRY",
 )
 
 
@@ -95,7 +102,8 @@ class RunPolicy:
     @classmethod
     def from_settings(cls, settings: Any) -> "RunPolicy":
         mode = _raw(settings, "MIMIC_PAID_SOLVE_MODE")
-        country = _raw(settings, "VEIL_COUNTRY")
+        # One exit country for every hop (forge sets both names to the profile's country).
+        country = _raw(settings, "VEIL_COUNTRY") or _raw(settings, "MIMIC_PROXY_COUNTRY")
         return cls(
             spider_id=_raw(settings, "SPIDER_ID"),
             run_id=_as_run_id(_raw(settings, "RUN_ID")),

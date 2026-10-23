@@ -22,7 +22,7 @@ from typing import Optional
 
 from scrapy import Request
 
-from scrapy_calyprium import _trace
+from scrapy_calyprium import _headers, _trace
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ class CalypriumTraceMiddleware:
     def __init__(self, crawler=None):
         self.crawler = crawler
         self._tracer = None
+        # computes the Referer Scrapy's RefererMiddleware gives a follow-up (see _headers)
+        self._referer = _headers.referer_middleware(getattr(crawler, "settings", None))
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -64,6 +66,7 @@ class CalypriumTraceMiddleware:
         for item in start_requests:
             if isinstance(item, Request):
                 _trace.request_trace(item)
+                item.meta.pop(_headers.SCRAPY_REFERER, None)  # no page yielded it
             yield item
 
     def process_spider_input(self, response, spider):
@@ -78,7 +81,7 @@ class CalypriumTraceMiddleware:
         parent = self._trace_id(response)
         try:
             for item in result:
-                self._note(item, counts, parent)
+                self._note(item, counts, parent, response)
                 yield item
         except Exception as exc:
             self._finish(response, counts, exc)
@@ -90,7 +93,7 @@ class CalypriumTraceMiddleware:
         parent = self._trace_id(response)
         try:
             async for item in result:
-                self._note(item, counts, parent)
+                self._note(item, counts, parent, response)
                 yield item
         except Exception as exc:
             self._finish(response, counts, exc)
@@ -103,12 +106,16 @@ class CalypriumTraceMiddleware:
         trace = (getattr(response, "meta", None) or {}).get(_trace.TRACE_KEY) if _has_meta(response) else None
         return trace.get("trace_id") if isinstance(trace, dict) else None
 
-    @staticmethod
-    def _note(item, counts, parent: Optional[str]) -> None:
+    def _note(self, item, counts, parent: Optional[str], response=None) -> None:
         if isinstance(item, Request):
             counts["requests"] += 1
             try:
                 _trace.request_trace(item, parent_trace_id=parent)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # the Referer Scrapy gave it, unlike one the spider set (see _headers)
+                _headers.note_scrapy_referer(item, response, self._referer)
             except Exception:  # noqa: BLE001
                 pass
         else:

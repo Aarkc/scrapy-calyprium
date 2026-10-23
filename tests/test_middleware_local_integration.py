@@ -31,12 +31,14 @@ class FakeRouter:
     def __init__(self):
         self.results = []
         self.fetch_calls = []
+        self.headers = []
 
     def queue(self, *items):
         self.results.extend(items)
 
-    async def fetch(self, url, *, domain):
+    async def fetch(self, url, *, domain, headers=None, **kwargs):
         self.fetch_calls.append((url, domain))
+        self.headers.append(headers)
         return self.results.pop(0)
 
 
@@ -131,7 +133,7 @@ async def test_disabled_returns_none_immediately():
 @pytest.mark.asyncio
 async def test_router_exception_falls_through_to_legacy():
     class ExplodingRouter:
-        async def fetch(self, url, *, domain):
+        async def fetch(self, url, *, domain, **kwargs):
             raise RuntimeError("router exploded")
 
     mw = _make_middleware(local_router=ExplodingRouter())

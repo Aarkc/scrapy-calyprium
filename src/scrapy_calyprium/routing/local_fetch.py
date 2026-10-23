@@ -34,7 +34,7 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 from scrapy_calyprium.routing.chrome_preset import replay_preset
@@ -130,19 +130,27 @@ def _inject_proxy_session(
     proxy_url: str,
     proxy_session_id: str,
     provider: Optional[str] = None,
+    country: Optional[str] = None,
 ) -> str:
-    """Inject sticky proxy session and provider into the proxy URL username.
+    """Inject sticky proxy session, provider and country into the proxy URL username.
 
-    Encodes the provider (e.g. webshare_rotating) and session id into the
-    gateway proxy username so the Veil gateway routes through the correct
-    upstream with sticky IP pinning.
+    Encodes the provider (e.g. webshare_rotating), the exit country and the
+    session id into the gateway proxy username, as the solve dialled them
+    (``-p_<provider>[-country_<cc>]-session_<id>``), so the Veil gateway routes
+    through the same upstream and IP that earned the clearance. The solve's
+    country replaces the run's (``-country_<cc>`` from the policy): one exit.
     """
     parsed = urlparse(proxy_url)
     if not parsed.username:
         return proxy_url
     parts = [parsed.username]
+    if country:
+        base, *params = parsed.username.split("-")
+        parts = [base, *(p for p in params if not p.startswith(("country_", "c_")))]
     if provider:
         parts.append(f"p_{provider}")
+    if country:
+        parts.append(f"country_{country}")
     parts.append(f"session_{proxy_session_id}")
     new_user = "-".join(parts)
     netloc = f"{new_user}:{parsed.password}@{parsed.hostname}"
@@ -157,6 +165,59 @@ def _build_cookie_header(cookies: List[Dict]) -> str:
     return "; ".join(
         f"{c['name']}={c['value']}" for c in cookies if c.get("name") and "value" in c
     )
+
+
+# ---------------------------------------------------------------------------
+# A request's own headers
+# ---------------------------------------------------------------------------
+
+#: Headers the fetcher owns, never taken from ``extra_headers``: the browser identity the TLS and
+#: HTTP/2 fingerprint belongs to (a cookie slot's User-Agent, the preset's client hints, the
+#: codings the backend decodes), the connection itself (forbidden on HTTP/2), and the proxy
+#: credentials, which are the gateway's and never the site's.
+_OWNED_HEADERS = frozenset({
+    "user-agent", "accept-encoding",
+    "host", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "te",
+    "trailer", "upgrade", "http2-settings", "content-length",
+    "proxy-authorization", "proxy-authenticate",
+})
+_OWNED_PREFIXES = ("sec-ch-ua", "x-veil-")
+
+
+def _request_headers(extra_headers: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], str]:
+    """``extra_headers`` the fetch may send, and the request's own Cookie header (merged with
+    the slot's cookies rather than replacing them). Both backends put a name the preset knows
+    (Accept, Referer, ...) where the browser would and append the others, so the preset's
+    header order holds."""
+    own: Dict[str, str] = {}
+    cookie = ""
+    for name, value in (extra_headers or {}).items():
+        key = str(name).lower()
+        if value is None:
+            continue
+        if key == "cookie":
+            cookie = str(value)
+        elif key not in _OWNED_HEADERS and not key.startswith(_OWNED_PREFIXES):
+            own[str(name)] = str(value)
+    return own, cookie
+
+
+def _cookie_pairs(header: str) -> List[Dict]:
+    pairs = []
+    for part in header.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip():
+            pairs.append({"name": name.strip(), "value": value.strip()})
+    return pairs
+
+
+def _merge_cookies(cookies: Optional[List[Dict]], header: str) -> List[Dict]:
+    """The slot's cookies, then the request's own (a name the slot has keeps the slot's value:
+    the clearance is what the replay is for)."""
+    merged = [c for c in (cookies or []) if c.get("name") and "value" in c]
+    names = {c["name"] for c in merged}
+    merged.extend(c for c in _cookie_pairs(header) if c["name"] not in names)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +305,12 @@ class LocalFetcher:
         preset: Optional[str] = None,
         timeout: Optional[int] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        method: str = "GET",
+        body: Optional[bytes] = None,
+        country: Optional[str] = None,
     ) -> LocalFetchResult:
-        """Perform a single HTTP GET and return raw bytes.
+        """Perform a single HTTP request (a GET unless ``method`` says otherwise) and
+        return raw bytes.
 
         Args:
             url: target URL
@@ -257,11 +322,19 @@ class LocalFetcher:
             proxy_session_id: optional sticky-session id, injected into the
                 proxy URL so the upstream gateway routes to the same IP that
                 earned the cookies.
+            country: the exit country the cookies were earned through (a
+                slot's), pinned with the session in place of the run's.
             preset: TLS fingerprint preset (httpcloak: chrome-143,
                 firefox-latest; curl_cffi: chrome120, etc.). Defaults to the
                 fetcher's default_preset.
             timeout: request timeout in seconds.
-            extra_headers: additional headers to send.
+            extra_headers: the request's own headers (a spider's X-Api-Key, Referer,
+                JSON Accept, ...). The browser identity, the codings, the connection
+                and proxy headers stay the fetcher's (see ``_OWNED_HEADERS``); a
+                Cookie header joins the slot's cookies.
+            method: the request's method; anything but GET sends ``body`` (raw bytes,
+                as the spider made them: a GraphQL query, a search form).
+            body: the request body, for a method other than GET.
 
         Returns:
             LocalFetchResult with `body` as raw bytes.
@@ -273,6 +346,7 @@ class LocalFetcher:
         """
         effective_preset = preset or self.default_preset
         effective_timeout = timeout or self.timeout
+        method = (method or "GET").upper()
 
         # Pick the best backend per-request. Firefox presets should use
         # curl_cffi because httpcloak's Firefox presets are fake (Chrome
@@ -288,9 +362,12 @@ class LocalFetcher:
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
                 provider=provider,
+                country=country,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
+                method=method,
+                body=body,
             )
         elif backend == "curl_cffi":
             return await self._fetch_curl_cffi(
@@ -300,9 +377,12 @@ class LocalFetcher:
                 proxy_url=proxy_url,
                 proxy_session_id=proxy_session_id,
                 provider=provider,
+                country=country,
                 preset=effective_preset,
                 timeout=effective_timeout,
                 extra_headers=extra_headers,
+                method=method,
+                body=body,
             )
         else:
             raise LocalFetchError(f"Unknown backend state: {backend}")
@@ -335,9 +415,12 @@ class LocalFetcher:
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
         provider: Optional[str] = None,
+        country: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
+        method: str = "GET",
+        body: Optional[bytes] = None,
     ) -> LocalFetchResult:
         import time
 
@@ -346,13 +429,15 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
+            effective_proxy = _inject_proxy_session(
+                proxy_url, proxy_session_id, provider=provider, country=country)
 
+        own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
         if user_agent:
             headers["User-Agent"] = user_agent
         if cookies:
-            headers["Cookie"] = _build_cookie_header(cookies)
+            headers["Cookie"] = _build_cookie_header(_merge_cookies(cookies, own_cookie))
             # Disable compression to avoid httpcloak decompression errors
             # (the server-side fetcher does the same — see AAR-12 sibling).
             headers["Accept-Encoding"] = "identity"
@@ -363,8 +448,9 @@ class LocalFetcher:
                 [c.get("name") for c in cookies[:10]],
                 (user_agent or "")[:60], proxy_session_id,
             )
-        if extra_headers:
-            headers.update(extra_headers)
+        elif own_cookie:
+            headers["Cookie"] = own_cookie
+        headers.update(own_headers)
 
         start = time.time()
 
@@ -377,6 +463,9 @@ class LocalFetcher:
                 preset=preset, proxy=effective_proxy, timeout=timeout
             )
             try:
+                if method != "GET":
+                    # the preset's headers as for a fetch(): known names in place, body as made
+                    return session.request(method, url, data=body, headers=headers or None)
                 if headers:
                     return session.get(url, headers=headers)
                 return session.get(url)
@@ -467,9 +556,12 @@ class LocalFetcher:
         proxy_url: Optional[str],
         proxy_session_id: Optional[str],
         provider: Optional[str] = None,
+        country: Optional[str] = None,
         preset: str,
         timeout: int,
         extra_headers: Optional[Dict[str, str]],
+        method: str = "GET",
+        body: Optional[bytes] = None,
     ) -> LocalFetchResult:
         import time
 
@@ -494,22 +586,24 @@ class LocalFetcher:
 
         effective_proxy = proxy_url
         if proxy_session_id and proxy_url:
-            effective_proxy = _inject_proxy_session(proxy_url, proxy_session_id, provider=provider)
+            effective_proxy = _inject_proxy_session(
+                proxy_url, proxy_session_id, provider=provider, country=country)
 
         proxies = None
         if effective_proxy:
             proxies = {"http": effective_proxy, "https": effective_proxy}
 
+        own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
         if user_agent:
             headers["User-Agent"] = user_agent
-        if extra_headers:
-            headers.update(extra_headers)
+        headers.update(own_headers)
 
         cookies_dict = None
         cookie_names = []
-        if cookies:
-            cookies_dict = {c["name"]: c["value"] for c in cookies if c.get("name")}
+        if cookies or own_cookie:
+            # one Cookie header: curl_cffi would send a Cookie header beside its cookie jar's
+            cookies_dict = {c["name"]: c["value"] for c in _merge_cookies(cookies, own_cookie)}
             cookie_names = list(cookies_dict.keys())
 
         if cookies:
@@ -523,13 +617,24 @@ class LocalFetcher:
         start = time.time()
         try:
             async with AsyncSession(impersonate=impersonate) as session:
-                response = await session.get(
-                    url,
-                    headers=headers or None,
-                    cookies=cookies_dict,
-                    proxies=proxies,
-                    timeout=timeout,
-                )
+                if method != "GET":
+                    response = await session.request(
+                        method,
+                        url,
+                        data=body,
+                        headers=headers or None,
+                        cookies=cookies_dict,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
+                else:
+                    response = await session.get(
+                        url,
+                        headers=headers or None,
+                        cookies=cookies_dict,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
         except Exception as exc:  # noqa: BLE001
             raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
 
