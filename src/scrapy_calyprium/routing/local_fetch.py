@@ -432,6 +432,11 @@ class LocalFetcher:
             effective_proxy = _inject_proxy_session(
                 proxy_url, proxy_session_id, provider=provider, country=country)
 
+        # A replay presents the Chrome its user agent names (a solver's clearance may name a
+        # preset of another Chrome release), and a derived chrome-<N>-windows preset, which
+        # httpcloak refuses until it is registered, is derived here too.
+        preset = replay_preset(preset, user_agent)
+
         own_headers, own_cookie = _request_headers(extra_headers)
         headers: Dict[str, str] = {}
         if user_agent:
@@ -453,10 +458,6 @@ class LocalFetcher:
         headers.update(own_headers)
 
         start = time.time()
-
-        # A solver's clearance may name a Chrome preset it derived for the current
-        # release; httpcloak refuses names it does not know, so derive it here too.
-        preset = replay_preset(preset)
 
         def _do_sync_fetch():
             session = httpcloak.Session(

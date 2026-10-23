@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
-VERSION = 2
+VERSION = 4
 
 OK = "ok"
 PROXY_FAILURE = "proxy_failure"            # 1
@@ -117,6 +117,8 @@ AMAZON = "amazon"
 GOOGLE = "google"
 DDOS_GUARD = "ddos_guard"
 SUCURI = "sucuri"
+VERCEL = "vercel"
+FASTLY = "fastly"
 
 
 @dataclass(frozen=True)
@@ -211,9 +213,37 @@ _LOGIN_PATH_RE = re.compile(
     re.I)
 _SOFT_DENY = ("access denied", "request blocked", "forbidden", "you have been blocked",
               "unusual traffic", "automated access", "bot detection", "verify you are human",
-              "are you a robot", "not a robot", "security check", "checking your browser")
+              "are you a robot", "not a robot", "security check", "checking your browser",
+              "verifying your browser")
+# Titles only a challenge, block or wall page carries (lowercased, end marks trimmed).
+_CHALLENGE_TITLES = ("just a moment", "attention required", "access denied", "please wait",
+                     "one moment, please", "403 forbidden", "forbidden", "security check",
+                     "pardon our interruption", "access to this page has been denied",
+                     "vercel security checkpoint", "verifying your browser", "checking your browser",
+                     "client challenge")
+# A JS interstitial of the site's own (a proof of work posted back, neobits.com) or a vendor's.
+_JS_INTERSTITIAL = ("verifying your browser", "checking your browser", "you will be redirected shortly")
+# PerimeterX's block page: its captcha container, its press-and-hold; and what names PerimeterX on a
+# page titled as its block page (the container can sit past a large inline stylesheet).
+_PX_BLOCK = ("px-captcha", "press & hold", "human-challenge")
+_PX_NAMES = ("_pxappid", "pxcaptcha", "perimeterx", "px-cloud.net")
+# Akamai Bot Manager's sensor script, as a page that has nothing else loads it: a path of four or
+# more short random segments and no extension (the passive script on normal pages looks the same,
+# so it only counts on a page with no content), or the akam pixel tag.
+_AKAMAI_SENSOR_SRC_RE = re.compile(r'<script[^>]*\ssrc="/[\w-]+(?:/[\w-]+){3,}"', re.I)
+_AKAMAI_SHELL = ("bazadebezolkohpepadr", "/akam/1")
+# Fastly Next-Gen WAF's client challenge ("Client Challenge", ~3KB, served with 200): its loader inserts
+# /_fs-ch-<token>/script.js. A served page of a Fastly site never names the path (mimic's
+# challenge.fastly_challenge reads the same).
+_FASTLY_SCRIPT_RE = re.compile(r"""["']/_fs-ch-[a-z0-9_-]+/script\.js""")
 _WAF_HEADERS = ("cf-ray", "x-datadome", "x-amzn-waf-action", "x-iinfo", "x-sucuri-id", "x-kpsdk-ct",
                 "x-px-", "server-timing")
+
+
+def akamai_reference(text: str) -> bool:
+    """Whether ``text`` carries the reference id of Akamai's edge deny ("Reference #18.x.y.z",
+    "Reference-ID: #0.x...", also HTML-escaped as on the stock page)."""
+    return bool(_AKAMAI_REFERENCE_RE.search((text or "")[:20000]))
 
 
 def _hdr(headers: Optional[Mapping[str, Any]], name: str) -> str:
@@ -238,22 +268,32 @@ def _retry_after(headers: Optional[Mapping[str, Any]]) -> Optional[float]:
     return None
 
 
+def _title(lower: str) -> str:
+    """The page's title, end marks trimmed; "" when it has none or only spaces and entities
+    ("&nbsp;", Akamai's interstitial)."""
+    m = re.search(r"<title[^>]*>([^<]*)</title>", lower[:8000])
+    if not m:
+        return ""
+    text = re.sub(r"&(?:nbsp|#160|#xa0);", " ", m.group(1))
+    return " ".join(text.split()).rstrip(".…! ").strip()
+
+
 def _real_structure(lower: str) -> bool:
-    """A real page rather than an interstitial: a title of its own, links, or layout tags."""
+    """A real page rather than an interstitial: a title of its own, links, or layout tags. A
+    challenge's own title is never a real page, whatever its layout (Imperva's block page sits in
+    a <main>, Vercel's checkpoint in <main> and <footer>)."""
     head = lower[:8000]
-    m = re.search(r"<title[^>]*>([^<]+)</title>", head)
-    if m:
-        title = m.group(1).strip().rstrip(".…! ").strip()
-        if title and title not in ("just a moment", "attention required", "access denied",
-                                   "please wait", "one moment, please", "403 forbidden",
-                                   "forbidden", "security check", "pardon our interruption"):
-            if head.count("<a ") >= 3 or any(t in head for t in ("<nav", "<main", "<article",
-                                                                 "<footer", "<header")):
-                return True
-            # A titled page with substantial visible text is real too.
-            text = re.sub(r"<[^>]+>", " ", lower[:40000])
-            if len(" ".join(text.split())) >= 1500:
-                return True
+    title = _title(head)
+    if title in _CHALLENGE_TITLES:
+        return False
+    if title:
+        if head.count("<a ") >= 3 or any(t in head for t in ("<nav", "<main", "<article",
+                                                             "<footer", "<header")):
+            return True
+        # A titled page with substantial visible text is real too.
+        text = re.sub(r"<[^>]+>", " ", lower[:40000])
+        if len(" ".join(text.split())) >= 1500:
+            return True
     if head.count("<a ") >= 5:
         return True
     return any(t in head for t in ("<nav", "<main", "<article"))
@@ -299,6 +339,10 @@ def _vendor_hint(lower: str, headers: Optional[Mapping[str, Any]]) -> str:
         return DDOS_GUARD
     if "sucuri" in server or "x-sucuri-id" in names:
         return SUCURI
+    if "x-vercel-mitigated" in names or "vercel security checkpoint" in lower[:40000]:
+        return VERCEL
+    if "/_fs-ch-" in lower[:50000]:
+        return FASTLY
     return ""
 
 
@@ -370,7 +414,7 @@ def diagnose_response(
 
     # --- Challenge pages (any status) ---------------------------------------------------------
     if is_html or block_status:
-        if any(m in lower for m in _CF_CHALLENGE) or _hdr(headers, "cf-mitigated").lower() == "challenge" \
+        if any(m in lower for m in _CF_CHALLENGE) or "challenge" in _hdr(headers, "cf-mitigated").lower() \
                 or (any(t in lower[:3000] for t in _CF_TITLES) and "challenge-platform" in lower):
             return d(CHALLENGE, "cloudflare_challenge", CLOUDFLARE)
         m = _DD_VAR_RE.search(lower[:20000])
@@ -379,20 +423,36 @@ def diagnose_response(
             if t and t.group(1) == "bv":
                 return d(EDGE_DENY, "datadome_banned", DATADOME)
             return d(CHALLENGE, "datadome_challenge", DATADOME)
-        if "px-captcha" in lower or "press & hold" in lower or "human-challenge" in lower:
+        title = _title(lower)
+        if any(p in lower for p in _PX_BLOCK) or (
+                title == "access to this page has been denied" and any(p in lower for p in _PX_NAMES)):
             return d(CHALLENGE, "perimeterx_challenge", PERIMETERX)
+        # Vercel's checkpoint (its Firewall's challenge action) answers 429: a challenge, not a rate limit.
+        if "vercel security checkpoint" in lower[:40000] or "challenge" in _hdr(headers, "x-vercel-mitigated").lower():
+            return d(CHALLENGE, "vercel_checkpoint", VERCEL)
+        if len(body) < 50000 and _FASTLY_SCRIPT_RE.search(lower):
+            return d(CHALLENGE, "fastly_challenge", FASTLY)
         if status in (403, 429) and (
                 "ips.js" in lower[:6000] or "kpsdk" in lower[:6000] or "149e9513-01fa" in lower[:6000]
                 or "x-kpsdk" in _header_names(headers)):
             return d(CHALLENGE, "kasada_challenge", KASADA)
+        # Akamai's interstitial: a proof of work in the page, posted to /_sec/verify with its bm-verify token.
+        if "bm-verify" in lower[:20000] and "/_sec/verify" in lower[:20000]:
+            return d(CHALLENGE, "akamai_interstitial", AKAMAI)
         if len(body) < 20000 and _SBSD_RE.search(body):
             return d(CHALLENGE, "akamai_sbsd", AKAMAI)
         if "_incapsula_resource" in lower[:6000] and "swjiylwa" in lower[:6000]:
             return d(CHALLENGE, "imperva_utmvc", IMPERVA)
         if "reese84" in lower[:20000] and block_status:
             return d(CHALLENGE, "imperva_reese84", IMPERVA)
-        if ("awswafintegration" in lower or "token.awswaf.com" in lower or "gokuprops" in lower) \
-                and not _real_structure(lower):
+        # Imperva's block page and reese84 interstitial ("Pardon Our Interruption"), served with 200.
+        if "pardon our interruption" in lower[:20000]:
+            return d(CHALLENGE, "imperva_interstitial", IMPERVA)
+        # window.gokuProps is only ever on AWS WAF's interstitial (a normal page's SDK, jsapi.js, never sets it), so it
+        # is a challenge whatever the page around it looks like; the SDK markers alone need a page with no structure,
+        # or AWS WAF's own challenge status (202; booking.com loads challenge.js from a first-party path)
+        if "gokuprops" in lower or (("awswafintegration" in lower or "token.awswaf.com" in lower)
+                                    and not _real_structure(lower)) or (status == 202 and "awswaf" in lower):
             return d(CHALLENGE, "aws_waf_challenge", AWS_WAF)
         if "enter the characters you see below" in lower or "to discuss automated access" in lower \
                 or "validatecaptcha" in lower:
@@ -406,6 +466,15 @@ def diagnose_response(
         widget = _interactive(lower)
         if widget and (block_status or not _real_structure(lower)):
             return d(CAPTCHA, f"{widget}_gate")
+        if status < 400 and len(body) < 20000 and not _real_structure(lower):
+            shown = _visible_text_len(lower)
+            # A page whose only content is Akamai's sensor script (its pixel tag, or a lone script on a
+            # random extensionless path): the sensor is the challenge.
+            if shown < 200 and (any(m in lower for m in _AKAMAI_SHELL) or _AKAMAI_SENSOR_SRC_RE.search(lower)):
+                return d(CHALLENGE, "akamai_sensor_shell", AKAMAI)
+            # A JS interstitial: the page runs a script (a proof of work, a check) and reloads.
+            if shown < 600 and "<script" in lower and any(p in lower for p in _JS_INTERSTITIAL):
+                return d(CHALLENGE, "js_interstitial")
 
     # --- Walls -------------------------------------------------------------------------------
     if status == 451:
@@ -415,7 +484,10 @@ def diagnose_response(
         return d(LOGIN_WALL, "redirect_to_sign_in")
     if status == 401:
         return d(LOGIN_WALL, "status_401", conf="low" if vendor else "high")
-    if is_html and stripped and not _real_structure(lower):
+    # A wall reads the same in any layout: office depot's geo wall is a 200 "Site Maintenance" page with
+    # its own header, <main> and footer, so a small page with little text is read too.
+    if is_html and stripped and (not _real_structure(lower)
+                                 or (len(body) < 20000 and _visible_text_len(lower) < 1500)):
         if any(p in lower for p in _GEO_PHRASES):
             return d(GEO_OR_CONSENT, "geo_wall")
         if any(p in lower for p in _CONSENT_PHRASES) or _host(final_url).startswith("consent."):
@@ -475,6 +547,10 @@ def diagnose_response(
         return d(SOFT_BLOCK, "empty_body", conf="low")
     if stripped.startswith(("<?xml", "<urlset", "<sitemapindex", "{", "[")):
         return d(OK, "")
+    # Akamai's edge deny served with 200 ("Something went wrong" and kin, with its reference id).
+    if len(body) < 20000 and akamai_reference(lower) and (not _real_structure(lower)
+                                                         or _visible_text_len(lower) < 1500):
+        return d(EDGE_DENY, "akamai_deny", AKAMAI)
     if len(body) < 10000 and not _real_structure(lower):
         if _is_markup_fragment(stripped):
             return d(OK, "")
@@ -486,7 +562,9 @@ def diagnose_response(
 
 
 def _proxy_reason_diagnosis(reason: str, status: int = 0) -> Diagnosis:
-    if "refused_domain" in reason:
+    # A vendor refusing the domain, or holding a new domain to its daily ramp: the next
+    # provider serves it (the gateway's X-Calyprium-Proxy-Error reasons).
+    if "refused_domain" in reason or "ramp_limit" in reason:
         return Diagnosis(PROVIDER_REFUSED, "", status, reason)
     if "budget" in reason or "policy" in reason:
         return Diagnosis(POLICY_STOP, "", status, reason)
@@ -528,6 +606,8 @@ def diagnose_error(error: Any, gateway_reason: Optional[str] = None) -> Diagnosi
         return Diagnosis(ORIGIN_ERROR, "", 0, "dns")
     if "refused_domain" in msg or "refused the domain" in msg:
         return Diagnosis(PROVIDER_REFUSED, "", 0, "provider_refused_domain")
+    if "ramp_limit" in msg:
+        return Diagnosis(PROVIDER_REFUSED, "", 0, "ramp_limit")
     if "timed out" in msg or "timeout" in msg:
         return Diagnosis(PROXY_FAILURE, "", 0, "timeout")
     if any(s in msg for s in _PROXY):
@@ -558,7 +638,10 @@ def from_solver(failure_class: Optional[str], vendor: str = "",
     when allowlists skipped every solver, else a solver gap)."""
     fc = (failure_class or "").strip().lower()
     if fc == "no_eligible_solver":
-        if any(r in ("not_allowlisted", "blocked_domain") for r in skipped_reasons):
+        reasons = set(skipped_reasons)
+        if "paid_cap" in reasons:
+            return Diagnosis(POLICY_STOP, vendor, 0, "paid_cap")
+        if reasons & {"not_allowlisted", "blocked_domain"}:
             return Diagnosis(PROVIDER_REFUSED, vendor, 0, "no_solver_serves_domain")
         return Diagnosis(SOLVER_FAULT, vendor, 0, "no_solver_for_challenge")
     cls = _SOLVER_MAP.get(fc)

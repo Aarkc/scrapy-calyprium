@@ -141,7 +141,16 @@ _CLOUDFLARE_MARKERS = (
     "challenge-platform", "cf-turnstile", "cf_chl_opt", "challenges.cloudflare.com",
     "just a moment", "turnstile/v0",
 )
+# Of those, the ones Cloudflare's JavaScript-detections tag carries too: it rides ordinary pages and
+# other vendors' block pages of a site behind Cloudflare, so they name Cloudflare only after the
+# other vendors' pages are ruled out.
+_CLOUDFLARE_JSD_MARKERS = ("challenge-platform", "/cdn-cgi/challenge-platform/")
 _PERIMETERX_MARKERS = ("px-captcha", "_pxappid", "human-challenge", "press & hold", "perimeterx")
+# PerimeterX's block page: its captcha container or press-and-hold (any status), or its title with a
+# name of PerimeterX's (the container can sit past a large inline stylesheet). diagnosis.py reads the same.
+_PERIMETERX_PAGE = ("px-captcha", "press & hold", "human-challenge")
+_PERIMETERX_NAMES = ("_pxappid", "pxcaptcha", "perimeterx", "px-cloud.net")
+_PERIMETERX_TITLE_RE = re.compile(r"<title[^>]*>\s*access to this page has been denied", re.I)
 # Akamai's blocking SBSD page (served 200): its only script is
 # src="/<path>?v=<uuid>&t=<challenge id>"; the passive script on normal pages has no t=.
 _SBSD_CHALLENGE_RE = re.compile(
@@ -150,6 +159,12 @@ _SBSD_CHALLENGE_RE = re.compile(
 )
 # Akamai's edge deny page: "Reference #18.x..." / "Reference-ID: #0.x...".
 _AKAMAI_REFERENCE_RE = re.compile(r"reference(?:-id)?\s*:?\s*#\d+\.[0-9a-f]+\.\d+\.[0-9a-f]+", re.I)
+# Fastly Next-Gen WAF's client challenge: a ~3KB "Client Challenge" page served with 200 whose loader
+# inserts /_fs-ch-<token>/script.js (mimic.routing.challenge.fastly_challenge reads the same).
+_FASTLY_SCRIPT_RE = re.compile(r"""["']/_fs-ch-[A-Za-z0-9_-]+/script\.js""")
+# AWS WAF's challenge (202) and captcha (405) pages; booking.com's 202 loads challenge.js from a
+# first-party path, where only "awswaf" names it.
+_AWS_WAF_MARKERS = ("awswaf", "gokuprops")
 
 
 def challenge_family(
@@ -157,41 +172,79 @@ def challenge_family(
     body: Union[bytes, str],
     headers: Optional[dict] = None,
 ) -> Optional[str]:
-    """The Tessera challenge type a blocked response shows, or None when it names no vendor.
+    """The Tessera challenge type a blocked response shows, or None when it names no vendor
+    (or none a solve should be asked for by name).
 
-    A solve that names the vendor reaches that vendor's solvers; without one Tessera
-    assumes a Cloudflare challenge. Cloudflare first (the most common, and its markup
-    can sit beside others), then the sensor vendors; Kasada before Akamai, whose CDN it
-    often sits behind. Incapsula only for its legacy ___utmvc page: the reese84 sensor
-    has no solver, and a hard incident page nothing to solve.
+    A solve that names the vendor reaches that vendor's solvers; without one Tessera assumes a
+    Cloudflare challenge. The order follows Mimic's ``challenge.classify_challenge`` and
+    ``api_family_of``:
+
+    * Cloudflare's challenge itself (its ``cf-mitigated: challenge`` header, its challenge page).
+    * Other vendors' challenge and block pages, by markers only those pages carry, on any status
+      (most are served with 200): DataDome; PerimeterX; Akamai's SBSD page; Fastly's client
+      challenge (``fastly``); Imperva's legacy ___utmvc page (``incapsula``); AWS WAF's challenge
+      or captcha on 202 / 405 (``aws_waf``); Akamai's 200 page that is only its sensor script, and
+      its 200 edge deny ("Something went wrong" with a reference id). Two vendor pages stop here
+      with no family: Akamai's bm-verify interstitial (its proof of work runs in a browser and no
+      API solver posts it) and Imperva's "Pardon Our Interruption" (the reese84 sensor has no
+      solver).
+    * Then Cloudflare's JavaScript-detections tag, which a site behind Cloudflare puts on the
+      other vendors' pages too.
+    * On a block status only (their tags and cookies ride normal pages): Kasada (before Akamai,
+      whose CDN it often sits behind), PerimeterX, DataDome, Akamai.
     """
     if isinstance(body, bytes):
-        text = body[:20_000].decode("latin-1")
+        text = body[:50_000].decode("latin-1")
     else:
-        text = (body or "")[:20_000]
-    low = text.lower()
+        text = (body or "")[:50_000]
+    size = len(body or b"")
+    window = text[:20_000]
+    low = window.lower()
     head = low[:4000]
     norm = _normalise_headers(headers)
     cookies = norm.get("set-cookie", "")
 
-    if norm.get("cf-mitigated") == "challenge" or any(m in low for m in _CLOUDFLARE_MARKERS):
+    # A header httpcloak may hand back as "['challenge']".
+    if "challenge" in norm.get("cf-mitigated", "") or any(
+            m in low for m in _CLOUDFLARE_MARKERS if m not in _CLOUDFLARE_JSD_MARKERS):
         return "cloudflare_managed"
+
+    # Other vendors' pages, before Cloudflare's detections tag.
     if "var dd=" in low or "geo.captcha-delivery.com" in low:
         return "datadome"
-    if len(body) < 20_000 and _SBSD_CHALLENGE_RE.search(text):
+    if any(m in low for m in _PERIMETERX_PAGE) or (
+            _PERIMETERX_TITLE_RE.search(low[:8000]) and any(m in low for m in _PERIMETERX_NAMES)):
+        return "perimeterx"
+    if size < 20_000 and _SBSD_CHALLENGE_RE.search(window):
         return "akamai"
+    if size < 50_000 and _FASTLY_SCRIPT_RE.search(text):
+        return "fastly"
+    if "bm-verify" in low and "/_sec/verify" in low:
+        return None
+    if status_code == 403 and "_incapsula_resource" in head and "swjiylwa" in head:
+        return "incapsula"
+    if "pardon our interruption" in low:
+        return None
+    if status_code in (202, 405) and (any(m in low for m in _AWS_WAF_MARKERS)
+                                      or "x-amzn-waf-action" in norm):
+        return "aws_waf"
+    if status_code < 400 and size < 20_000 and diagnose(status_code, body, headers=headers).evidence in (
+            "akamai_sensor_shell", "akamai_deny"):
+        return "akamai"
+    if any(m in low for m in _CLOUDFLARE_JSD_MARKERS):
+        return "cloudflare_managed"
+
     if status_code not in BLOCKED_STATUS_CODES:
         return None
     if (any(m in head for m in ("149e9513-01fa", "ips.js", "kpsdk"))
             or any(name.startswith(_WAF_HEADER_PREFIXES) for name in norm) or "kp_uidz" in cookies):
         return "kasada"
-    if status_code == 403 and "_incapsula_resource" in head and "swjiylwa" in head:
-        return "incapsula"
     if any(m in low for m in _PERIMETERX_MARKERS) or any(m in cookies for m in ("_pxhd", "_pxvid", "_px3")):
         return "perimeterx"
     if "x-datadome" in norm or "datadome=" in cookies:
         return "datadome"
     if ("bmak" in low or "_abck" in low or "akamaighost" in norm.get("server", "")
-            or _AKAMAI_REFERENCE_RE.search(text) or any(m in cookies for m in ("_abck", "bm_sz", "ak_bmsc"))):
+            or _AKAMAI_REFERENCE_RE.search(window) or dg.akamai_reference(window)
+            or any(m in cookies for m in ("_abck", "bm_sz", "ak_bmsc"))):
         return "akamai"
     return None

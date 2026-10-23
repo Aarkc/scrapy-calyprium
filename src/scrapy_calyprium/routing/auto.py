@@ -77,6 +77,24 @@ class RouteResult:
     diagnosis: Optional[dg.Diagnosis] = None
 
 
+#: A fresh Cloudflare clearance is often refused on its first replay before Cloudflare accepts it
+#: (cookie warm-up: domain_cache.MAX_SLOT_FAILURES tolerates the same). A solve's clearance refused
+#: so is replayed once more after this pause before the router gives up on it (Mimic's
+#: NATIVE_REPLAY_RETRY_DELAY_S). 0 = no second replay.
+WARMUP_REPLAY_DELAY_S = 2.0
+
+
+def _cloudflare_clearance(slot) -> bool:
+    return any(str(c.get("name", "")) == "cf_clearance" for c in (slot.cookies or []))
+
+
+def _warmup_refusal(fetch: LocalFetchResult) -> bool:
+    """A replay refused the way a fresh cf_clearance's first use is: Cloudflare's 403 / 503, or
+    its challenge again (cf-mitigated / the challenge page). A rate limit is not."""
+    return fetch.status_code in (403, 503) or challenge_family(
+        fetch.status_code, fetch.body, headers=fetch.headers) == "cloudflare_managed"
+
+
 #: Path segments (and host names) of an API endpoint: a browser has no page to load there.
 _API_SEGMENTS = frozenset({"api", "apis", "graphql", "gql", "rest", "rpc", "ajax", "services"})
 
@@ -122,6 +140,7 @@ class SpiderAutoRouter:
         solve_max_retries: int = 5,
         solve_parallel_solves: int = 3,
         tracer=None,
+        warmup_replay_delay_s: float = WARMUP_REPLAY_DELAY_S,
     ):
         self.fetcher = fetcher
         self.cache = cache
@@ -145,6 +164,9 @@ class SpiderAutoRouter:
         # The vendor each domain's last block showed (block_detect.challenge_family),
         # named in its solves -- the hot path's and the refill's.
         self._challenge_family: Dict[str, str] = {}
+        # The pause before a fresh Cloudflare clearance refused on its first replay is replayed
+        # once more (WARMUP_REPLAY_DELAY_S; 0 = never).
+        self.warmup_replay_delay_s = warmup_replay_delay_s
 
         # Phase 5: proactive cookie pool expansion. The hot path solve
         # coalescing collapses N concurrent requests into 1 solve, which is
@@ -764,26 +786,49 @@ class SpiderAutoRouter:
         self._ensure_refill_task(domain)
         return slot
 
-    async def _replay_with_slot(self, url, domain, slot, original_result, own=None):
-        """Replay a URL with a cookie slot (``own``: the request's own fetch arguments: its
-        headers, and the method and body of anything but a GET). Returns RouteResult."""
+    async def _replay_slot_once(self, url, domain, slot, own=None) -> LocalFetchResult:
+        """One fetch of ``url`` with a cookie slot's clearance, on the slot's own identity."""
         self.cache.record_request(domain, slot.slot_id)
         slot.in_flight += 1  # busy until the fetch completes (see CookieSlot)
         try:
-            try:
-                replay = await self.fetcher.fetch(
-                    url=url,
-                    cookies=slot.cookies,
-                    user_agent=slot.user_agent,
-                    proxy_url=self.proxy_url,
-                    proxy_session_id=slot.proxy_session_id,
-                    provider=slot.provider,
-                    country=slot.country,
-                    preset=slot.preset,
-                    **(own or {}),
+            return await self.fetcher.fetch(
+                url=url,
+                cookies=slot.cookies,
+                user_agent=slot.user_agent,
+                proxy_url=self.proxy_url,
+                proxy_session_id=slot.proxy_session_id,
+                provider=slot.provider,
+                country=slot.country,
+                preset=slot.preset,
+                **(own or {}),
+            )
+        finally:
+            slot.in_flight -= 1
+
+    async def _replay_with_slot(self, url, domain, slot, original_result, own=None):
+        """Replay a URL with a cookie slot (``own``: the request's own fetch arguments: its
+        headers, and the method and body of anything but a GET). Returns RouteResult.
+
+        A fresh Cloudflare clearance (a slot with a cf_clearance cookie, never replayed yet)
+        that Cloudflare refuses on this first replay is replayed once more after
+        ``warmup_replay_delay_s`` (cookie warm-up), before the router gives up on it. The
+        refusal counts against the slot (MAX_SLOT_FAILURES tolerates it), not its IP."""
+        fresh = slot.fail_count == 0 and slot.success_count == 0 and _cloudflare_clearance(slot)
+        try:
+            replay = await self._replay_slot_once(url, domain, slot, own)
+            delay = float(self.warmup_replay_delay_s or 0)
+            if (fresh and delay > 0 and _diagnose_fetch(replay, url).blocked
+                    and _warmup_refusal(replay)):
+                self.cache.record_slot_failure(
+                    domain, slot.slot_id, status_code=replay.status_code,
                 )
-            finally:
-                slot.in_flight -= 1
+                logger.info(
+                    "AutoRouter: a fresh clearance for %s was refused on its first replay "
+                    "(status=%d); replaying once more in %.1fs (cookie warm-up)",
+                    domain, replay.status_code, delay,
+                )
+                await asyncio.sleep(delay)
+                replay = await self._replay_slot_once(url, domain, slot, own)
         except LocalFetchError as exc:
             logger.warning(
                 "AutoRouter: replay error for %s: %s", domain, exc,
