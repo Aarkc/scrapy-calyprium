@@ -182,7 +182,7 @@ async def test_spider_headers_ride_on_a_cookie_replay(httpcloak):
     _assert_spider_headers(sent)
     assert sent["user-agent"] == "Slot-UA"  # the clearance's UA, not Spectre's
     assert sent["cookie"] == "cf_clearance=clear"
-    assert "-p_iproyal_static-session_s1:" in replay["proxy"]
+    assert "-p_iproyal_static-session_s1-strict_1:" in replay["proxy"]
 
 
 @pytest.mark.asyncio
@@ -323,7 +323,7 @@ async def test_a_post_is_replayed_on_a_solved_slot(httpcloak):
     sent = _sent(replay)
     assert sent["user-agent"] == "Slot-UA" and sent["cookie"] == "cf_clearance=clear"
     assert replay["preset"] == "chrome-146"
-    assert "-p_iproyal_static-session_sess1:" in replay["proxy"]
+    assert "-p_iproyal_static-session_sess1-strict_1:" in replay["proxy"]
 
 
 @pytest.mark.asyncio
