@@ -1,3 +1,10 @@
+## [1.35.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.6...v1.35.7) (2026-10-24)
+
+
+### Bug Fixes
+
+* **routing:** replay a solved slot on a strict gateway session ([ac92396](https://github.com/Aarkc/scrapy-calyprium/commit/ac92396ad46a81e35e24320406f82eb7c4ea24ca)), closes [#261](https://github.com/Aarkc/scrapy-calyprium/issues/261)
+
 ## [1.35.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.5...v1.35.6) (2026-10-24)
 
 
