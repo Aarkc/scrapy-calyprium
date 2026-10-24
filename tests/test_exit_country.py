@@ -94,10 +94,10 @@ async def test_solve_client_keeps_the_solves_country():
 def test_replay_username_names_the_solves_country_once():
     base = "http://calyprium-spider_42-country_gb:clp_k@gw:8080"
     url = _inject_proxy_session(base, "s1", provider="iproyal_static", country="us")
-    assert url == "http://calyprium-spider_42-p_iproyal_static-country_us-session_s1:clp_k@gw:8080"
+    assert url == "http://calyprium-spider_42-p_iproyal_static-country_us-session_s1-strict_1:clp_k@gw:8080"
     # no solve country: the run's stays
     assert _inject_proxy_session(base, "s1", provider="evomi") == (
-        "http://calyprium-spider_42-country_gb-p_evomi-session_s1:clp_k@gw:8080")
+        "http://calyprium-spider_42-country_gb-p_evomi-session_s1-strict_1:clp_k@gw:8080")
 
 
 def test_slot_keeps_its_provider_and_country():
@@ -134,7 +134,7 @@ async def test_a_pinned_spider_exits_us_on_every_hop(httpcloak):
     light, replay = httpcloak.calls
     assert _countries(light["proxy"]) == ["country_us"]
     assert _countries(replay["proxy"]) == ["country_us"]
-    assert "-p_iproyal_static-country_us-session_s1:" in replay["proxy"]
+    assert "-p_iproyal_static-country_us-session_s1-strict_1:" in replay["proxy"]
 
 
 @pytest.mark.asyncio
@@ -164,4 +164,12 @@ async def test_a_replay_keeps_the_country_mimic_solved_in(httpcloak):
     assert _countries(light["proxy"]) == []
     assert _countries(replay["proxy"]) == ["country_dk"]
     assert _countries(cookie_replay["proxy"]) == ["country_dk"]
-    assert "-session_s9:" in cookie_replay["proxy"]
+    assert "-session_s9-strict_1:" in cookie_replay["proxy"]
+
+
+def test_a_replay_session_is_strict_once():
+    """Gateway 1.173.24: a strict session never moves to another IP (a clearance is bound to the
+    address that earned it); the token is added once, even if the username already has it."""
+    from scrapy_calyprium.routing.local_fetch import _inject_proxy_session
+    url = _inject_proxy_session("http://calyprium-spider_42:k@gw:8080", "s1", provider="iproyal_static")
+    assert url.count("strict_1") == 1 and "-session_s1-strict_1:" in url

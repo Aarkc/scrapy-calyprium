@@ -136,9 +136,11 @@ def _inject_proxy_session(
 
     Encodes the provider (e.g. webshare_rotating), the exit country and the
     session id into the gateway proxy username, as the solve dialled them
-    (``-p_<provider>[-country_<cc>]-session_<id>``), so the Veil gateway routes
+    (``-p_<provider>[-country_<cc>]-session_<id>-strict_1``), so the Veil gateway routes
     through the same upstream and IP that earned the clearance. The solve's
     country replaces the run's (``-country_<cc>`` from the policy): one exit.
+    ``strict_1`` (gateway 1.173.24+): the session never moves to another IP, since a
+    clearance is bound to the address that earned it (an older gateway ignores it).
     """
     parsed = urlparse(proxy_url)
     if not parsed.username:
@@ -152,6 +154,8 @@ def _inject_proxy_session(
     if country:
         parts.append(f"country_{country}")
     parts.append(f"session_{proxy_session_id}")
+    if "strict_1" not in parts:
+        parts.append("strict_1")
     new_user = "-".join(parts)
     netloc = f"{new_user}:{parsed.password}@{parsed.hostname}"
     if parsed.port:

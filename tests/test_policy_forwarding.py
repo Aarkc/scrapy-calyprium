@@ -89,7 +89,7 @@ def test_local_proxy_session_injection_keeps_policy_params():
         "SPIDER_ID": "42", "CALYPRIUM_API_KEY": "clp_k", "VEIL_GATEWAY_URL": "http://gw:8080",
     }).settings)
     assert _inject_proxy_session(base, "abc", provider="evomi") == (
-        "http://calyprium-spider_42-p_evomi-session_abc:clp_k@gw:8080"
+        "http://calyprium-spider_42-p_evomi-session_abc-strict_1:clp_k@gw:8080"
     )
 
 
