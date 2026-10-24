@@ -1,3 +1,10 @@
+## [1.35.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.5...v1.35.6) (2026-10-24)
+
+
+### Bug Fixes
+
+* **routing:** re-copy mimic's failure classifier at version 5 ([d7b389c](https://github.com/Aarkc/scrapy-calyprium/commit/d7b389c1854023eaa0f0f0508ddca5e012cd8055)), closes [#256](https://github.com/Aarkc/scrapy-calyprium/issues/256)
+
 ## [1.35.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.4...v1.35.5) (2026-10-23)
 
 
