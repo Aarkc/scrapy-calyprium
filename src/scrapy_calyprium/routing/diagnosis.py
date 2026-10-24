@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
-VERSION = 4
+VERSION = 5
 
 OK = "ok"
 PROXY_FAILURE = "proxy_failure"            # 1
@@ -195,6 +195,9 @@ _SBSD_RE = re.compile(
     r'&(?:amp;)?t=[^"&]+"', re.I)
 _AKAMAI_REFERENCE_RE = re.compile(
     r"reference(?:-id)?(?:\s|&#32;)*:?(?:\s|&#32;)*(?:#|&#35;)\d+(?:\.|&#46;)[0-9a-f]+", re.I)
+# Amazon's robot check posts its form to /errors/validateCaptcha (or /errors_page/...): the path,
+# not the word, which a site's own script may carry (musicstore.com's ValidateCaptchaInputs).
+_AMAZON_CAPTCHA_FORM_RE = re.compile(r"/errors(?:_page)?/validatecaptcha\b", re.I)
 _INTERACTIVE = (
     ("hcaptcha", ("hcaptcha.com", "h-captcha")),
     ("recaptcha", ("google.com/recaptcha", "g-recaptcha", "grecaptcha", "recaptcha/api.js")),
@@ -220,7 +223,7 @@ _CHALLENGE_TITLES = ("just a moment", "attention required", "access denied", "pl
                      "one moment, please", "403 forbidden", "forbidden", "security check",
                      "pardon our interruption", "access to this page has been denied",
                      "vercel security checkpoint", "verifying your browser", "checking your browser",
-                     "client challenge")
+                     "client challenge", "robot or human")
 # A JS interstitial of the site's own (a proof of work posted back, neobits.com) or a vendor's.
 _JS_INTERSTITIAL = ("verifying your browser", "checking your browser", "you will be redirected shortly")
 # PerimeterX's block page: its captcha container, its press-and-hold; and what names PerimeterX on a
@@ -407,6 +410,12 @@ def diagnose_response(
     if not is_html:
         if "captcha-delivery.com" in lower[:4000]:
             return d(CHALLENGE, "datadome_json", DATADOME)
+        # Cloudflare's challenge under a non-HTML type: its orchestrate script
+        # (application/javascript, "window._cf_chl_opt.…") or a challenge page mislabelled.
+        # No clean API, feed or script body carries these markers.
+        if any(m in lower[:8000] for m in _CF_CHALLENGE) \
+                or "challenge" in _hdr(headers, "cf-mitigated").lower():
+            return d(CHALLENGE, "cloudflare_challenge", CLOUDFLARE)
         if ("blockscript" in lower[:4000] or "\"appid\"" in lower[:4000]) and "px" in lower[:4000]:
             return d(CHALLENGE, "perimeterx_json", PERIMETERX)
         if status == 429 and ("x-kpsdk" in _header_names(headers)):
@@ -455,7 +464,7 @@ def diagnose_response(
                                     and not _real_structure(lower)) or (status == 202 and "awswaf" in lower):
             return d(CHALLENGE, "aws_waf_challenge", AWS_WAF)
         if "enter the characters you see below" in lower or "to discuss automated access" in lower \
-                or "validatecaptcha" in lower:
+                or _AMAZON_CAPTCHA_FORM_RE.search(lower):
             return d(CAPTCHA, "amazon_robot_check", AMAZON)
         if "/sorry/index" in (final_url or "").lower() or ("our systems have detected unusual traffic"
                                                           in lower and "google" in lower):

@@ -40,3 +40,13 @@ def test_the_copy_has_what_block_detect_reads():
     assert (dg.VERCEL, dg.FASTLY) == ("vercel", "fastly")
     assert dg.akamai_reference("Reference&#32;&#35;18&#46;1a2b3c4d&#46;1700000000")
     assert not dg.akamai_reference("<p>no reference here</p>")
+
+
+def test_version_5_reads_amazons_robot_check_by_its_form_path():
+    """VERSION 5 (Mimic PR #256): a page that only names `ValidateCaptchaInputs` in a script (musicstore.com's
+    listings) is not Amazon's robot check; a Cloudflare challenge is a block under any content type."""
+    from scrapy_calyprium.routing import diagnosis as dg
+    assert dg.VERSION >= 5
+    page = ("<html><head><title>Guitars | MUSIC STORE</title></head><body>" + "<p>x</p>" * 2000
+            + "<script>var a='ViewCheckoutPayment-ValidateCaptchaInputs';</script></body></html>")
+    assert dg.diagnose_response(200, page).cls != "captcha"
