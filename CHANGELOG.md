@@ -1,3 +1,10 @@
+# [1.36.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.7...v1.36.0) (2026-10-25)
+
+
+### Features
+
+* **routing:** spread light fetches over sticky gateway sessions ([29b4621](https://github.com/Aarkc/scrapy-calyprium/commit/29b46212c617f3335557d5f2c478123dd499a582))
+
 ## [1.35.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.6...v1.35.7) (2026-10-24)
 
 
