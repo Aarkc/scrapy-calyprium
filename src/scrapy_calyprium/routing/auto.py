@@ -53,6 +53,10 @@ from scrapy_calyprium.routing.solve_client import SolveClient, SolveError
 logger = logging.getLogger(__name__)
 
 
+def _light_session_id() -> str:
+    return "lt" + uuid.uuid4().hex[:14]
+
+
 @dataclass
 class RouteResult:
     """Outcome of an auto-route attempt."""
@@ -141,6 +145,7 @@ class SpiderAutoRouter:
         solve_parallel_solves: int = 3,
         tracer=None,
         warmup_replay_delay_s: float = WARMUP_REPLAY_DELAY_S,
+        light_sessions: int = 0,
     ):
         self.fetcher = fetcher
         self.cache = cache
@@ -167,6 +172,12 @@ class SpiderAutoRouter:
         # The pause before a fresh Cloudflare clearance refused on its first replay is replayed
         # once more (WARMUP_REPLAY_DELAY_S; 0 = never).
         self.warmup_replay_delay_s = warmup_replay_delay_s
+        # Plain (light) fetches spread over this many sticky gateway sessions, round robin: one exit each,
+        # so a run's pages leave through that many addresses (MIMIC_LOCAL_LIGHT_SESSIONS). 0 keeps one
+        # session-less proxy URL, which the gateway puts on the same exit for every tunnel. A session
+        # whose fetch was refused (429) or failed in transport takes a new id, so another exit.
+        self._light_sessions: List[str] = [_light_session_id() for _ in range(max(0, int(light_sessions)))]
+        self._light_next = 0
 
         # Phase 5: proactive cookie pool expansion. The hot path solve
         # coalescing collapses N concurrent requests into 1 solve, which is
@@ -500,6 +511,20 @@ class SpiderAutoRouter:
             result.trace_id = trace_id
         return result
 
+    def _light_session(self):
+        """The next light session (its index and id), or (-1, None) with none configured."""
+        if not self._light_sessions:
+            return -1, None
+        at = self._light_next % len(self._light_sessions)
+        self._light_next += 1
+        return at, self._light_sessions[at]
+
+    def _renew_light_session(self, at: int, session: Optional[str]) -> None:
+        """A light session that was refused or failed moves to a new id (another exit), once per failure:
+        a later failure of the same old id finds it already replaced."""
+        if session and 0 <= at < len(self._light_sessions) and self._light_sessions[at] == session:
+            self._light_sessions[at] = _light_session_id()
+
     async def _fetch_inner(
         self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
         method: str = "GET", body: Optional[bytes] = None,
@@ -526,16 +551,22 @@ class SpiderAutoRouter:
         own: Dict = {"extra_headers": headers} if headers else {}
         if method != "GET":
             own.update(method=method, body=body)
+        light_at, light_session = self._light_session()
+        if light_session:
+            own["proxy_session_id"] = light_session
         try:
             light_result = await self.fetcher.fetch(
                 url=url, proxy_url=self.proxy_url, **own,
             )
         except LocalFetchError as exc:
             light_result = None
+            self._renew_light_session(light_at, light_session)
             # A transport error (timeout / connection reset) is NOT a block — a
             # solve can't fix a dead connection. Remember it so the solve step
             # can back off instead of escalating.
             transport_error = exc
+        if light_result is not None and light_result.status_code == 429:
+            self._renew_light_session(light_at, light_session)
         light_diag = _diagnose_fetch(light_result, url) if light_result else None
         if light_result and not light_diag.blocked:
             # A cookieless 200 here is often a warm-IP fluke: hard domains like
