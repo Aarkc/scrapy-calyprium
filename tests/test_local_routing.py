@@ -537,3 +537,57 @@ class TestTransportErrorBackoff:
         assert len(s.calls) == 1  # genuine block → solved
         assert result.routing_method == "solve_then_replay"
         assert result.blocked is False
+
+
+# ---------------------------------------------------------------------------
+# Light sessions: plain fetches spread over sticky gateway sessions
+# ---------------------------------------------------------------------------
+
+
+class TestLightSessions:
+    def _router(self, f, n):
+        return SpiderAutoRouter(
+            fetcher=f, cache=DomainCache(), solve_client=FakeSolveClient(),
+            proxy_url="http://user:pw@gw:8080", target_pool_size=0, light_sessions=n,
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_configured_sends_no_session(self):
+        f = FakeFetcher()
+        f.queue(_ok())
+        await self._router(f, 0).fetch("https://example.com/", domain="example.com")
+        assert "proxy_session_id" not in f.calls[0]
+
+    @pytest.mark.asyncio
+    async def test_round_robin_over_the_sessions(self):
+        f = FakeFetcher()
+        f.queue(*[_ok() for _ in range(6)])
+        router = self._router(f, 3)
+        for _ in range(6):
+            await router.fetch("https://example.com/", domain="example.com")
+        ids = [c["proxy_session_id"] for c in f.calls]
+        assert len(set(ids)) == 3
+        assert ids[:3] == ids[3:]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_session_moves_to_a_new_id(self):
+        f = FakeFetcher()
+        refused = LocalFetchResult(url="https://example.com/", final_url="https://example.com/", status_code=429,
+                                   headers={"content-type": "text/html"}, body=b"<html>slow down</html>",
+                                   backend="httpcloak")
+        f.queue(refused, _ok(), _ok())
+        router = self._router(f, 1)
+        router.solve_client.queue(SolveError("rate limited"))  # whatever the router does after a 429
+        await router.fetch("https://example.com/", domain="example.com")
+        first = f.calls[0]["proxy_session_id"]
+        await router.fetch("https://example.com/", domain="example.com")
+        assert f.calls[-1]["proxy_session_id"] != first
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_moves_the_session(self):
+        f = FakeFetcher()
+        f.queue(LocalFetchError("connection reset"), _ok())
+        router = self._router(f, 1)
+        await router.fetch("https://example.com/", domain="example.com")
+        await router.fetch("https://example.com/", domain="example.com")
+        assert f.calls[0]["proxy_session_id"] != f.calls[1]["proxy_session_id"]

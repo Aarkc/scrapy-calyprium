@@ -552,6 +552,8 @@ class MimicBrowserMiddleware:
                 target_pool_size=pool_size,
                 solve_parallel_solves=parallel_solves,
                 cold_start_burst=cold_start_burst,
+                # Plain fetches over this many sticky gateway sessions (exits), round robin; 0 = one.
+                light_sessions=self.crawler.settings.getint("MIMIC_LOCAL_LIGHT_SESSIONS", 0),
             )
 
             # Slot-stats reporter — periodically batch the local DomainCache's
