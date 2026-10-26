@@ -1,3 +1,10 @@
+## [1.36.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.2...v1.36.3) (2026-10-26)
+
+
+### Bug Fixes
+
+* **diagnosis:** linkedin's 999 is a rate limit, not a site error ([05467bf](https://github.com/Aarkc/scrapy-calyprium/commit/05467bf2b9e3af0d979a716f35e14f3f089b249b))
+
 ## [1.36.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.1...v1.36.2) (2026-10-26)
 
 
