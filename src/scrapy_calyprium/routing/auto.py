@@ -179,7 +179,7 @@ class SpiderAutoRouter:
         # Plain (light) fetches spread over this many sticky gateway sessions, round robin: one exit each,
         # so a run's pages leave through that many addresses (MIMIC_LOCAL_LIGHT_SESSIONS). 0 keeps one
         # session-less proxy URL, which the gateway puts on the same exit for every tunnel. A session
-        # whose fetch was refused (429) or failed in transport takes a new id, so another exit.
+        # whose fetch was refused (429, or LinkedIn's 999) or failed in transport takes a new id, so another exit.
         self._light_sessions: List[str] = [_light_session_id() for _ in range(max(0, int(light_sessions)))]
         self._light_next = 0
         # A domain whose plain fetch the site refused (a challenge, a deny) while it has live cookie
@@ -601,7 +601,7 @@ class SpiderAutoRouter:
                 # solve can't fix a dead connection. Remember it so the solve step
                 # can back off instead of escalating.
                 transport_error = exc
-            if light_result is not None and light_result.status_code == 429:
+            if light_result is not None and light_result.status_code in (429, 999):
                 self._renew_light_session(light_at, light_session)
             light_diag = _diagnose_fetch(light_result, url) if light_result else None
             if light_diag is not None:

@@ -591,3 +591,17 @@ class TestLightSessions:
         await router.fetch("https://example.com/", domain="example.com")
         await router.fetch("https://example.com/", domain="example.com")
         assert f.calls[0]["proxy_session_id"] != f.calls[1]["proxy_session_id"]
+
+    @pytest.mark.asyncio
+    async def test_a_999_moves_the_session_and_never_solves(self):
+        f = FakeFetcher()
+        denied = LocalFetchResult(url="https://www.linkedin.com/company/x", final_url="https://www.linkedin.com/company/x",
+                                  status_code=999, headers={"content-type": "text/html"}, body=b"<html></html>",
+                                  backend="httpcloak")
+        f.queue(denied, _ok())
+        router = self._router(f, 1)
+        result = await router.fetch("https://www.linkedin.com/company/x", domain="www.linkedin.com")
+        assert router.solve_client.calls == []
+        assert result.diagnosis.cls == "rate_limited"
+        await router.fetch("https://www.linkedin.com/company/x", domain="www.linkedin.com")
+        assert f.calls[0]["proxy_session_id"] != f.calls[1]["proxy_session_id"]

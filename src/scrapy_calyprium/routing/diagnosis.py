@@ -532,6 +532,8 @@ def diagnose_response(
         return d(EDGE_DENY, "large_403", conf="low")
     if status == 429:
         return d(RATE_LIMITED, "status_429")
+    if status == 999:  # LinkedIn's "request denied": its answer to too many requests from an address
+        return d(RATE_LIMITED, "status_999")
     if status in (404, 410):
         return d(NOT_FOUND, f"status_{status}")
     if status == 503:

@@ -192,6 +192,14 @@ class TestWafHeaderGate:
         d = diagnose(429, b"too many requests", headers=h)
         assert (d.cls, d.info.move) == (dg.RATE_LIMITED, dg.SLOW_DOWN)
 
+    def test_linkedin_999_is_a_rate_limit(self):
+        # LinkedIn's 999 ("request denied") is its answer to too many requests from an address: slow
+        # down, never solve. Read as a site error it was retried at a fixed delay, out of the spider's
+        # sight, and a crawl kept its pace while 85% of its requests were denied (2026-10-26).
+        d = diagnose(999, b"<html><script>window.onload=function(){}</script></html>",
+                     content_type="text/html")
+        assert (d.cls, d.evidence, d.info.move) == (dg.RATE_LIMITED, "status_999", dg.SLOW_DOWN)
+
     def test_akamai_server_403_blocked(self):
         h = {"Server": "AkamaiGHost", "Content-Type": "text/html"}
         assert is_blocked(403, b"<html></html>", headers=h) is True
