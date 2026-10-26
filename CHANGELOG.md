@@ -1,3 +1,13 @@
+## [1.36.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.3...v1.36.4) (2026-10-26)
+
+
+### Bug Fixes
+
+* **diagnosis:** re-copy Mimic's classifier (Akamai's challenge action is a captcha) ([b74b811](https://github.com/Aarkc/scrapy-calyprium/commit/b74b81101a9492076efc6ac8ed03a5aee04f24e7))
+* **diagnosis:** re-copy Mimic's classifier (VERSION 6: F5's bot defence) ([245c434](https://github.com/Aarkc/scrapy-calyprium/commit/245c434b363082b7bc811ed76ec9c15f23121423))
+* **routing:** replay Firefox clearances on hosts that prefer a finite-field group ([589193f](https://github.com/Aarkc/scrapy-calyprium/commit/589193fccdf2d9ec65ded98e28ab7ff46d7655e6))
+* **routing:** solve a page's call to another host of its site on that page ([262e56a](https://github.com/Aarkc/scrapy-calyprium/commit/262e56a90fdf90e31972757f1bc7983d0d2fc348))
+
 ## [1.36.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.2...v1.36.3) (2026-10-26)
 
 
