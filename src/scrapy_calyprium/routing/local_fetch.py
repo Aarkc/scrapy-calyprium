@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
+from scrapy_calyprium.routing.block_detect import is_blocked
 from scrapy_calyprium.routing.chrome_preset import replay_preset
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,9 @@ class LocalFetchResult:
     body: bytes = b""
     elapsed_ms: int = 0
     backend: str = ""
+    # Every Set-Cookie value the site sent, one per cookie (``headers`` folds a repeated header
+    # into one value, which no cookie parser can split again).
+    set_cookies: List[str] = field(default_factory=list)
 
     @property
     def content_type(self) -> str:
@@ -222,6 +226,30 @@ def _merge_cookies(cookies: Optional[List[Dict]], header: str) -> List[Dict]:
     names = {c["name"] for c in merged}
     merged.extend(c for c in _cookie_pairs(header) if c["name"] not in names)
     return merged
+
+
+def join_cookie_headers(first: str, second: str) -> str:
+    """One Cookie header from two: ``first``'s cookies, then those of ``second`` whose names
+    ``first`` lacks."""
+    return _build_cookie_header(_merge_cookies(_cookie_pairs(first or ""), second or ""))
+
+
+def _set_cookie_values(raw) -> List[str]:
+    """Every Set-Cookie value of a backend's response headers, one per cookie: httpcloak hands a
+    list per name, curl_cffi a multi-dict (whose plain items() keeps one value per name)."""
+    get_list = getattr(raw, "get_list", None)
+    if callable(get_list):
+        try:
+            return [str(v) for v in (get_list("set-cookie") or [])]
+        except Exception:  # noqa: BLE001 — fall back to reading the items
+            pass
+    items = raw.multi_items() if hasattr(raw, "multi_items") else (
+        raw.items() if hasattr(raw, "items") else ())
+    out: List[str] = []
+    for k, v in items:
+        if str(k).lower() == "set-cookie":
+            out.extend(str(x) for x in v) if isinstance(v, (list, tuple)) else out.append(str(v))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +549,8 @@ class LocalFetcher:
         if cookies:
             cf_mitigated = clean_headers.get("cf-mitigated", "")
             cf_ray = clean_headers.get("cf-ray", "")
-            blocked = response.status_code >= 400 or len(body) < 20000
+            # the shared classifier's verdict (a small page or an error status alone is no block)
+            blocked = is_blocked(response.status_code, body, headers=clean_headers)
             body_hint = ""
             if blocked and body:
                 text = body[:200].decode("utf-8", errors="replace")
@@ -546,6 +575,7 @@ class LocalFetcher:
             body=body,
             elapsed_ms=elapsed_ms,
             backend="httpcloak",
+            set_cookies=_set_cookie_values(raw),
         )
 
     # ------------------------------------------------------------------
@@ -663,7 +693,8 @@ class LocalFetcher:
             cf_ray = clean_headers.get("cf-ray", "")
             server = clean_headers.get("server", "")
             new_cookies = "set-cookie" in clean_headers
-            blocked = response.status_code >= 400 or len(body) < 20000
+            # the shared classifier's verdict (a small page or an error status alone is no block)
+            blocked = is_blocked(response.status_code, body, headers=clean_headers)
             body_hint = ""
             if blocked and body:
                 text = body[:200].decode("utf-8", errors="replace")
@@ -692,4 +723,5 @@ class LocalFetcher:
             body=body,
             elapsed_ms=elapsed_ms,
             backend="curl_cffi",
+            set_cookies=_set_cookie_values(response.headers),
         )

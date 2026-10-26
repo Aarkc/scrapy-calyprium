@@ -53,6 +53,18 @@ class TestChallengeFamily:
         assert challenge_family(403, b"nope", {"server": "AkamaiGHost"}) == "akamai"
         assert challenge_family(403, b"nope", {"set-cookie": "datadome=abc"}) == "datadome"
 
+    def test_impervas_utmvc_stub_served_with_200(self):
+        # bizfileonline.sos.ca.gov's 212-byte challenge page, served with 200.
+        stub = (b'<html>\n<head>\n<META NAME="robots" CONTENT="noindex,nofollow">\n<script src="/_Incapsula_Resource'
+                b'?SWJIYLWA=5074a744e2e3d891814e9a2dace20bd4,719d34d31c8e3a6e6fffd425f7e032f3">\n</script>\n<body>\n'
+                b'</body></html>\n')
+        assert is_blocked(200, stub, "text/html")
+        assert challenge_family(200, stub) == "incapsula"
+        # A served page carrying the script as a beacon names no vendor.
+        served = (b'<html><head><script src="/_Incapsula_Resource?SWJIYLWA=719d34d3"></script></head><body>'
+                  + b"<p>results</p>" * 600 + b"</body></html>")
+        assert challenge_family(200, served) is None
+
     def test_kasada_behind_akamais_cdn_is_kasada(self):
         assert challenge_family(429, KASADA, {**KASADA_HEADERS, "server": "AkamaiGHost"}) == "kasada"
 

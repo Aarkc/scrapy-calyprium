@@ -86,6 +86,9 @@ class RouteResult:
 #: so is replayed once more after this pause before the router gives up on it (Mimic's
 #: NATIVE_REPLAY_RETRY_DELAY_S). 0 = no second replay.
 WARMUP_REPLAY_DELAY_S = 2.0
+# How long a domain whose plain (cookieless) fetch was refused sends its requests straight to its
+# cookie slots before one request tries the plain fetch again (MIMIC_LOCAL_LIGHT_PROBE_INTERVAL).
+LIGHT_PROBE_INTERVAL_S = 60.0
 
 
 def _cloudflare_clearance(slot) -> bool:
@@ -146,6 +149,7 @@ class SpiderAutoRouter:
         tracer=None,
         warmup_replay_delay_s: float = WARMUP_REPLAY_DELAY_S,
         light_sessions: int = 0,
+        light_probe_interval: float = LIGHT_PROBE_INTERVAL_S,
     ):
         self.fetcher = fetcher
         self.cache = cache
@@ -178,6 +182,13 @@ class SpiderAutoRouter:
         # whose fetch was refused (429) or failed in transport takes a new id, so another exit.
         self._light_sessions: List[str] = [_light_session_id() for _ in range(max(0, int(light_sessions)))]
         self._light_next = 0
+        # A domain whose plain fetch the site refused (a challenge, a deny) while it has live cookie
+        # slots sends its requests straight to them for light_probe_interval seconds, then one request
+        # tries the plain fetch again: on a walled host every plain try is a wasted request (and a
+        # rationed residential one on a .gov host). A plain fetch that passes ends it. 0 = always try
+        # the plain fetch first, as before.
+        self.light_probe_interval = float(light_probe_interval or 0)
+        self._light_refused_at: Dict[str, float] = {}
 
         # Phase 5: proactive cookie pool expansion. The hot path solve
         # coalescing collapses N concurrent requests into 1 solve, which is
@@ -209,6 +220,8 @@ class SpiderAutoRouter:
         self.solve_parallel_solves = solve_parallel_solves
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
+        # Refill solves in flight (cancelled by stop_refill when the crawl ends).
+        self._refill_running: set = set()
         # Last hot-path refill check per domain. The original design used a
         # long-lived asyncio.create_task background loop, but in Scrapy's
         # Twisted-driven environment that task's `await asyncio.sleep` never
@@ -251,6 +264,8 @@ class SpiderAutoRouter:
         when there's an active await chain from a Scrapy callback.
         """
         import time as _t
+        if self._refill_stop:
+            return
         entry = self.cache.get(domain)
         if entry is None or entry.level != "cookies":
             return
@@ -308,9 +323,12 @@ class SpiderAutoRouter:
                 self._refill_in_flight.get(domain, 0) + 1
             )
             try:
-                asyncio.create_task(self._refill_one(domain, live))
+                task = asyncio.create_task(self._refill_one(domain, live))
             except RuntimeError:
                 self._refill_in_flight[domain] -= 1
+            else:
+                self._refill_running.add(task)
+                task.add_done_callback(self._refill_running.discard)
 
     async def _refill_one(self, domain: str, live_at_check: int) -> None:
         """Mint a single fresh slot. Called via fire-and-forget from
@@ -361,9 +379,11 @@ class SpiderAutoRouter:
             )
 
     def stop_refill(self) -> None:
-        """No-op since the long-lived loop was replaced by hot-path checks.
-        Kept for backwards compatibility with shutdown handlers."""
+        """End pool refills (the crawl is over): no refill solve starts after this, and the ones
+        in flight are cancelled, so a closed spider doesn't keep paying for clearances."""
         self._refill_stop = True
+        for task in list(self._refill_running):
+            task.cancel()
 
     def _report_ip_outcome(
         self,
@@ -511,6 +531,21 @@ class SpiderAutoRouter:
             result.trace_id = trace_id
         return result
 
+    def _light_refused(self, domain: str, entry) -> bool:
+        """Whether this request skips the plain fetch: the domain's last plain fetch was refused
+        less than light_probe_interval ago and it has live cookie slots to go to instead. Once
+        the interval is up, this request is the one that tries the plain fetch again (its peers
+        keep skipping while it does)."""
+        if self.light_probe_interval <= 0 or domain not in self._light_refused_at:
+            return False
+        if not (entry and entry.level == "cookies" and entry.live_slots()):
+            return False
+        now = time.monotonic()
+        if now - self._light_refused_at[domain] >= self.light_probe_interval:
+            self._light_refused_at[domain] = now
+            return False
+        return True
+
     def _light_session(self):
         """The next light session (its index and id), or (-1, None) with none configured."""
         if not self._light_sessions:
@@ -551,23 +586,29 @@ class SpiderAutoRouter:
         own: Dict = {"extra_headers": headers} if headers else {}
         if method != "GET":
             own.update(method=method, body=body)
-        light_at, light_session = self._light_session()
-        if light_session:
-            own["proxy_session_id"] = light_session
-        try:
-            light_result = await self.fetcher.fetch(
-                url=url, proxy_url=self.proxy_url, **own,
-            )
-        except LocalFetchError as exc:
-            light_result = None
-            self._renew_light_session(light_at, light_session)
-            # A transport error (timeout / connection reset) is NOT a block — a
-            # solve can't fix a dead connection. Remember it so the solve step
-            # can back off instead of escalating.
-            transport_error = exc
-        if light_result is not None and light_result.status_code == 429:
-            self._renew_light_session(light_at, light_session)
-        light_diag = _diagnose_fetch(light_result, url) if light_result else None
+        light_result = None
+        light_diag = None
+        if not self._light_refused(domain, entry):
+            light_at, light_session = self._light_session()
+            light_own = dict(own, proxy_session_id=light_session) if light_session else own
+            try:
+                light_result = await self.fetcher.fetch(
+                    url=url, proxy_url=self.proxy_url, **light_own,
+                )
+            except LocalFetchError as exc:
+                self._renew_light_session(light_at, light_session)
+                # A transport error (timeout / connection reset) is NOT a block — a
+                # solve can't fix a dead connection. Remember it so the solve step
+                # can back off instead of escalating.
+                transport_error = exc
+            if light_result is not None and light_result.status_code == 429:
+                self._renew_light_session(light_at, light_session)
+            light_diag = _diagnose_fetch(light_result, url) if light_result else None
+            if light_diag is not None:
+                if light_diag.blocked:
+                    self._light_refused_at[domain] = time.monotonic()
+                else:
+                    self._light_refused_at.pop(domain, None)
         if light_result and not light_diag.blocked:
             # A cookieless 200 here is often a warm-IP fluke: hard domains like
             # DigiKey serve ~8% of cookieless requests on Evomi IPs that recently

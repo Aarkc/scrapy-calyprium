@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from scrapy_calyprium.routing import domain_cache as dc
 from scrapy_calyprium.routing.auto import SpiderAutoRouter
 from scrapy_calyprium.routing.domain_cache import DomainCache, CookieSlot
@@ -25,6 +27,8 @@ def _router(target, budget):
     r._refill_in_flight = {}
     r._last_refill_check = {}
     r._cold_start_done = {"example.com": True}  # force the steady-state path
+    r._refill_stop = False
+    r._refill_running = set()
     return r
 
 
@@ -40,10 +44,14 @@ def _seed(cache, n):
 def _count_fired(router, monkeypatch):
     fired = []
 
+    class _Task:
+        def add_done_callback(self, cb):
+            pass
+
     def fake_create_task(coro):
         coro.close()  # don't actually run the solve
         fired.append(1)
-        return object()
+        return _Task()
 
     monkeypatch.setattr("asyncio.create_task", fake_create_task)
     router._ensure_refill_task("example.com")
@@ -87,3 +95,37 @@ def test_configure_cookie_ttl_extends_expiry():
         assert slot.is_expired is False
     finally:
         dc.configure(cookie_ttl=1800)   # restore default
+
+
+@pytest.mark.asyncio
+async def test_stop_refill_cancels_running_solves_and_starts_none():
+    """A closed spider pays for no more clearances: refills in flight are cancelled, none start."""
+    import asyncio
+
+    started = asyncio.Event()
+
+    class SlowSolve:
+        calls = 0
+
+        async def solve(self, **kwargs):
+            SlowSolve.calls += 1
+            started.set()
+            await asyncio.sleep(3600)
+
+    dc.configure(max_slots=1000)
+    router = SpiderAutoRouter(fetcher=None, cache=DomainCache(), solve_client=SlowSolve(),
+                              target_pool_size=4, cold_start_burst=2)
+    _seed(router.cache, 1)
+    router._ensure_refill_task("example.com")
+    await asyncio.wait_for(started.wait(), 1)
+    assert router._refill_running
+
+    router.stop_refill()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not router._refill_running
+    calls = SlowSolve.calls
+    router._cold_start_done.clear()
+    router._ensure_refill_task("example.com")
+    await asyncio.sleep(0)
+    assert SlowSolve.calls == calls
