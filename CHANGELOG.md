@@ -1,3 +1,10 @@
+## [1.36.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.1...v1.36.2) (2026-10-26)
+
+
+### Bug Fixes
+
+* **mimic:** keep the spider's per-domain pacing on the local route ([efa2099](https://github.com/Aarkc/scrapy-calyprium/commit/efa2099f2000ab6454dc3b9e0f6bfa11f0af6184))
+
 ## [1.36.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.0...v1.36.1) (2026-10-26)
 
 
