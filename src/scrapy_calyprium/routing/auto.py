@@ -27,16 +27,32 @@ Flow per request:
 `RouteResult` carries the diagnosis of how it ended. Returns `RouteResult`. The
 caller (MimicMiddleware) wraps it in a Scrapy Response.
 
+Akamai Bot Manager in front of a form (apps.ilsos.gov's search, 2026-10-26) is met in three
+ways no other vendor shows, each handled on the slot's own exit:
+
+* the form's POST with the page's unaccepted ``_abck`` gets no answer at all (the stream is
+  reset in ~130 ms, or the request is held): a transport error that is the site's verdict, not
+  the proxy's. It is solved as an Akamai sensor on the page (the Referer, else the homepage),
+  and the POST replayed on that solve's exit;
+* the POST with an accepted ``_abck`` meets Akamai's challenge action ("Challenge
+  Validation", diagnosis ``akamai_captcha``): the solve service answers it on the slot's
+  session (a paid recaptcha token, the page's verify call, the form posted again) and its
+  answer is the request's response;
+* minutes later the sensor's validation lapses (the site answers its 404 and resets ``_abck``):
+  the sensor is run again on the same exit and its cookies merged into the slot, the site's
+  session and ``sec_cpt`` kept, before the request is replayed.
+
 AAR-17.
 """
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from scrapy_calyprium import _outcome
@@ -187,6 +203,130 @@ def _diagnose_fetch(fetch: LocalFetchResult, url: Optional[str] = None) -> dg.Di
                     url or fetch.url, fetch.final_url)
 
 
+#: Akamai Bot Manager's own cookies. A sensor run again on a slot (the lapse) replaces these;
+#: the site's own session cookie and the challenge action's ``sec_cpt`` stay, as they do in a
+#: browser whose page reran the sensor script.
+AKAMAI_COOKIES = frozenset({"_abck", "bm_sz", "ak_bmsc", "bm_sv", "bm_mi", "bm_so", "bm_s", "bm_ss",
+                            "bm_lso", "sbsd", "sbsd_o", "sbsd_ss"})
+#: The challenge action's clearance cookie (two hours from the challenge, kept across sensor runs).
+CPT_COOKIE = "sec_cpt"
+#: The cookies a slot on an Akamai host keeps current from its responses, as a browser does.
+_AKAMAI_KEPT = AKAMAI_COOKIES | {CPT_COOKIE}
+#: How long one answer of Akamai's challenge action may take at the solve service (a 2Captcha
+#: token took 67 s, then two requests).
+CAPTCHA_DEADLINE_MS = 200_000
+#: A challenge met again on a slot this soon after its answer is not bought again at once: the slot's sensor is
+#: run again first (free). On apps.ilsos.gov the challenge came back about seven minutes after an answer
+#: (2026-10-26), and was answered again.
+CAPTCHA_MIN_INTERVAL_S = 120.0
+
+
+def _abck_accepted(value: Optional[str]) -> Optional[bool]:
+    """Whether an ``_abck`` value says Akamai accepted its sensor (second field 0); None for none."""
+    if not value:
+        return None
+    parts = str(value).split("~")
+    return len(parts) > 1 and parts[1] == "0"
+
+
+def _cookie_of(cookies: Optional[List[Dict]], name: str) -> Optional[str]:
+    for c in cookies or []:
+        if c.get("name") == name:
+            return c.get("value")
+    return None
+
+
+def _set_cookie_updates(lines: Optional[List[str]]) -> List[Tuple[str, str, Optional[str], bool]]:
+    """(name, value, domain, deletes) for each Set-Cookie line: ``deletes`` for Max-Age zero or less, or an
+    Expires date already past (a browser drops the cookie then)."""
+    out = []
+    for line in lines or []:
+        head, *attrs = str(line).split(";")
+        name, sep, value = head.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            continue
+        fields = {}
+        for attr in attrs:
+            key, _, val = attr.strip().partition("=")
+            fields[key.strip().lower()] = val.strip()
+        deletes = False
+        if "max-age" in fields:
+            try:
+                deletes = int(fields["max-age"]) <= 0
+            except ValueError:
+                deletes = False
+        elif "expires" in fields:
+            try:
+                when = email.utils.parsedate_to_datetime(fields["expires"].replace("-", " "))
+                deletes = when.timestamp() <= time.time()
+            except (TypeError, ValueError):
+                deletes = False
+        out.append((name, value.strip(), fields.get("domain") or None, deletes))
+    return out
+
+
+def _abck_reset(lines: Optional[List[str]]) -> bool:
+    """Whether a response set ``_abck`` to a value whose sensor is not accepted (the lapse)."""
+    return any(name == "_abck" and not deletes and _abck_accepted(value) is False
+               for name, value, _, deletes in _set_cookie_updates(lines))
+
+
+def _sets_akamai(lines: Optional[List[str]]) -> bool:
+    """Whether a response set Akamai Bot Manager's cookies (its sensor's ``_abck`` or ``bm_sz``)."""
+    return any(name in ("_abck", "bm_sz") for name, _, _, _ in _set_cookie_updates(lines))
+
+
+def _request_cookies(headers: Optional[Dict[str, str]]) -> List[Dict]:
+    """The cookies of a request's own Cookie header (Scrapy's jar), as ``{name, value}``."""
+    header = next((str(v) for k, v in (headers or {}).items() if str(k).lower() == "cookie"), "")
+    out = []
+    for part in header.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip():
+            out.append({"name": name.strip(), "value": value.strip()})
+    return out
+
+
+def _absorb(cookies: List[Dict], lines: Optional[List[str]], host: str, names=None) -> List[Dict]:
+    """``cookies`` with a response's Set-Cookie lines applied as a browser does (a value replaced, a
+    deleted cookie dropped, a new one added), only for ``names`` when given."""
+    out = [dict(c) for c in cookies or []]
+    for name, value, domain, deletes in _set_cookie_updates(lines):
+        if names is not None and name not in names:
+            continue
+        out = [c for c in out if c.get("name") != name]
+        if not deletes:
+            out.append({"name": name, "value": value, "domain": domain or host, "path": "/"})
+    return out
+
+
+def _merge_sensor(slot_cookies: List[Dict], solved: List[Dict]) -> List[Dict]:
+    """A slot's cookies after its sensor ran again: Akamai's cookies from the new run, every other
+    cookie the slot holds kept (the site's session, ``sec_cpt``), and the new run's others added."""
+    fresh = {c.get("name"): c for c in solved or [] if c.get("name")}
+    out = []
+    for c in slot_cookies or []:
+        name = c.get("name")
+        if name in AKAMAI_COOKIES and name in fresh:
+            continue
+        out.append(dict(c))
+    have = {c.get("name") for c in out}
+    out.extend(dict(c) for name, c in fresh.items() if name not in have)
+    return out
+
+
+def _sensor_page(url: str, headers: Optional[Dict[str, str]] = None) -> str:
+    """The page whose sensor a form's POST needs: the request's Referer on the same host (the form's own
+    page), else the host's homepage."""
+    found = {str(k).lower(): str(v) for k, v in (headers or {}).items() if v is not None}
+    parsed = urlparse(url)
+    referer = urlparse(found.get("referer", "").strip())
+    if referer.scheme in ("http", "https") and (referer.hostname or "") == (parsed.hostname or ""):
+        return referer.geturl()
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}/"
+
+
 class SpiderAutoRouter:
     def __init__(
         self,
@@ -296,6 +436,18 @@ class SpiderAutoRouter:
         # a page calling an API host of its site). Refill solves load it too: the API host's
         # homepage, which a refill opens otherwise, may be a page that no solve clears.
         self._solve_pages: Dict[str, str] = {}
+        # Hosts whose responses set Akamai's sensor cookies, and those whose slots came from an
+        # Akamai sensor solve for a form (their slots keep Akamai's cookies current and are
+        # watched for the sensor's lapse).
+        self._akamai_seen: set = set()
+        self._akamai_forms: set = set()
+        # When each slot's challenge action was last answered and its sensor last run again
+        # (monotonic): a request that met either before then replays instead of paying again.
+        self._cpt_answered: Dict[str, float] = {}
+        self._resensored: Dict[str, float] = {}
+        # Slots whose last answer came with the sensor's validation reset: their next request runs
+        # the sensor first (rather than meeting the site's 404).
+        self._resensor_due: set = set()
 
     def _solve_lock(self, domain: str) -> asyncio.Lock:
         lock = self._solve_locks.get(domain)
@@ -642,6 +794,7 @@ class SpiderAutoRouter:
         # an UnboundLocalError at the solve step.
         result = None
         transport_error = None
+        started = time.monotonic()
         # The request as made rides on every fetch of it: its own headers, and the method
         # and body of anything but a GET (a plain GET's fetches are exactly as they were).
         method = (method or "GET").upper()
@@ -666,6 +819,8 @@ class SpiderAutoRouter:
             if light_result is not None and light_result.status_code in (429, 999):
                 self._renew_light_session(light_at, light_session)
             light_diag = _diagnose_fetch(light_result, url) if light_result else None
+            if light_result is not None and _sets_akamai(light_result.set_cookies):
+                self._akamai_seen.add(domain)
             if light_diag is not None:
                 if light_diag.blocked:
                     self._light_refused_at[domain] = time.monotonic()
@@ -700,6 +855,12 @@ class SpiderAutoRouter:
         # Step 2b: light path failed → try cookie replay if available.
         if entry and level == "cookies":
             slot = entry.next_slot()
+            if slot and slot.slot_id in self._resensor_due:
+                # the slot's sensor validation lapsed on its last answer: run it again before this request
+                rerun = await self._akamai_rerun_sensor(url, domain, slot, own, started)
+                if rerun is not None:
+                    return rerun
+                slot = None
             if slot:
                 # Adaptive rate limiting: defer if this slot is already at
                 # the learned cap. The router waits inside the request
@@ -749,6 +910,9 @@ class SpiderAutoRouter:
                     # let the solve step back off rather than escalate.
                     transport_error = exc
                 else:
+                    handled = await self._akamai_answer(url, domain, slot, result, own, started)
+                    if handled is not None:
+                        return handled
                     replay_diag = _diagnose_fetch(result, url)
                     if not replay_diag.blocked:
                         self.cache.record_slot_success(domain, slot.slot_id)
@@ -806,6 +970,14 @@ class SpiderAutoRouter:
         # no challenge. Back off (the middleware falls through and Scrapy retries
         # the request) instead. When we DID see a genuine block (light_blocked, or
         # a blocked cookie-replay response in `result`), fall through to solve.
+        if (result is None and not light_blocked and transport_error is not None
+                and self._needs_akamai_sensor(domain, method, headers)):
+            # Akamai answers a form's POST with an unaccepted _abck with no answer at all (a
+            # reset stream, or a held request): the site's verdict, which a sensor solve on the
+            # form's page lifts. Not a proxy failure to back off from.
+            self._light_refused_at[domain] = time.monotonic()
+            return await self._akamai_sensor_route(url, domain, headers, own, transport_error, started)
+
         if result is None and not light_blocked and transport_error is not None:
             logger.info(
                 "AutoRouter: %s transport error (%s); backing off instead of "
@@ -951,6 +1123,7 @@ class SpiderAutoRouter:
         ``warmup_replay_delay_s`` (cookie warm-up), before the router gives up on it. The
         refusal counts against the slot (MAX_SLOT_FAILURES tolerates it), not its IP."""
         fresh = slot.fail_count == 0 and slot.success_count == 0 and _cloudflare_clearance(slot)
+        started = time.monotonic()
         try:
             replay = await self._replay_slot_once(url, domain, slot, own)
             delay = float(self.warmup_replay_delay_s or 0)
@@ -982,6 +1155,9 @@ class SpiderAutoRouter:
                 ]),
             )
 
+        handled = await self._akamai_answer(url, domain, slot, replay, own, started)
+        if handled is not None:
+            return handled
         replay_diag = _diagnose_fetch(replay, url)
         if replay_diag.blocked:
             if replay_diag.cls in (dg.CHALLENGE, dg.EDGE_DENY):
@@ -1015,3 +1191,191 @@ class SpiderAutoRouter:
             slot_id=slot.slot_id,
             diagnosis=replay_diag,
         )
+
+    # -- Akamai Bot Manager in front of a form -------------------------------------------------------
+
+    def _needs_akamai_sensor(self, domain: str, method: str, headers: Optional[Dict[str, str]]) -> bool:
+        """Whether a transport error on this request is Akamai withholding the answer: a request other
+        than a GET (a form's POST) to a host whose pages set Akamai's sensor cookies, sent with no
+        accepted ``_abck`` of its own."""
+        if (method or "GET").upper() in ("GET", "HEAD"):
+            return False
+        own = _cookie_of(_request_cookies(headers), "_abck")
+        if own is not None:
+            return _abck_accepted(own) is False
+        return domain in self._akamai_seen
+
+    def _solve_provider(self, slot) -> Optional[str]:
+        """The ``provider`` a solve on a slot's own exit names: Mimic's is the Veil provider of the exit;
+        Tessera's would force a solver, so it is left out there."""
+        return slot.provider if getattr(self.solve_client, "backend", None) == "mimic" else None
+
+    async def _akamai_sensor_route(self, url, domain, headers, own, transport_error, started) -> RouteResult:
+        """Solve Akamai's sensor on the form's page and replay the request on that solve's exit."""
+        page = self._solve_pages.get(domain) or _sensor_page(url, headers)
+        self._solve_pages[domain] = page
+        self._challenge_family[domain] = "akamai"
+        self._akamai_forms.add(domain)
+        logger.info(
+            "AutoRouter: %s gave no answer to a %s without an accepted _abck (%s); solving Akamai's "
+            "sensor on %s", domain, "form request", transport_error, page,
+        )
+        slot = None
+        async with self._solve_lock(domain):
+            entry = self.cache.get(domain)
+            if entry and entry.level == "cookies":
+                pristine = [s for s in entry.live_slots() if s.fail_count == 0]
+                if pristine:
+                    slot = min(pristine, key=lambda s: s.requests_per_minute())
+            if slot is None:
+                slot = await self._try_one_solve(domain, page)
+        if slot is None:
+            return RouteResult(
+                fetch=None, routing_method="solve_then_replay", blocked=True, domain_level="cookies",
+                error=f"akamai sensor solve failed after: {transport_error}",
+                diagnosis=dg.diagnose_error(transport_error),
+            )
+        return await self._replay_with_slot(url, domain, slot, None, own)
+
+    async def _akamai_answer(self, url, domain, slot, fetch: LocalFetchResult, own, started: float,
+                             fix: bool = True) -> Optional[RouteResult]:
+        """What a slot's response from an Akamai host calls for, once per request (``fix``): its
+        challenge action answered on the slot's session, or its sensor run again after the lapse.
+        Keeps the slot's Akamai cookies current from the response, as a browser does. None: the
+        response stands as it is."""
+        akamai = domain in self._akamai_forms
+        diag = _diagnose_fetch(fetch, url)
+        captcha = diag.evidence == "akamai_captcha"
+        if not (akamai or captcha):
+            return None
+        host = urlparse(url).hostname or domain
+        accepted_before = _abck_accepted(_cookie_of(slot.cookies, "_abck"))
+        reset = _abck_reset(fetch.set_cookies)
+        slot.cookies = _absorb(slot.cookies, fetch.set_cookies, host, _AKAMAI_KEPT)
+        if not fix:
+            return None
+        if captcha:
+            return await self._answer_akamai_captcha(url, domain, slot, fetch, own, started)
+        if akamai and reset and accepted_before and fetch.status_code != 404 and not diag.blocked:
+            # the answer came, and the sensor's validation lapsed with it: it stands, and the slot's
+            # next request runs the sensor first
+            self._resensor_due.add(slot.slot_id)
+            return None
+        lapsed = (reset and accepted_before) or (
+            fetch.status_code == 404 and _abck_accepted(_cookie_of(slot.cookies, "_abck")) is False)
+        if akamai and lapsed:
+            return await self._akamai_rerun_sensor(url, domain, slot, own, started)
+        return None
+
+    def _session_of(self, slot, own, fetch: LocalFetchResult, host: str) -> List[Dict]:
+        """The cookies a slot's request was sent with (the slot's, then the request's own that the slot
+        lacks), as its response left them."""
+        cookies = [dict(c) for c in slot.cookies or []]
+        have = {c.get("name") for c in cookies}
+        for c in _request_cookies((own or {}).get("extra_headers")):
+            if c["name"] not in have:
+                cookies.append({"name": c["name"], "value": c["value"], "domain": host, "path": "/"})
+        return _absorb(cookies, fetch.set_cookies, host)
+
+    async def _answer_akamai_captcha(self, url, domain, slot, fetch: LocalFetchResult, own,
+                                     started: float) -> Optional[RouteResult]:
+        """Akamai's challenge action met on a slot: the solve service answers it on the slot's session
+        and exit (a paid recaptcha token, under the run's paid-solve policy); its answer is the
+        request's response. None when it was not answered (the challenge page stands)."""
+        host = urlparse(url).hostname or domain
+        answered_at = self._cpt_answered.get(slot.slot_id, 0.0)
+        if (answered_at <= started and time.monotonic() - answered_at < CAPTCHA_MIN_INTERVAL_S
+                and domain in self._akamai_forms):
+            # answered on this slot moments ago and met again: not bought again at once. The sensor is run again on
+            # the slot's exit (free) and the request replayed; met once more, the challenge page stands.
+            if self._resensored.get(slot.slot_id, 0.0) > started:
+                logger.info("AutoRouter: Akamai's challenge action on %s again right after its answer and a sensor "
+                            "run; not answered again", domain)
+                return None
+            return await self._akamai_rerun_sensor(url, domain, slot, own, started)
+        async with self._solve_lock(domain):
+            if self._cpt_answered.get(slot.slot_id, 0.0) > started:
+                # answered for this slot while this request waited: its replay carries the answer
+                replay = await self._replay_slot_once(url, domain, slot, own)
+                return await self._akamai_answer(url, domain, slot, replay, own, started, fix=False) or RouteResult(
+                    fetch=replay, routing_method="httpcloak_cookies", blocked=_diagnose_fetch(replay, url).blocked,
+                    domain_level="cookies", slot_id=slot.slot_id, diagnosis=_diagnose_fetch(replay, url))
+            logger.info("AutoRouter: %s answered with Akamai's challenge action; asking the solve service to "
+                        "answer it on slot %s's session", domain, slot.slot_id)
+            try:
+                solve = await self.solve_client.solve(
+                    domain=domain, target_url=fetch.final_url or url, challenge_type="akamai_captcha",
+                    proxy_session_id=slot.proxy_session_id, provider=self._solve_provider(slot),
+                    country=slot.country, page_html=(fetch.body or b"").decode("utf-8", "replace"),
+                    cookies=self._session_of(slot, own, fetch, host), user_agent=slot.user_agent,
+                    paid=True, deadline_ms=CAPTCHA_DEADLINE_MS,
+                )
+            except SolveError as exc:
+                logger.info("AutoRouter: Akamai's challenge action on %s not answered: %s", domain, exc)
+                return None
+            if not solve.success or solve.response is None:
+                logger.info("AutoRouter: Akamai's challenge action on %s not answered: %s", domain,
+                            solve.error or "no response")
+                return None
+            self._cpt_answered[slot.slot_id] = time.monotonic()
+            slot.cookies = [{"name": c["name"], "value": c["value"], "domain": c.get("domain") or host,
+                             "path": c.get("path") or "/"} for c in solve.cookies]
+        r = solve.response
+        answered = LocalFetchResult(url=url, final_url=r.url or url, status_code=r.status, headers=dict(r.headers),
+                                    body=r.body, backend=f"solve:{solve.engine or 'tessera'}",
+                                    set_cookies=list(r.set_cookies))
+        diag = _diagnose_fetch(answered, url)
+        if diag.blocked:
+            self.cache.record_slot_failure(domain, slot.slot_id, status_code=answered.status_code)
+        else:
+            self.cache.record_slot_success(domain, slot.slot_id)
+        logger.info("AutoRouter: Akamai's challenge action on %s answered (status=%d)", domain, r.status)
+        return RouteResult(fetch=answered, routing_method="captcha_solve", blocked=diag.blocked,
+                           domain_level="cookies", slot_id=slot.slot_id, diagnosis=diag)
+
+    async def _akamai_rerun_sensor(self, url, domain, slot, own, started: float) -> Optional[RouteResult]:
+        """The sensor's validation lapsed on a slot: run the sensor again on the slot's exit, merge its
+        cookies into the slot (the site's session and ``sec_cpt`` kept) and replay the request once.
+        None when the sensor did not run (the lapsed response stands)."""
+        page = self._solve_pages.get(domain) or _sensor_page(url, (own or {}).get("extra_headers"))
+        async with self._solve_lock(domain):
+            if self._resensored.get(slot.slot_id, 0.0) <= started:
+                logger.info("AutoRouter: Akamai's sensor validation lapsed on %s (slot %s); running the sensor "
+                            "again on the slot's exit", domain, slot.slot_id)
+                try:
+                    solve = await self.solve_client.solve(
+                        domain=domain, target_url=page, challenge_type="akamai",
+                        proxy_session_id=slot.proxy_session_id, provider=self._solve_provider(slot),
+                        country=slot.country,
+                    )
+                except SolveError as exc:
+                    logger.info("AutoRouter: the sensor run on %s failed: %s", domain, exc)
+                    return None
+                if not solve.success or not solve.cookies:
+                    logger.info("AutoRouter: the sensor run on %s earned no cookies (%s)", domain, solve.error)
+                    return None
+                slot.cookies = _merge_sensor(slot.cookies, solve.cookies)
+                self._resensor_due.discard(slot.slot_id)
+                if solve.proxy_session_id and solve.proxy_session_id != slot.proxy_session_id:
+                    # the site denied the slot's exit and the solve moved to another: the slot follows it
+                    slot.proxy_session_id = solve.proxy_session_id
+                    slot.egress_ip = solve.egress_ip or slot.egress_ip
+                self._resensored[slot.slot_id] = time.monotonic()
+        try:
+            replay = await self._replay_slot_once(url, domain, slot, own)
+        except LocalFetchError as exc:
+            return RouteResult(fetch=None, routing_method="solve_then_replay", blocked=True, domain_level="cookies",
+                               error=str(exc), diagnosis=dg.diagnose_error(exc))
+        diag = _diagnose_fetch(replay, url)
+        if diag.evidence == "akamai_captcha":
+            answered = await self._akamai_answer(url, domain, slot, replay, own, started)
+            if answered is not None:
+                return answered
+        else:
+            await self._akamai_answer(url, domain, slot, replay, own, started, fix=False)
+        if diag.blocked:
+            self.cache.record_slot_failure(domain, slot.slot_id, status_code=replay.status_code)
+        else:
+            self.cache.record_slot_success(domain, slot.slot_id)
+        return RouteResult(fetch=replay, routing_method="solve_then_replay", blocked=diag.blocked,
+                           domain_level="cookies", slot_id=slot.slot_id, diagnosis=diag)

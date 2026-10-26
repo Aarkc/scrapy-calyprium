@@ -178,6 +178,17 @@ class RunPolicy:
             out["country"] = self.country
         return out
 
+    def paid_solve_fields(self) -> Dict[str, Any]:
+        """The paid-solve policy on a solve that needs a paid token (Akamai's challenge action): Mimic's
+        ``/api/solve`` decides on them as its fetches do; Tessera ignores them (a run whose policy refuses
+        paid solves sends its solves to Mimic)."""
+        out: Dict[str, Any] = {}
+        if self.allow_paid_solve is not None:
+            out["allow_paid_solve"] = self.allow_paid_solve
+        if self.paid_solve_mode:
+            out["paid_solve_mode"] = self.paid_solve_mode
+        return out
+
     def clamp_engine(self, engine: Optional[str]) -> Optional[str]:
         """Keep an engine choice inside the allow-list (None = let the server pick
         unless an allow-list forces the first allowed engine)."""

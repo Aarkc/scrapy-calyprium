@@ -558,6 +558,7 @@ class MimicBrowserMiddleware:
                 or self.crawler.settings.get("RECRAWL_USER_ID"),
                 timeout=solve_timeout,
                 policy=self.policy,
+                backend=self._solve_backend,
             )
             tracer = self._find_tracer()
 
@@ -857,7 +858,7 @@ class MimicBrowserMiddleware:
         # Success — wrap as a Scrapy Response with raw bytes (AAR-12 fix point)
         if rate_limited:
             self._local_stats["local_blocked"] += 1
-        elif result.routing_method == "solve_then_replay":
+        elif result.routing_method in ("solve_then_replay", "captcha_solve"):
             self._local_stats["local_solve"] += 1
         else:
             self._local_stats["local_success"] += 1
