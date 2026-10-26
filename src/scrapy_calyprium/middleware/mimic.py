@@ -67,6 +67,7 @@ Settings:
 """
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -78,7 +79,7 @@ from scrapy.downloadermiddlewares.cookies import CookiesMiddleware
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
-from scrapy_calyprium import _headers, _outcome, _trace, _wait
+from scrapy_calyprium import _headers, _outcome, _pacing, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 from scrapy_calyprium.routing import diagnosis as dg
@@ -312,6 +313,9 @@ class MimicBrowserMiddleware:
         self._local_enabled: bool = False
         # Scrapy's CookiesMiddleware of this crawl (found lazily; False once known to be absent).
         self._cookie_jar_mw: Any = None
+        # Per-domain pacing of the responses this middleware returns itself (see _pacing; built
+        # lazily from the crawl's downloader; False when MIMIC_PACING is off).
+        self._pacer: Any = None
         self._local_stats = {
             "local_success": 0,
             "local_blocked": 0,
@@ -818,7 +822,8 @@ class MimicBrowserMiddleware:
         if method != "GET":
             route_kwargs.update(method=method, body=request.body)
         try:
-            result = await self._local_router.fetch(request.url, domain=domain, **route_kwargs)
+            async with self._paced(request, spider):
+                result = await self._local_router.fetch(request.url, domain=domain, **route_kwargs)
         except Exception as e:
             logger.warning(
                 f"MimicMiddleware: local route raised for {request.url}: {e}; "
@@ -890,7 +895,7 @@ class MimicBrowserMiddleware:
             for key in [k for k in response_headers if str(k).lower() == "set-cookie"]:
                 del response_headers[key]
             response_headers["Set-Cookie"] = list(set_cookies)
-        return _response_from_envelope(
+        response = _response_from_envelope(
             request,
             url=result.fetch.final_url or request.url,
             status=result.fetch.status_code,
@@ -898,6 +903,43 @@ class MimicBrowserMiddleware:
             body=result.fetch.body,
             content_type=ct,
         )
+        self._downloaded(request, response, spider, result.fetch.elapsed_ms)
+        return response
+
+    def _pacer_for(self) -> Optional["_pacing.SlotPacer"]:
+        """The crawl's SlotPacer, or None: MIMIC_PACING off, or no downloader yet."""
+        if self._pacer is None:
+            crawler = self.crawler
+            if crawler is None:
+                return None
+            if not crawler.settings.getbool("MIMIC_PACING", True):
+                self._pacer = False
+                return None
+            downloader = getattr(getattr(crawler, "engine", None), "downloader", None)
+            if downloader is None:
+                return None  # not built yet: look again next time
+            self._pacer = _pacing.SlotPacer(downloader)
+        return self._pacer or None
+
+    def _paced(self, request, spider):
+        """Hold a fetch this middleware makes itself to the request's download slot: its
+        DOWNLOAD_DELAY / AutoThrottle delay and per-domain concurrency (see _pacing)."""
+        pacer = self._pacer_for()
+        return pacer.paced(request, spider) if pacer else contextlib.nullcontext()
+
+    def _downloaded(self, request, response, spider, elapsed_ms: int) -> None:
+        """What Scrapy's downloader does for a response it fetched: the site's response time in
+        meta download_latency and the response_downloaded signal, which AutoThrottle adjusts the
+        slot's delay from. The time is the final fetch's, not the route's (a solve is no
+        measure of the site's speed)."""
+        if not self._pacer_for() or request.meta.get(_pacing.DOWNLOAD_SLOT) is None:
+            return
+        request.meta["download_latency"] = max(0.0, float(elapsed_ms or 0) / 1000.0)
+        try:
+            self.crawler.signals.send_catch_log(signal=signals.response_downloaded,
+                                                response=response, request=request, spider=spider)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MimicMiddleware: response_downloaded not sent for %s: %s", request.url, exc)
 
     def _cookies_middleware(self) -> Optional[CookiesMiddleware]:
         """Scrapy's CookiesMiddleware of this crawl, or None: COOKIES_ENABLED off,
@@ -999,11 +1041,12 @@ class MimicBrowserMiddleware:
 
             # Auto-routing mode: use /api/fetch which tries httpcloak first,
             # then escalates to browser only when blocked.
-            if self.render_all and not explicit_browser:
-                return await self._fetch_auto(client, request)
+            async with self._paced(request, spider):
+                if self.render_all and not explicit_browser:
+                    return await self._fetch_auto(client, request)
 
-            # Explicit browser mode: use a session for full JS rendering
-            return await self._fetch_browser(client, request, spider)
+                # Explicit browser mode: use a session for full JS rendering
+                return await self._fetch_browser(client, request, spider)
 
         except Exception as e:
             # Per-request fallback: this request continues as a plain download.
