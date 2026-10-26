@@ -205,6 +205,15 @@ _AMAZON_CAPTCHA_FORM_RE = re.compile(r"/errors(?:_page)?/validatecaptcha\b", re.
 # script and the reese84 sensor, neither of which clears it (bizfileonline.sos.ca.gov, 2026-10-26).
 IMPERVA_INCIDENT_RE = re.compile(r"""_incapsula_resource\?(?:cwudnsai|swudnsai)=\d+[^"'<>]*?[?&;]edet=(\d+)""")
 IMPERVA_CAPTCHA_EDET = "12"
+# Akamai Bot Manager's challenge action ("Challenge Validation"): the challenge sits in a frame, <iframe
+# id="sec-cpt-if" provider="...">, beside a form (sec_chlge_form) that re-posts the request the page stood in for
+# (?akamai-challenge-resubmit=true) once /_sec/cp_challenge/verify takes the answer. The provider names the
+# challenge: a captcha (recaptcha with its data-key: apps.ilsos.gov's search, 2026-10-26, served to real Chrome
+# with an accepted _abck too) or Akamai's own proof of work (crypto). Its script sits on a random extensionless
+# path, so the page read as the sensor's shell before.
+_AKAMAI_CPT_FRAME_RE = re.compile(r"""<iframe[^>]*\sid=["']?sec-cpt-if\b[^>]*>""")
+_AKAMAI_CPT_PROVIDER_RE = re.compile(r"""\sprovider=["']?([\w-]+)""")
+_AKAMAI_CPT_FORM = ("akamai-challenge-resubmit", "sec_chlge_form")
 _INTERACTIVE = (
     ("hcaptcha", ("hcaptcha.com", "h-captcha")),
     ("recaptcha", ("google.com/recaptcha", "g-recaptcha", "grecaptcha", "recaptcha/api.js")),
@@ -373,6 +382,17 @@ def imperva_captcha(html: Optional[str]) -> bool:
     return bool(m) and m.group(1) == IMPERVA_CAPTCHA_EDET
 
 
+def akamai_challenge_provider(html: Optional[str]) -> Optional[str]:
+    """The provider of Akamai's challenge action when ``html`` is its page ("recaptcha", "crypto", ...; "" when the
+    page names none), else None (see _AKAMAI_CPT_FRAME_RE)."""
+    lower = (html or "")[:20000].lower()
+    frame = _AKAMAI_CPT_FRAME_RE.search(lower)
+    if frame:
+        m = _AKAMAI_CPT_PROVIDER_RE.search(frame.group(0))
+        return m.group(1) if m else ""
+    return "" if any(m in lower for m in _AKAMAI_CPT_FORM) else None
+
+
 def _interactive(lower: str) -> str:
     for name, markers in _INTERACTIVE:
         if any(m in lower for m in markers):
@@ -478,6 +498,13 @@ def diagnose_response(
         # Akamai's interstitial: a proof of work in the page, posted to /_sec/verify with its bm-verify token.
         if "bm-verify" in lower[:20000] and "/_sec/verify" in lower[:20000]:
             return d(CHALLENGE, "akamai_interstitial", AKAMAI)
+        # Akamai's challenge action: a person's captcha (no sensor clears it: an accepted _abck is what the page
+        # was served to), or its own proof of work, which a browser clears.
+        cpt = akamai_challenge_provider(lower)
+        if cpt is not None:
+            if cpt in ("crypto", ""):
+                return d(CHALLENGE, "akamai_cpt", AKAMAI)
+            return d(CAPTCHA, "akamai_captcha", AKAMAI)
         if len(body) < 20000 and _SBSD_RE.search(body):
             return d(CHALLENGE, "akamai_sbsd", AKAMAI)
         if imperva_captcha(lower):
