@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
 
-VERSION = 5
+VERSION = 6
 
 OK = "ok"
 PROXY_FAILURE = "proxy_failure"            # 1
@@ -119,6 +119,7 @@ DDOS_GUARD = "ddos_guard"
 SUCURI = "sucuri"
 VERCEL = "vercel"
 FASTLY = "fastly"
+F5 = "f5"
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,21 @@ _AKAMAI_REFERENCE_RE = re.compile(
 # Amazon's robot check posts its form to /errors/validateCaptcha (or /errors_page/...): the path,
 # not the word, which a site's own script may carry (musicstore.com's ValidateCaptchaInputs).
 _AMAZON_CAPTCHA_FORM_RE = re.compile(r"/errors(?:_page)?/validatecaptcha\b", re.I)
+# Imperva's incident page: an iframe of /_Incapsula_Resource?CWUDNSAI=<n>&... (SWUDNSAI on some builds) naming
+# Imperva's error code as edet (the JSON block answer's errorCode carries the same numbers). edet=12 is its CAPTCHA:
+# the iframe holds an hCaptcha form ("Additional security check is required"); the page beside it loads the utmvc
+# script and the reese84 sensor, neither of which clears it (bizfileonline.sos.ca.gov, 2026-10-26).
+IMPERVA_INCIDENT_RE = re.compile(r"""_incapsula_resource\?(?:cwudnsai|swudnsai)=\d+[^"'<>]*?[?&;]edet=(\d+)""")
+IMPERVA_CAPTCHA_EDET = "12"
+# Akamai Bot Manager's challenge action ("Challenge Validation"): the challenge sits in a frame, <iframe
+# id="sec-cpt-if" provider="...">, beside a form (sec_chlge_form) that re-posts the request the page stood in for
+# (?akamai-challenge-resubmit=true) once /_sec/cp_challenge/verify takes the answer. The provider names the
+# challenge: a captcha (recaptcha with its data-key: apps.ilsos.gov's search, 2026-10-26, served to real Chrome
+# with an accepted _abck too) or Akamai's own proof of work (crypto). Its script sits on a random extensionless
+# path, so the page read as the sensor's shell before.
+_AKAMAI_CPT_FRAME_RE = re.compile(r"""<iframe[^>]*\sid=["']?sec-cpt-if\b[^>]*>""")
+_AKAMAI_CPT_PROVIDER_RE = re.compile(r"""\sprovider=["']?([\w-]+)""")
+_AKAMAI_CPT_FORM = ("akamai-challenge-resubmit", "sec_chlge_form")
 _INTERACTIVE = (
     ("hcaptcha", ("hcaptcha.com", "h-captcha")),
     ("recaptcha", ("google.com/recaptcha", "g-recaptcha", "grecaptcha", "recaptcha/api.js")),
@@ -239,6 +255,14 @@ _AKAMAI_SHELL = ("bazadebezolkohpepadr", "/akam/1")
 # /_fs-ch-<token>/script.js. A served page of a Fastly site never names the path (mimic's
 # challenge.fastly_challenge reads the same).
 _FASTLY_SCRIPT_RE = re.compile(r"""["']/_fs-ch-[a-z0-9_-]+/script\.js""")
+# F5 BIG-IP's bot defence (ASM / Advanced WAF, "TSPD"). Its cookies: TS<hex> (TS01xxxxxx, TS<8 hex>0nn), TSPD_101*.
+# Its pages: the JavaScript challenge (~7KB, served 200, window["bobcmn"] naming TSPD_101) and the image captcha
+# (served 200, its default text below). A request that lacks the cookies its script makes just before a protected
+# request (a search POST) gets an empty 200 that sets its cookies. Normal pages load its /TSPD/ scripts too.
+# wyobiz.wyo.gov, 2026-10-26.
+_F5_COOKIE_RE = re.compile(r"(?:^|[,;]\s*)(?:ts[0-9a-f]{8,}(?:_\d+)?|tspd_101\w*)=")
+_F5_CHALLENGE = 'window["bobcmn"]'
+_F5_CAPTCHA = "this question is for testing whether you are a human visitor"
 _WAF_HEADERS = ("cf-ray", "x-datadome", "x-amzn-waf-action", "x-iinfo", "x-sucuri-id", "x-kpsdk-ct",
                 "x-px-", "server-timing")
 
@@ -346,7 +370,27 @@ def _vendor_hint(lower: str, headers: Optional[Mapping[str, Any]]) -> str:
         return VERCEL
     if "/_fs-ch-" in lower[:50000]:
         return FASTLY
+    if _F5_CHALLENGE in lower[:20000] or "/tspd/" in lower[:60000]:
+        return F5
     return ""
+
+
+def imperva_captcha(html: Optional[str]) -> bool:
+    """Whether a page is Imperva's CAPTCHA: its incident iframe with edet=12 (see IMPERVA_INCIDENT_RE). A browser's
+    page of it carries the same iframe tag, its frames' documents inlined after it."""
+    m = IMPERVA_INCIDENT_RE.search((html or "")[:8000].lower())
+    return bool(m) and m.group(1) == IMPERVA_CAPTCHA_EDET
+
+
+def akamai_challenge_provider(html: Optional[str]) -> Optional[str]:
+    """The provider of Akamai's challenge action when ``html`` is its page ("recaptcha", "crypto", ...; "" when the
+    page names none), else None (see _AKAMAI_CPT_FRAME_RE)."""
+    lower = (html or "")[:20000].lower()
+    frame = _AKAMAI_CPT_FRAME_RE.search(lower)
+    if frame:
+        m = _AKAMAI_CPT_PROVIDER_RE.search(frame.group(0))
+        return m.group(1) if m else ""
+    return "" if any(m in lower for m in _AKAMAI_CPT_FORM) else None
 
 
 def _interactive(lower: str) -> str:
@@ -441,6 +485,12 @@ def diagnose_response(
             return d(CHALLENGE, "vercel_checkpoint", VERCEL)
         if len(body) < 50000 and _FASTLY_SCRIPT_RE.search(lower):
             return d(CHALLENGE, "fastly_challenge", FASTLY)
+        # F5's image captcha and its JavaScript challenge, both served 200 (the captcha page carries the
+        # challenge's script too, so it is read first).
+        if _F5_CAPTCHA in lower:
+            return d(CAPTCHA, "f5_captcha", F5)
+        if _F5_CHALLENGE in lower[:20000]:
+            return d(CHALLENGE, "f5_challenge", F5)
         if status in (403, 429) and (
                 "ips.js" in lower[:6000] or "kpsdk" in lower[:6000] or "149e9513-01fa" in lower[:6000]
                 or "x-kpsdk" in _header_names(headers)):
@@ -448,8 +498,17 @@ def diagnose_response(
         # Akamai's interstitial: a proof of work in the page, posted to /_sec/verify with its bm-verify token.
         if "bm-verify" in lower[:20000] and "/_sec/verify" in lower[:20000]:
             return d(CHALLENGE, "akamai_interstitial", AKAMAI)
+        # Akamai's challenge action: a person's captcha (no sensor clears it: an accepted _abck is what the page
+        # was served to), or its own proof of work, which a browser clears.
+        cpt = akamai_challenge_provider(lower)
+        if cpt is not None:
+            if cpt in ("crypto", ""):
+                return d(CHALLENGE, "akamai_cpt", AKAMAI)
+            return d(CAPTCHA, "akamai_captcha", AKAMAI)
         if len(body) < 20000 and _SBSD_RE.search(body):
             return d(CHALLENGE, "akamai_sbsd", AKAMAI)
+        if imperva_captcha(lower):
+            return d(CAPTCHA, "imperva_captcha", IMPERVA)
         if "_incapsula_resource" in lower[:6000] and "swjiylwa" in lower[:6000]:
             return d(CHALLENGE, "imperva_utmvc", IMPERVA)
         if "reese84" in lower[:20000] and block_status:
@@ -555,6 +614,9 @@ def diagnose_response(
     if status == 204 or not is_html:
         return d(OK, "")
     if not stripped:
+        # F5's answer to a request without the cookies its script makes (see _F5_COOKIE_RE): empty, setting them.
+        if _F5_COOKIE_RE.search(_hdr(headers, "set-cookie").lower()):
+            return d(CHALLENGE, "f5_empty_answer", F5)
         return d(SOFT_BLOCK, "empty_body", conf="low")
     if stripped.startswith(("<?xml", "<urlset", "<sitemapindex", "{", "[")):
         return d(OK, "")

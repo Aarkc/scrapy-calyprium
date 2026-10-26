@@ -106,11 +106,66 @@ def _warmup_refusal(fetch: LocalFetchResult) -> bool:
 _API_SEGMENTS = frozenset({"api", "apis", "graphql", "gql", "rest", "rpc", "ajax", "services"})
 
 
+_SITES = None
+
+
+def _site(host: str) -> str:
+    """The registrable domain of ``host`` (``ohiosos.gov`` for ``businesssearch.ohiosos.gov``),
+    from tldextract's bundled public suffix list (Scrapy's own dependency; the list is never
+    fetched); the host itself when it has none or tldextract is missing."""
+    global _SITES
+    host = (host or "").lower().rstrip(".")
+    if _SITES is None:
+        try:
+            from tldextract import TLDExtract
+            _SITES = TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
+        except Exception:  # noqa: BLE001 — without it only one host is its own site
+            _SITES = False
+    if _SITES:
+        try:
+            parts = _SITES(host)
+        except Exception:  # noqa: BLE001
+            return host
+        if parts.domain and parts.suffix:
+            return f"{parts.domain}.{parts.suffix}"
+    return host
+
+
+def _calling_page(url: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The page whose script made a request to another host of its own site, or None.
+
+    A browser sends ``Origin`` on a script's cross-origin request (fetch, XMLHttpRequest) and
+    never on a navigation. When it names another host of the request's site, the request is
+    the page's call to an API host, and that page is where a browser earns the clearance
+    (Cloudflare's cf_clearance holds for every host of the zone): the ``Referer`` when it is
+    on the origin's host, else the origin's homepage. The API host's own URLs may be no page
+    at all: businesssearchapi.ohiosos.gov blocks every request that does not come from
+    businesssearch.ohiosos.gov (no Origin or Referer of it) with a 403 page that no solve
+    clears, so a browser sent there earns nothing, while the search page's managed challenge
+    gives the clearance its API takes (2026-10-26)."""
+    found = {str(k).lower(): str(v) for k, v in (headers or {}).items() if v is not None}
+    origin = urlparse(found.get("origin", "").strip())
+    host = (urlparse(url).hostname or "").lower()
+    page_host = (origin.hostname or "").lower()
+    if origin.scheme not in ("http", "https") or not page_host or not host or page_host == host:
+        return None
+    if _site(page_host) != _site(host):
+        return None
+    referer = urlparse(found.get("referer", "").strip())
+    if referer.scheme in ("http", "https") and (referer.hostname or "").lower() == page_host:
+        return referer.geturl()
+    return f"{origin.scheme}://{origin.netloc}/"
+
+
 def _solve_url(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None) -> str:
     """The page a solve loads for a request. Mimic's /api/solve opens a URL in a browser (a GET):
-    a GET solves on its own URL, a POST to a page (a search form) on that page, and a POST to an
+    a page's call to another host of its site (``_calling_page``) solves on that page; else a
+    GET solves on its own URL, a POST to a page (a search form) on that page, and a POST to an
     API (a JSON or GraphQL body, or an api / graphql path) on the site's homepage, whose
     clearance cookies are the host's. The request itself is then replayed as it was made."""
+    page = _calling_page(url, headers)
+    if page:
+        return page
     if (method or "GET").upper() in ("GET", "HEAD"):
         return url
     parsed = urlparse(url)
@@ -237,6 +292,10 @@ class SpiderAutoRouter:
         # in parallel during cold start without hammering Mimic forever.
         self._refill_in_flight: Dict[str, int] = {}
         self._cold_start_done: Dict[str, bool] = {}
+        # The page a domain's requests solve on when it is not the domain's own (``_calling_page``:
+        # a page calling an API host of its site). Refill solves load it too: the API host's
+        # homepage, which a refill opens otherwise, may be a page that no solve clears.
+        self._solve_pages: Dict[str, str] = {}
 
     def _solve_lock(self, domain: str) -> asyncio.Lock:
         lock = self._solve_locks.get(domain)
@@ -336,9 +395,12 @@ class SpiderAutoRouter:
         and a transient failure should not affect spider throughput."""
         try:
             try:
+                # the page the domain's requests solve on, when it is not the domain's own
+                page = self._solve_pages.get(domain)
                 solve = await self.solve_client.solve(
                     domain=domain, provider=self.provider, solvers=self.solvers,
                     challenge_type=self._challenge_family.get(domain),
+                    **({"target_url": page} if page else {}),
                 )
             except SolveError as exc:
                 logger.info(
@@ -805,6 +867,9 @@ class SpiderAutoRouter:
 
                 # We hold the lock — one solve, no parallel fan-out. A solve loads a page;
                 # the request (a POST too) is replayed as made.
+                page = _calling_page(url, headers)
+                if page:
+                    self._solve_pages[domain] = page
                 winning_slot = await self._try_one_solve(domain, _solve_url(url, method, headers))
 
             if winning_slot is not None:
