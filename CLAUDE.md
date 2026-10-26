@@ -56,6 +56,20 @@ response itself (`response_received` never fires for it), and sends `attempt` / 
 `/api/fetch`. Retry delays use `_wait.sleep` (asyncio or Twisted, per reactor); a download slot's delay
 would not apply to Mimic-served requests, which never enter the slot queue.
 
+### Pace and Proxy-Pool Backpressure (`middleware/portfolio.py`)
+
+The gateway shares a capacity-capped proxy vendor across the platform's spiders, and it refuses a request it
+cannot give a connection as `pool_busy` (`503 Service Unavailable (pool_busy)` + `X-Calyprium-Proxy-Error`;
+`_pool_busy.py` has the texts each client surfaces). `PaceMiddleware` (120: after Offsite/RobotsTxt drop
+requests, before Mimic answers its own) holds the spider to `CALYPRIUM_PACE_PPM` pages a minute, spider-wide;
+not installed without it. `PoolBusyMiddleware` (950: `process_exception`/`process_response` run in descending
+order, so it sees a refusal before HttpCache, DownloaderStats, Scrapy's RetryMiddleware and Mimic) requeues the
+request after a jittered backoff without touching its retry counts, and backs `downloader.total_concurrency`
+off (AIMD, `CALYPRIUM_POOL_AIMD`). On the local route the router ends at once with `RouteResult.pool_busy`
+(no solve, no slot/exit/IP blame, no span), and `MimicBrowserMiddleware` raises `PoolBusyError` from
+`process_request`; every `process_exception` sees it. A refusal is never a failure in the run stats
+(`pool_busy_count`). Forge registers both classes behind a guarded import.
+
 ### Local-First Auto-Routing (`routing/`)
 
 This is the most complex subsystem. The flow per request:
@@ -113,6 +127,8 @@ Each `CookieSlot` in the `DomainCache` has:
 | `VEIL_PROXY_TYPE` | Veil username `-type_`; also the tier (`fast` / `residential`) `CalypriumRequestTracer` puts on Veil-path spans |
 | `FORGE_SERVICE_SECRET` | Legacy Forge auth; only used when no `CALYPRIUM_API_KEY` (see `_forge.ForgeAuth`) |
 | `CALYPRIUM_RETRY_ENABLED`, `CALYPRIUM_RETRY_TIMES`, `CALYPRIUM_RETRY_DELAY`, `CALYPRIUM_RETRY_MAX_DELAY` | Calyprium retry in `MimicBrowserMiddleware` (on by default; 2 retries, 5 s base, 60 s cap) |
+| `CALYPRIUM_PACE_PPM`, `CALYPRIUM_PACE_BURST` | `PaceMiddleware`: spider-wide pages/min (off unless set), token-bucket burst (1) |
+| `CALYPRIUM_POOL_BUSY_MAX_REQUEUES`, `CALYPRIUM_POOL_BUSY_DELAY`, `CALYPRIUM_POOL_BUSY_MAX_DELAY`, `CALYPRIUM_POOL_AIMD` | `PoolBusyMiddleware`: requeues per request (30), backoff 2-10 s, concurrency AIMD (on) |
 | `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: wait for Prism to index an unknown domain (404) before closing as `prism_no_urls` (default 900 s); refill failures back off 2 s doubling to 60 s |
 | `SNAPSHOTS_ENABLED`, `SNAPSHOTS_SAMPLE`, `SNAPSHOTS_ERRORS`, `SNAPSHOTS_MAX_BYTES` | `SnapshotRecorder` extension: gzipped sample/error/blocked pages uploaded to `{run prefix}/snapshots/{sha256}.html.gz` and reported to forge `POST /jobs/spiders/{slug}/runs/{n}/snapshots` at close |
 

@@ -28,6 +28,9 @@ Settings:
         sends the headers the spider set on the request (not the fingerprint's;
         the fetcher keeps its User-Agent, client hints and codings), and a POST
         its method and body (the solve loads a page, then the POST is replayed).
+        A local fetch the proxy gateway refuses for a busy pool raises
+        ``PoolBusyError`` from process_request (nothing solves or falls back):
+        PoolBusyMiddleware requeues the request (see middleware/portfolio.py).
     MIMIC_ESCALATION_TTL: seconds a domain stays escalated to ``maximum``
         stealth after a blocked Mimic response (default: 600)
     MIMIC_TRANSPORT_RETRIES: retries for transport errors (timeouts,
@@ -86,7 +89,7 @@ from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
 from scrapy_calyprium import _browser_submit as _bsub
-from scrapy_calyprium import _headers, _outcome, _pacing, _trace, _wait
+from scrapy_calyprium import _headers, _outcome, _pacing, _pool_busy, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
 from scrapy_calyprium.routing import diagnosis as dg
@@ -335,6 +338,7 @@ class MimicBrowserMiddleware:
             "local_blocked": 0,
             "local_solve": 0,
             "fallback_legacy": 0,
+            "pool_busy": 0,
         }
 
     @classmethod
@@ -755,11 +759,12 @@ class MimicBrowserMiddleware:
         if self._local_enabled:
             logger.info(
                 "MimicMiddleware: local-first stats: success=%d cookies_solve=%d "
-                "blocked=%d fallback_legacy=%d",
+                "blocked=%d fallback_legacy=%d pool_busy=%d",
                 self._local_stats["local_success"],
                 self._local_stats["local_solve"],
                 self._local_stats["local_blocked"],
                 self._local_stats["fallback_legacy"],
+                self._local_stats["pool_busy"],
             )
             if self._local_router:
                 # No solves for a crawl that is over: none started, the running ones cancelled.
@@ -816,6 +821,10 @@ class MimicBrowserMiddleware:
 
         Per-request opt-out via meta['mimic_local_skip']=True; per-request
         opt-in to *always* use the browser via meta['mimic_force_browser']=True.
+
+        Raises PoolBusyError when the proxy gateway refused the fetch for a busy pool:
+        not the site's answer, so neither a fall-back nor a block (PoolBusyMiddleware
+        requeues the request).
         """
         if not self._local_router:
             return None
@@ -858,6 +867,10 @@ class MimicBrowserMiddleware:
             self._local_stats["fallback_legacy"] += 1
             request.meta[_outcome.FALLBACK_DIAGNOSIS] = _outcome.of_error(e)
             return None
+
+        if getattr(result, "pool_busy", False):
+            self._local_stats["pool_busy"] += 1
+            raise _pool_busy.PoolBusyError(result.error or "")
 
         route_diag = getattr(result, "diagnosis", None)
         diagnosis = route_diag.to_dict() if isinstance(route_diag, dg.Diagnosis) else None

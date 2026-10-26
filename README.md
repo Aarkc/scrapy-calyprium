@@ -20,6 +20,7 @@ scrapy_calyprium.configure(api_key="clp_your_key_here")
 This auto-configures:
 - **VeilProxyMiddleware** — routes requests through rotating proxies with TLS fingerprinting
 - **MimicBrowserMiddleware** — renders JavaScript pages with stealth browser instances
+- **PaceMiddleware** / **PoolBusyMiddleware** — an optional pages-per-minute pace, and backpressure when the shared proxy pool is busy
 - **S3 feed storage** — write spider output to Calyprium storage using Scrapy's built-in `S3FeedStorage`
 
 ## Usage
@@ -79,6 +80,36 @@ sign-in / geo / consent walls, policy). A retry carries `meta["calyprium_attempt
 and `meta["max_retry_times"]` work as with Scrapy's RetryMiddleware; with that middleware enabled,
 the statuses in `RETRY_HTTP_CODES` are left to it. Stats: `calyprium/retry/<class>` per retry,
 `calyprium/class/<class>` per final response.
+
+### Pace and a Shared Proxy Pool
+
+`configure()` adds two downloader middlewares from `scrapy_calyprium.middleware.portfolio`:
+
+- **PaceMiddleware** (120) holds the whole spider, all domains together, to `CALYPRIUM_PACE_PPM` pages a
+  minute (a token bucket of `CALYPRIUM_PACE_BURST` tokens). It paces every attempt, including the ones
+  `MimicBrowserMiddleware` answers itself on the local route, where `DOWNLOAD_DELAY` and the per-domain
+  concurrency do not apply. Without the setting it is not installed. Stats: `calyprium/pace/delayed`,
+  `calyprium/pace/wait_seconds`.
+- **PoolBusyMiddleware** (950) handles the Calyprium gateway's `pool_busy` answer. The gateway sends it when
+  the shared proxy pool has no free connection: `503 Service Unavailable (pool_busy)` with
+  `X-Calyprium-Proxy-Error: pool_busy`, which Scrapy reports as a `TunnelError` for HTTPS and the local route
+  as `PoolBusyError`. It is not the site's answer, so the request goes back in the queue after a 2-10 s
+  jittered backoff and keeps its retries (`retry_times` and the Calyprium retry's count). Nothing solves,
+  falls back or blames a cookie slot, exit or domain, and the run's stats do not count the refusal as a
+  failure. After `CALYPRIUM_POOL_BUSY_MAX_REQUEUES` refusals of one request, the usual error handling takes
+  over. With `CALYPRIUM_POOL_AIMD` on, each refusal cuts `CONCURRENT_REQUESTS` to 3/4, at most once every
+  5 s and never below 1. Every 20 responses in a row without a refusal add 1 back, up to the configured
+  value. Stats: `calyprium/pool_busy`, `calyprium/pool_busy/requeued`,
+  `calyprium/pool_busy/max_reached`, `calyprium/pool_busy/wait_seconds`,
+  `calyprium/pool_busy/concurrency`.
+
+```python
+DOWNLOADER_MIDDLEWARES = {
+    "scrapy_calyprium.PaceMiddleware": 120,
+    "scrapy_calyprium.PoolBusyMiddleware": 950,
+}
+CALYPRIUM_PACE_PPM = 30  # optional: one page every 2 s
+```
 
 ### Saving Output to Calyprium Storage
 
@@ -168,6 +199,12 @@ All middleware requires a valid API key. Set it via:
 | `CALYPRIUM_RETRY_TIMES` | Retries per request | `2` |
 | `CALYPRIUM_RETRY_DELAY` | Seconds before a `retry_later`; base of the `slow_down` backoff | `5` |
 | `CALYPRIUM_RETRY_MAX_DELAY` | Cap on any retry delay (seconds) | `60` |
+| `CALYPRIUM_PACE_PPM` | Spider-wide pages per minute, all domains together (`0` = off) | off |
+| `CALYPRIUM_PACE_BURST` | Pages the pace lets go at once after an idle spell | `1` |
+| `CALYPRIUM_POOL_BUSY_MAX_REQUEUES` | Requeues of one request for the gateway's `pool_busy` before the usual error handling | `30` |
+| `CALYPRIUM_POOL_BUSY_DELAY` | Shortest backoff before a requeued request goes again (seconds) | `2` |
+| `CALYPRIUM_POOL_BUSY_MAX_DELAY` | Longest backoff; the ceiling doubles with each refusal up to this (seconds) | `10` |
+| `CALYPRIUM_POOL_AIMD` | Lower `CONCURRENT_REQUESTS` on `pool_busy`, raise it back after successes | `True` |
 | `PRISM_WAIT_FOR_SCAN_S` | `PrismSitemapSpider`: how long to wait for Prism to index an unknown domain before closing as `prism_no_urls` (ends 30 s before `CLOSESPIDER_TIMEOUT`) | `900` |
 
 ## Development

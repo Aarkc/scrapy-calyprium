@@ -105,8 +105,13 @@ class CalypriumConfig:
             # one trace per request: starts each download attempt, before the others
             "scrapy_calyprium.middleware.tracing.CalypriumTraceMiddleware": 50,
             "scrapy_calyprium.middleware.veil.VeilProxyMiddleware": 100,
+            # CALYPRIUM_PACE_PPM: pages/min spider-wide, after Offsite/RobotsTxt drop requests and
+            # before Mimic answers its own (not installed without the setting)
+            "scrapy_calyprium.middleware.portfolio.PaceMiddleware": 120,
             "scrapy_calyprium.middleware.spectre.SpectreMiddleware": 150,
             "scrapy_calyprium.middleware.mimic.MimicBrowserMiddleware": 200,
+            # requeues the gateway's pool_busy refusals before any other middleware handles them
+            "scrapy_calyprium.middleware.portfolio.PoolBusyMiddleware": 950,
         }
         settings["SPIDER_MIDDLEWARES"] = {
             "scrapy_calyprium.middleware.tracing.CalypriumTraceMiddleware": 50,
