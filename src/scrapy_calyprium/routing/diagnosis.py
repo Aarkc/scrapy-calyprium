@@ -556,6 +556,11 @@ def diagnose_response(
         return d(SOFT_BLOCK, "empty_body", conf="low")
     if stripped.startswith(("<?xml", "<urlset", "<sitemapindex", "{", "[")):
         return d(OK, "")
+    # A bare answer with no markup at all ("True", "OK", a token, a count) under an HTML type: what a form's
+    # verify call or a small endpoint returns (tncab.tnsos.gov's captcha verify answers "True"). No vendor's
+    # challenge or block page comes without markup.
+    if "<" not in stripped and len(stripped) < 2000 and not any(s in lower for s in _SOFT_DENY):
+        return d(OK, "text_answer")
     # Akamai's edge deny served with 200 ("Something went wrong" and kin, with its reference id).
     if len(body) < 20000 and akamai_reference(lower) and (not _real_structure(lower)
                                                          or _visible_text_len(lower) < 1500):
@@ -597,6 +602,12 @@ _DNS = ("name or service not known", "nodename nor servname", "no such host",
         "getaddrinfo failed", "nxdomain", "could not resolve host", "temporary failure in name")
 
 
+# The gateway refusing a destination for every provider the request may use, as a client relays it: httpcloak
+# quotes the CONNECT reply ("403 Forbidden - destination blocked by proxy provider policy", connection.py's
+# ProviderRefused), camoufox's Page.goto names a proxy that answered the CONNECT with 403.
+_PROVIDER_POLICY = ("blocked by proxy provider policy", "ns_error_proxy_forbidden")
+
+
 def diagnose_error(error: Any, gateway_reason: Optional[str] = None) -> Diagnosis:
     """Classify a transport-level failure (no HTTP response from the site)."""
     if gateway_reason:
@@ -607,6 +618,8 @@ def diagnose_error(error: Any, gateway_reason: Optional[str] = None) -> Diagnosi
         m = re.search(r"x-calyprium-proxy-error[\"':=\s]+([a-z_0-9]+)", msg)
         if m:
             return _proxy_reason_diagnosis(m.group(1))
+    if any(s in msg for s in _PROVIDER_POLICY):
+        return Diagnosis(PROVIDER_REFUSED, "", 0, "provider_refused_domain")
     if any(s in msg for s in _DEADLINE):
         return Diagnosis(CAPACITY, "", 0, "deadline")
     if any(s in msg for s in _CAPACITY):

@@ -74,6 +74,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from scrapy import signals
+from scrapy.downloadermiddlewares.cookies import CookiesMiddleware
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
@@ -176,12 +177,13 @@ def _response_from_envelope(request, url, status, headers, body, content_type):
 # AAR-17: optional local-first routing components. Imported lazily so the
 # middleware still works for users who haven't installed scrapy-calyprium[local].
 try:
-    from scrapy_calyprium.routing.auto import SpiderAutoRouter, RouteResult
+    from scrapy_calyprium.routing.auto import LIGHT_PROBE_INTERVAL_S, SpiderAutoRouter, RouteResult
     from scrapy_calyprium.routing.domain_cache import DomainCache
     from scrapy_calyprium.routing import domain_cache as domain_cache_module
     from scrapy_calyprium.routing.local_fetch import (
         LocalFetcher,
         is_local_fetch_available,
+        join_cookie_headers,
     )
     from scrapy_calyprium.routing.solve_client import SolveClient, solve_timeout_from_settings
     from scrapy_calyprium.routing.slot_stats import SlotStatsReporter
@@ -217,6 +219,14 @@ def _transport_errors() -> tuple:
 #: Exceptions treated as transient transport failures (mirrors Scrapy's
 #: RetryMiddleware.EXCEPTIONS_TO_RETRY).
 _TRANSPORT_ERRORS = _transport_errors()
+
+
+def _default_pool_size(settings) -> int:
+    """The cookie pool a spider gets without MIMIC_LOCAL_POOL_SIZE: two slots per request it
+    sends to a domain at a time, at most the legacy 8 (Scrapy's default 8 per domain keeps 8)."""
+    per_domain = settings.getint("CONCURRENT_REQUESTS_PER_DOMAIN", 8) or 8
+    overall = settings.getint("CONCURRENT_REQUESTS", 16) or 16
+    return min(8, max(2, 2 * min(per_domain, overall)))
 
 
 def _builtin_retry_active(settings) -> bool:
@@ -300,6 +310,8 @@ class MimicBrowserMiddleware:
         self._solve_client: Optional["SolveClient"] = None
         self._slot_stats_reporter: Optional["SlotStatsReporter"] = None
         self._local_enabled: bool = False
+        # Scrapy's CookiesMiddleware of this crawl (found lazily; False once known to be absent).
+        self._cookie_jar_mw: Any = None
         self._local_stats = {
             "local_success": 0,
             "local_blocked": 0,
@@ -478,8 +490,12 @@ class MimicBrowserMiddleware:
             timeout = self.crawler.settings.getint("DOWNLOAD_TIMEOUT", 60)
             # Cookie-pool sizing (throughput ≈ pool_size × rpm_cap). Defaults
             # match the legacy 8 slots × 10 RPM. Raise the pool to scale up;
-            # keep rpm_cap low to protect cf_clearance lifetime.
-            pool_size = self.crawler.settings.getint("MIMIC_LOCAL_POOL_SIZE", 8)
+            # keep rpm_cap low to protect cf_clearance lifetime. A spider that
+            # sends one or two requests to a domain at a time gets a smaller
+            # pool (two slots per request in flight), so it doesn't pay for
+            # solves (and walled hosts' rationed exits) it can never use.
+            pool_size = self.crawler.settings.getint(
+                "MIMIC_LOCAL_POOL_SIZE", _default_pool_size(self.crawler.settings))
             max_slots = self.crawler.settings.getint("MIMIC_LOCAL_MAX_SLOTS", max(8, pool_size))
             rpm_cap = self.crawler.settings.getfloat("MIMIC_LOCAL_SLOT_RPM_CAP", 10.0)
             # Target throughput: ask for a pages/min rate and let the pool size
@@ -491,8 +507,10 @@ class MimicBrowserMiddleware:
             if target_rpm > 0 and rpm_cap > 0:
                 import math
                 pool_size = min(max_slots, max(1, math.ceil(target_rpm / rpm_cap)))
-            parallel_solves = self.crawler.settings.getint("MIMIC_LOCAL_PARALLEL_SOLVES", 3)
-            cold_start_burst = self.crawler.settings.getint("MIMIC_LOCAL_COLD_START_BURST", 4)
+            # Never more solves at once than the pool has room for beside its first slot.
+            room = max(1, pool_size - 1)
+            parallel_solves = self.crawler.settings.getint("MIMIC_LOCAL_PARALLEL_SOLVES", min(3, room))
+            cold_start_burst = self.crawler.settings.getint("MIMIC_LOCAL_COLD_START_BURST", min(4, room))
             # Cookie TTL (seconds): how long a solved cf_clearance is reused
             # before retirement. Extend it (0 = keep the built-in default) when
             # the domain's clearance outlives the default, for more pages/solve.
@@ -554,6 +572,10 @@ class MimicBrowserMiddleware:
                 cold_start_burst=cold_start_burst,
                 # Plain fetches over this many sticky gateway sessions (exits), round robin; 0 = one.
                 light_sessions=self.crawler.settings.getint("MIMIC_LOCAL_LIGHT_SESSIONS", 0),
+                # Seconds a domain whose plain fetch was refused goes straight to its clearances
+                # before one request tries the plain fetch again; 0 = always try it first.
+                light_probe_interval=self.crawler.settings.getfloat(
+                    "MIMIC_LOCAL_LIGHT_PROBE_INTERVAL", LIGHT_PROBE_INTERVAL_S),
             )
 
             # Slot-stats reporter — periodically batch the local DomainCache's
@@ -720,6 +742,9 @@ class MimicBrowserMiddleware:
                 self._local_stats["local_blocked"],
                 self._local_stats["fallback_legacy"],
             )
+            if self._local_router:
+                # No solves for a crawl that is over: none started, the running ones cancelled.
+                self._local_router.stop_refill()
             if self._slot_stats_reporter:
                 try:
                     await self._slot_stats_reporter.stop()
@@ -782,7 +807,13 @@ class MimicBrowserMiddleware:
 
         # The request as made: its own headers, and the method and body of anything but a GET
         # (a storefront's GraphQL or search POST is fetched, solved and replayed locally too).
-        route_kwargs: Dict[str, Any] = {"headers": _local_headers(request)}
+        # Its Cookie header carries the cookies earlier responses set (Scrapy's cookie jar).
+        headers = _local_headers(request)
+        jar = self._jar_cookie(request, spider)
+        if jar:
+            name = next((k for k in headers if k.lower() == "cookie"), "Cookie")
+            headers[name] = join_cookie_headers(headers.get(name, ""), jar)
+        route_kwargs: Dict[str, Any] = {"headers": headers}
         method = (request.method or "GET").upper()
         if method != "GET":
             route_kwargs.update(method=method, body=request.body)
@@ -852,14 +883,59 @@ class MimicBrowserMiddleware:
             or result.fetch.headers.get("Content-Type")
             or ""
         )
+        response_headers: Dict[str, Any] = dict(result.fetch.headers)
+        set_cookies = getattr(result.fetch, "set_cookies", None)
+        if set_cookies:
+            # One header per cookie, so Scrapy's cookie middleware stores every one.
+            for key in [k for k in response_headers if str(k).lower() == "set-cookie"]:
+                del response_headers[key]
+            response_headers["Set-Cookie"] = list(set_cookies)
         return _response_from_envelope(
             request,
             url=result.fetch.final_url or request.url,
             status=result.fetch.status_code,
-            headers=result.fetch.headers,
+            headers=response_headers,
             body=result.fetch.body,
             content_type=ct,
         )
+
+    def _cookies_middleware(self) -> Optional[CookiesMiddleware]:
+        """Scrapy's CookiesMiddleware of this crawl, or None: COOKIES_ENABLED off,
+        MIMIC_LOCAL_COOKIE_JAR off, or no crawler yet."""
+        if self._cookie_jar_mw is None:
+            crawler = self.crawler
+            if crawler is None:
+                return None
+            if not crawler.settings.getbool("MIMIC_LOCAL_COOKIE_JAR", True):
+                self._cookie_jar_mw = False
+                return None
+            manager = getattr(getattr(getattr(crawler, "engine", None), "downloader", None),
+                              "middleware", None)
+            if manager is None:
+                return None  # the downloader isn't built yet: look again next time
+            self._cookie_jar_mw = next(
+                (m for m in getattr(manager, "middlewares", ()) if isinstance(m, CookiesMiddleware)),
+                False,
+            )
+        return self._cookie_jar_mw or None
+
+    def _jar_cookie(self, request, spider) -> str:
+        """The Cookie header Scrapy's cookie middleware would send with ``request``: the
+        cookies earlier responses set, and the request's own ``cookies=``. That middleware
+        (700) never sees a request this one (200) answers, so the local route sent none of
+        them; its process_response still stores what each response sets. Empty when cookies
+        are off, under meta ``dont_merge_cookies``, or with nothing stored for the URL."""
+        mw = self._cookies_middleware()
+        if mw is None:
+            return ""
+        probe = request.replace()  # it rewrites the Cookie header of the request it is given
+        try:
+            mw.process_request(probe, spider)
+        except Exception as exc:  # noqa: BLE001 — a jar failure must not fail the fetch
+            logger.debug("MimicMiddleware: cookie jar unavailable for %s: %s", request.url, exc)
+            return ""
+        value = probe.headers.get("Cookie")
+        return _header_text(value) if value else ""
 
     async def process_request(self, request, spider):
         """Intercept requests that need stealth rendering.
