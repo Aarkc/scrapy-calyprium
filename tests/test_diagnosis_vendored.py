@@ -50,3 +50,28 @@ def test_version_5_reads_amazons_robot_check_by_its_form_path():
     page = ("<html><head><title>Guitars | MUSIC STORE</title></head><body>" + "<p>x</p>" * 2000
             + "<script>var a='ViewCheckoutPayment-ValidateCaptchaInputs';</script></body></html>")
     assert dg.diagnose_response(200, page).cls != "captcha"
+
+
+def test_version_6_names_f5s_bot_defence():
+    """VERSION 6: F5 BIG-IP's bot defence (wyobiz.wyo.gov). Its image captcha, served 200, was read as a page; its
+    empty answer to a search POST without its script-made cookies was an anonymous low-confidence soft block. Both
+    reach the SDK through block_detect, with Scrapy's byte headers or the local fetch's flattened ones."""
+    from scrapy_calyprium.routing import block_detect as bd
+
+    assert dg.VERSION >= 6 and dg.F5 == "f5"
+    captcha = ('<html><head><script>window["bobcmn"] = "1011TSPD_101";</script></head><body>This question is for '
+               'testing whether you are a human visitor and to prevent automated spam submission.<br><img src="data:'
+               'image/png;base64,' + "A" * 4000 + '"><b>What code is in the image?</b><input id="ans" name="answer">'
+               '<button id="jar" type="button">submit</button></body></html>')
+    d = bd.diagnose(200, captcha.encode(), "text/html")
+    assert (d.cls, d.vendor) == (dg.CAPTCHA, dg.F5) and bd.is_blocked(200, captcha.encode(), "text/html")
+    scrapy_headers = {b"Content-Type": [b"text/html"],
+                      b"Set-Cookie": [b"TS758a99fc029=01ab; Path=/", b"TS00000000027=08c2; path=/"]}
+    flattened = {"content-type": "text/html", "set-cookie": "TS758a99fc029=01ab; Path=/, TS00000000027=08c2; path=/"}
+    for headers in (scrapy_headers, flattened):
+        d = bd.diagnose(200, b"", headers=headers)
+        assert (d.cls, d.vendor, d.evidence) == (dg.CHALLENGE, dg.F5, "f5_empty_answer"), headers
+        assert bd.is_blocked(200, b"", headers=headers)
+    # no solve family names F5 (no solver for it): the solve is the plain browser one
+    assert bd.challenge_family(200, b"", headers=flattened) is None
+    assert bd.challenge_family(200, captcha.encode()) is None
