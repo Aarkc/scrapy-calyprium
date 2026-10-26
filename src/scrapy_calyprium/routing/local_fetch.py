@@ -169,6 +169,37 @@ def _inject_proxy_session(
     )
 
 
+# ---------------------------------------------------------------------------
+# Firefox ClientHellos without the finite-field groups
+# ---------------------------------------------------------------------------
+
+#: The groups of curl_cffi's Firefox ClientHello (every firefox* target: X25519MLKEM768, X25519,
+#: P-256, P-384, P-521, ffdhe2048, ffdhe3072) without the two finite-field Diffie-Hellman groups.
+#: curl_cffi's BoringSSL lists ffdhe2048 and ffdhe3072 so its Firefox fingerprint matches Firefox's,
+#: but cannot compute either. A server that prefers one (wyobiz.wyo.gov's F5 BIG-IP answers any
+#: ClientHello listing ffdhe3072 with a HelloRetryRequest for it) ends the handshake: curl error 35,
+#: SSL_ERROR_SYSCALL, on every exit. Firefox itself (NSS) and OpenSSL complete it; Chrome and Safari
+#: never list those groups. Without them the ClientHello is otherwise the same (its ciphers,
+#: extensions and key shares; the JA4, which leaves the groups out, is unchanged).
+FIREFOX_CURVES_NO_FFDHE = "X25519MLKEM768:X25519:P-256:P-384:P-521"
+
+
+def _tls_handshake_failed(exc: BaseException) -> bool:
+    """Whether a curl_cffi error is a failed TLS handshake (curl error 35, CURLE_SSL_CONNECT_ERROR)."""
+    return "curl: (35)" in str(exc)
+
+
+def _no_ffdhe_options() -> Optional[Dict]:
+    """curl options presenting a Firefox ClientHello without the finite-field groups, or None when
+    this curl_cffi has no SSL_EC_CURVES option."""
+    try:
+        from curl_cffi.const import CurlOpt  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    option = getattr(CurlOpt, "SSL_EC_CURVES", None)
+    return {option: FIREFOX_CURVES_NO_FFDHE} if option is not None else None
+
+
 def _build_cookie_header(cookies: List[Dict]) -> str:
     return "; ".join(
         f"{c['name']}={c['value']}" for c in cookies if c.get("name") and "value" in c
@@ -282,6 +313,9 @@ class LocalFetcher:
         # larger pool so the cookie pool (N slots x RPM cap) is the real limit.
         self._fetch_concurrency = max(1, int(fetch_concurrency))
         self._executor: Optional[ThreadPoolExecutor] = None
+        # Hosts that end a Firefox handshake listing the finite-field groups: their curl_cffi
+        # Firefox fetches leave those groups out (see FIREFOX_CURVES_NO_FFDHE).
+        self.no_ffdhe_hosts: set = set()
 
         if backend == "httpcloak":
             if _HTTPCLOAK is None:
@@ -649,11 +683,13 @@ class LocalFetcher:
                 (user_agent or "")[:60], proxy_session_id,
             )
 
-        start = time.time()
-        try:
-            async with AsyncSession(impersonate=impersonate) as session:
+        async def _send(curl_options: Optional[Dict] = None):
+            session_kwargs: Dict = {"impersonate": impersonate}
+            if curl_options:
+                session_kwargs["curl_options"] = curl_options
+            async with AsyncSession(**session_kwargs) as session:
                 if method != "GET":
-                    response = await session.request(
+                    return await session.request(
                         method,
                         url,
                         data=body,
@@ -662,16 +698,34 @@ class LocalFetcher:
                         proxies=proxies,
                         timeout=timeout,
                     )
-                else:
-                    response = await session.get(
-                        url,
-                        headers=headers or None,
-                        cookies=cookies_dict,
-                        proxies=proxies,
-                        timeout=timeout,
-                    )
+                return await session.get(
+                    url,
+                    headers=headers or None,
+                    cookies=cookies_dict,
+                    proxies=proxies,
+                    timeout=timeout,
+                )
+
+        # A Firefox ClientHello lists ffdhe2048/ffdhe3072, which curl_cffi cannot compute: a host
+        # that ended such a handshake is sent one without them, and a handshake that fails is tried
+        # once more without them before the error stands (see FIREFOX_CURVES_NO_FFDHE).
+        host = (urlparse(url).hostname or "").lower()
+        no_ffdhe = _no_ffdhe_options() if impersonate.startswith("firefox") else None
+        start = time.time()
+        try:
+            response = await _send(no_ffdhe if host in self.no_ffdhe_hosts else None)
         except Exception as exc:  # noqa: BLE001
-            raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
+            if not no_ffdhe or host in self.no_ffdhe_hosts or not _tls_handshake_failed(exc):
+                raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
+            try:
+                response = await _send(no_ffdhe)
+            except Exception:  # noqa: BLE001 -- the first error is the one to report
+                raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
+            self.no_ffdhe_hosts.add(host)
+            logger.info(
+                "curl_cffi: %s ended the %s handshake listing the finite-field groups; its "
+                "Firefox fetches leave ffdhe2048/ffdhe3072 out from now on", host, impersonate,
+            )
 
         elapsed_ms = int((time.time() - start) * 1000)
 
