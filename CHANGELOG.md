@@ -1,3 +1,10 @@
+## [1.36.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.0...v1.36.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **routing:** keep site cookies and stop wasting requests on walled hosts ([f59c0bb](https://github.com/Aarkc/scrapy-calyprium/commit/f59c0bb61b30cced2fa1aa5f9a6e8ee8b8581f8e))
+
 # [1.36.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.35.7...v1.36.0) (2026-10-25)
 
 
