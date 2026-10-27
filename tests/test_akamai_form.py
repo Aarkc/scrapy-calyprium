@@ -5,9 +5,10 @@
   ~130 ms): a sensor solve on the form's page, then the POST replayed on that solve's exit.
 * With an accepted ``_abck`` the POST meets Akamai's challenge action ("Challenge Validation", a
   recaptcha): the solve service answers it on the slot's session and its answer is the response.
-* About seven minutes later the sensor's validation lapses (the site's 404, ``_abck`` reset): the
-  sensor runs again on the same exit, its cookies merged into the slot (the site's session and
-  ``sec_cpt`` kept), and the request is replayed.
+* An answer opens three requests (its resubmit and two more); the fourth meets the challenge
+  again, answered again (2026-10-27, from home and on the platform).
+* The clearance lapses (the site's 404 with ``_abck`` reset, or the POST held again): the slot is
+  retired and the request starts over (a sensor merged beside the old ``sec_cpt`` was held).
 
 Recorded shapes only: the challenge page and the site's pages are stand-ins, no token, no cookie.
 """
@@ -24,7 +25,6 @@ from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium.routing.auto import (
     SpiderAutoRouter,
     _abck_reset,
-    _merge_sensor,
     _sensor_page,
 )
 from scrapy_calyprium.routing.domain_cache import DomainCache
@@ -102,7 +102,7 @@ class FakeSolve:
         n = sum(1 for c in self.calls if c.get("challenge_type") == "akamai")
         cookies = self.rerun_cookies if (n > 1 and self.rerun_cookies) else SENSOR_COOKIES
         return SolveResult(success=True, cookies=[dict(c) for c in cookies], user_agent="UA",
-                           proxy_session_id=kwargs.get("proxy_session_id") or "s1", engine="native",
+                           proxy_session_id=kwargs.get("proxy_session_id") or f"s{n}", engine="native",
                            preset="chrome-155-windows", duration_ms=30_000, provider="native")
 
     async def report_ip_outcome(self, **kwargs):
@@ -130,10 +130,6 @@ def test_helpers():
     assert _abck_reset(["_abck=X~-1~Y~-1~-1~-1; Domain=.example.gov; Path=/; Secure"])
     assert not _abck_reset(["_abck=X~0~Y~-1~-1~-1; Path=/", "bm_sz=1; Path=/"])
     assert not _abck_reset(["_abck=; Max-Age=0; Path=/"])
-    merged = _merge_sensor(
-        [{"name": "JSESSIONID", "value": "J0"}, {"name": "_abck", "value": "old"}, {"name": "sec_cpt", "value": "C"}],
-        [{"name": "_abck", "value": "new"}, {"name": "JSESSIONID", "value": "J9"}, {"name": "bm_sz", "value": "Z"}])
-    assert {c["name"]: c["value"] for c in merged} == {"JSESSIONID": "J0", "_abck": "new", "sec_cpt": "C", "bm_sz": "Z"}
 
 
 @pytest.mark.asyncio
@@ -220,32 +216,33 @@ async def _cleared_router(fetcher, solve):
     return router
 
 
+RERUN = [{"name": "JSESSIONID", "value": "J9", "domain": HOST},
+         {"name": "_abck", "value": "A2~0~B~-1~-1~-1", "domain": ".example.gov"},
+         {"name": "bm_sz", "value": "Z2", "domain": ".example.gov"}]
+
+
 @pytest.mark.asyncio
-async def test_the_lapse_runs_the_sensor_again_on_the_same_exit_and_keeps_the_session():
-    rerun = [{"name": "JSESSIONID", "value": "J9", "domain": HOST},
-             {"name": "_abck", "value": "A2~0~B~-1~-1~-1", "domain": ".example.gov"},
-             {"name": "bm_sz", "value": "Z2", "domain": ".example.gov"}]
+async def test_the_lapse_retires_the_slot_and_starts_the_request_over():
+    """A fresh sensor merged beside the old sec_cpt was held by the site (canary 2026-10-27): the lapsed slot is
+    retired and the request starts over on a fresh solve, none of the old session's cookies carried."""
     fetcher = FakeFetcher(
         _fetch(404, NOT_FOUND, ["_abck=R~-1~S~-1~-1~-1; Domain=.example.gov; Path=/"]),   # the lapse
-        _fetch(200, RESULTS))                                                                # the replay
-    solve = FakeSolve(rerun_cookies=rerun)
+        _fetch(200, RESULTS))                                                                # the fresh replay
+    solve = FakeSolve(rerun_cookies=RERUN)
     router = await _cleared_router(fetcher, solve)
     result = await _post(router)
     assert not result.blocked and result.fetch.body == RESULTS and result.routing_method == "solve_then_replay"
-    rerun_call = solve.calls[-1]
-    assert rerun_call["challenge_type"] == "akamai" and rerun_call["proxy_session_id"] == "s1"
-    assert rerun_call["target_url"] == PAGE
+    fresh = solve.calls[-1]
+    assert fresh["challenge_type"] == "akamai" and fresh["target_url"] == PAGE and "proxy_session_id" not in fresh
+    assert fresh["extra"] == {"abck": "accepted"}
     sent = _sent_cookies(fetcher.calls[-1])
-    assert sent["_abck"] == "A2~0~B~-1~-1~-1" and sent["bm_sz"] == "Z2"        # the new sensor's
-    assert sent["JSESSIONID"] == "J1" and sent["sec_cpt"] == "CPT2"              # the session's, kept
-    assert fetcher.calls[-1]["proxy_session_id"] == "s1"
+    assert sent["_abck"] == "A2~0~B~-1~-1~-1" and sent["JSESSIONID"] == "J9" and "sec_cpt" not in sent
+    assert fetcher.calls[-1]["proxy_session_id"] == "s2"                     # the fresh solve's exit
+    assert [s.slot_id for s in router.cache.get(HOST).live_slots()] != []
 
 
 @pytest.mark.asyncio
-async def test_after_the_lapse_the_challenge_again_is_answered_once(monkeypatch):
-    """The lapse comes minutes after the answer (the quick-repeat guard does not apply)."""
-    from scrapy_calyprium.routing import auto as auto_mod
-    monkeypatch.setattr(auto_mod, "CAPTCHA_MIN_INTERVAL_S", 0.0)
+async def test_after_the_lapse_the_fresh_start_meets_the_challenge_and_answers_it():
     fetcher = FakeFetcher(
         _fetch(404, NOT_FOUND, ["_abck=R~-1~S~-1~-1~-1; Path=/"]),
         _fetch(200, CHALLENGE, ["sec_cpt=CPT3; Path=/"]))
@@ -257,40 +254,48 @@ async def test_after_the_lapse_the_challenge_again_is_answered_once(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_the_challenge_right_after_its_answer_runs_the_sensor_instead_of_paying_again():
-    fetcher = FakeFetcher(
-        _fetch(200, CHALLENGE, ["sec_cpt=CPT3; Path=/"]),     # met again at once
-        _fetch(200, RESULTS))                                  # the replay after the sensor ran again
+async def test_the_fourth_request_after_an_answer_meets_the_challenge_and_it_is_answered_again():
+    """apps.ilsos.gov 2026-10-27, from home at 1-6 s spacing and on the platform: the answer's resubmit and two more
+    searches answered, the fourth met the challenge (with _abck reset). It is answered again."""
+    fetcher = FakeFetcher(_fetch(200, RESULTS), _fetch(200, RESULTS),
+                          _fetch(200, CHALLENGE, ["_abck=R~-1~S~-1~-1~-1; Path=/", "sec_cpt=CPT3; Path=/"]))
     solve = FakeSolve()
     router = await _cleared_router(fetcher, solve)
+    for _ in range(2):
+        assert (await _post(router)).fetch.body == RESULTS
     result = await _post(router)
-    assert not result.blocked and result.fetch.body == RESULTS
-    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha", "akamai"]
+    assert not result.blocked and result.routing_method == "captcha_solve" and result.fetch.body == RESULTS
+    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha", "akamai_captcha"]
+    assert router._since_answer[result.slot_id] == 1
 
 
 @pytest.mark.asyncio
-async def test_the_challenge_that_stays_after_the_sensor_run_stands_unpaid():
-    fetcher = FakeFetcher(
-        _fetch(200, CHALLENGE, ["sec_cpt=CPT3; Path=/"]),
-        _fetch(200, CHALLENGE, ["sec_cpt=CPT4; Path=/"]))
+async def test_a_challenge_right_after_its_answer_is_not_bought_again_and_the_slot_retired():
+    """The answer opened only its own resubmit: answering again would buy a token per request."""
+    fetcher = FakeFetcher(_fetch(200, CHALLENGE, ["sec_cpt=CPT3; Path=/"]))
     solve = FakeSolve()
     router = await _cleared_router(fetcher, solve)
     result = await _post(router)
     assert result.blocked and result.diagnosis.evidence == "akamai_captcha"
-    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha", "akamai"]
+    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha"]
+    entry = router.cache.get(HOST)
+    assert entry is None or entry.live_slots() == []
 
 
 @pytest.mark.asyncio
-async def test_a_challenge_minutes_after_its_answer_is_answered_again(monkeypatch):
-    """apps.ilsos.gov, 2026-10-26: about seven minutes after an answer the search met the challenge again."""
-    from scrapy_calyprium.routing import auto as auto_mod
-    fetcher = FakeFetcher(_fetch(200, CHALLENGE, ["sec_cpt=CPT3; Path=/"]))
-    solve = FakeSolve()
+async def test_a_held_form_request_on_a_slot_starts_the_request_over():
+    """Canary 2026-10-27: after the challenge, every POST on the slot was held, and the slot (an infra failure
+    never retires one) was replayed and held for the rest of the run. Now it is retired and the request starts
+    over."""
+    fetcher = FakeFetcher(LocalFetchError("roundtrip apps.example.gov [h1]: context deadline exceeded"),
+                          _fetch(200, RESULTS))
+    solve = FakeSolve(rerun_cookies=RERUN)
     router = await _cleared_router(fetcher, solve)
-    monkeypatch.setattr(auto_mod, "CAPTCHA_MIN_INTERVAL_S", 0.0)
+    held_slot = router.cache.get(HOST).live_slots()[0].slot_id
     result = await _post(router)
-    assert not result.blocked and result.routing_method == "captcha_solve"
-    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha", "akamai_captcha"]
+    assert not result.blocked and result.fetch.body == RESULTS
+    assert [c["challenge_type"] for c in solve.calls] == ["akamai", "akamai_captcha", "akamai"]
+    assert held_slot not in [s.slot_id for s in router.cache.get(HOST).live_slots()]
 
 
 @pytest.mark.asyncio
@@ -303,20 +308,20 @@ async def test_a_plain_404_with_the_sensor_accepted_is_the_answer():
 
 
 @pytest.mark.asyncio
-async def test_an_answer_that_resets_the_sensor_stands_and_the_next_request_runs_it_first():
+async def test_an_answer_that_resets_the_sensor_stands_and_the_next_request_starts_over():
     """The site answered and reset _abck with it: the answer is kept (no duplicate request), and the slot's next
-    request runs the sensor before it is sent (rather than meeting the site's 404)."""
+    request starts over (rather than meeting the site's 404)."""
     fetcher = FakeFetcher(
         _fetch(200, RESULTS, ["_abck=R~-1~S~-1~-1~-1; Path=/"]),   # answered, the sensor's validation lapsed with it
-        _fetch(200, RESULTS))                                       # the next request, after the sensor ran again
-    solve = FakeSolve()
+        _fetch(200, RESULTS))                                       # the next request, on a fresh solve
+    solve = FakeSolve(rerun_cookies=RERUN)
     router = await _cleared_router(fetcher, solve)
     first = await _post(router)
     assert first.fetch.body == RESULTS and first.routing_method == "httpcloak_cookies" and len(solve.calls) == 2
     second = await _post(router)
     assert second.fetch.body == RESULTS and [c["challenge_type"] for c in solve.calls] == [
         "akamai", "akamai_captcha", "akamai"]
-    assert len(fetcher.calls) == 4 and _sent_cookies(fetcher.calls[-1])["_abck"] == "A~0~B~-1~-1~-1"
+    assert len(fetcher.calls) == 4 and _sent_cookies(fetcher.calls[-1])["_abck"] == "A2~0~B~-1~-1~-1"
 
 
 @pytest.mark.asyncio
@@ -412,14 +417,14 @@ async def test_a_sensor_solve_with_no_accepted_abck_is_not_replayed():
 
 
 @pytest.mark.asyncio
-async def test_the_lapse_rerun_asks_for_an_accepted_sensor_and_refuses_an_unaccepted_one(monkeypatch):
+async def test_a_fresh_start_with_no_accepted_sensor_is_not_replayed():
     fetcher = FakeFetcher(_fetch(404, NOT_FOUND, ["_abck=R~-1~S~-1~-1~-1; Path=/"]))
     solve = FakeSolve(rerun_cookies=[{"name": "_abck", "value": "X~-1~Y~-1~-1~-1", "domain": ".example.gov"}])
     router = await _cleared_router(fetcher, solve)
     result = await _post(router)
-    assert result.fetch.status_code == 404                                   # the lapse stands: nothing replayed
-    rerun = solve.calls[-1]
-    assert rerun["challenge_type"] == "akamai" and rerun["extra"] == {"abck": "accepted"}
+    assert result.blocked and "no accepted _abck" in result.error
+    assert len(fetcher.calls) == 3                                           # the lapsed 404, nothing replayed
+    assert solve.calls[-1]["challenge_type"] == "akamai" and solve.calls[-1]["extra"] == {"abck": "accepted"}
 
 
 @pytest.mark.asyncio
@@ -489,3 +494,38 @@ async def test_the_answer_reaches_the_spider_decoded_whatever_encoding_the_solve
     response = HtmlResponse(FORM, status=200, headers=result.fetch.headers, body=result.fetch.body, request=request)
     decoded = HttpCompressionMiddleware().process_response(request, response, None)
     assert decoded.body == RESULTS
+
+
+@pytest.mark.asyncio
+async def test_the_slots_delay_starts_again_after_a_solve():
+    """Canary 2026-10-27: a search took 76 s inside its download (the token), and the next one went 0.1 s after
+    the captcha's resubmit, the slot's delay having been counted from the first one's start."""
+    import time as _time
+    from types import SimpleNamespace
+
+    from scrapy.http import Request
+
+    from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
+    from scrapy_calyprium.routing.auto import RouteResult
+
+    slot = SimpleNamespace(lastseen=_time.time() - 80.0)
+
+    class Router:
+        cache = None
+
+        def __init__(self, method):
+            self.method = method
+
+        async def fetch(self, url, **kwargs):
+            return RouteResult(fetch=_fetch(200, RESULTS), routing_method=self.method, blocked=False,
+                               domain_level="cookies")
+
+    for method, restarted in (("captcha_solve", True), ("httpcloak_cookies", False)):
+        slot.lastseen = _time.time() - 80.0
+        mimic = MimicBrowserMiddleware(service_url="http://mimic", api_key="clp_k")
+        mimic._local_enabled, mimic._local_router = True, Router(method)
+        mimic.crawler = SimpleNamespace(engine=SimpleNamespace(downloader=SimpleNamespace(slots={HOST: slot})),
+                                        settings=SimpleNamespace(getbool=lambda k, d=None: False))
+        request = Request(FORM, method="POST", body=BODY, meta={"download_slot": HOST})
+        await mimic.process_request(request, None)
+        assert (_time.time() - slot.lastseen < 5) is restarted, method
