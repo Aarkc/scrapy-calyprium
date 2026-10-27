@@ -112,6 +112,10 @@ def _header_text(value: bytes) -> str:
         return value.decode("latin-1")
 
 
+#: Routes that solved inside the fetch (the slot's delay restarts at their end).
+_SOLVED_ROUTES = frozenset({"solve_then_replay", "captcha_solve"})
+
+
 def _local_headers(request) -> Dict[str, str]:
     """The request's own headers, for the local fetch: the ones the spider set, not the device
     fingerprint's (SpectreMiddleware names them) and not Scrapy's automatic Referer. The
@@ -844,6 +848,8 @@ class MimicBrowserMiddleware:
         try:
             async with self._paced(request, spider):
                 result = await self._local_router.fetch(request.url, domain=domain, **route_kwargs)
+            if getattr(result, "routing_method", None) in _SOLVED_ROUTES:
+                self._restart_delay(request)
         except Exception as e:
             logger.warning(
                 f"MimicMiddleware: local route raised for {request.url}: {e}; "
@@ -940,6 +946,16 @@ class MimicBrowserMiddleware:
                 return None  # not built yet: look again next time
             self._pacer = _pacing.SlotPacer(downloader)
         return self._pacer or None
+
+    def _restart_delay(self, request) -> None:
+        """A route that solved sent its own requests to the site at its end (a captcha's verify and
+        resubmit after a token that took a minute): the slot's delay counts from then, not from the
+        fetch's start, which would let the next request go at once (canary 2026-10-27)."""
+        key = request.meta.get(_pacing.DOWNLOAD_SLOT)
+        downloader = getattr(getattr(self.crawler, "engine", None), "downloader", None) if self.crawler else None
+        slot = getattr(downloader, "slots", {}).get(key) if key is not None and downloader is not None else None
+        if slot is not None:
+            slot.lastseen = max(getattr(slot, "lastseen", 0.0) or 0.0, time.time())
 
     def _paced(self, request, spider):
         """Hold a fetch this middleware makes itself to the request's download slot: its
