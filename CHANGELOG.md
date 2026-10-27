@@ -1,3 +1,10 @@
+## [1.37.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.0...v1.37.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **routing:** solve akamai's sensor on the page the form came from and replay only an accepted one ([d0eab49](https://github.com/Aarkc/scrapy-calyprium/commit/d0eab491fe2d360fa3ed3eb5fa6eb74ca7cc2ca0))
+
 # [1.37.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.4...v1.37.0) (2026-10-27)
 
 
