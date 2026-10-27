@@ -197,6 +197,7 @@ class SolveClient:
         country: Optional[str] = None,
         paid: bool = False,
         deadline_ms: Optional[int] = None,
+        extra: Optional[Dict[str, str]] = None,
     ) -> SolveResult:
         """Call /api/solve and return the cookies (or a structured failure).
 
@@ -207,7 +208,9 @@ class SolveClient:
         it. Such a solve sends the challenge page (``page_html``), the session's
         ``cookies`` and ``user_agent``, its exit (``proxy_session_id``, ``provider``,
         ``country``), the run's paid-solve policy (``paid``) and a ``deadline_ms``;
-        its result carries the request's ``response``."""
+        its result carries the request's ``response``. ``extra``: Tessera's per-family
+        options ({"abck": "accepted"}: the Akamai sensor must be accepted, a page served
+        without one is no solve)."""
         client = await self._get_client()
         body = {"domain": domain, **self.policy.solve_fields()}
         if country:
@@ -226,6 +229,8 @@ class SolveClient:
             body["user_agent"] = user_agent
         if deadline_ms:
             body["deadline_ms"] = int(deadline_ms)
+        if extra:
+            body["extra"] = {str(k): str(v) for k, v in extra.items()}
         if target_url:
             body["target_url"] = target_url
         engine_hint = self.policy.clamp_engine(engine_hint)

@@ -125,8 +125,8 @@ async def _post(router):
 
 def test_helpers():
     assert _sensor_page(FORM, {"Referer": PAGE}) == PAGE
-    assert _sensor_page(FORM, {"Referer": "https://www.other.gov/x"}) == f"https://{HOST}/"
-    assert _sensor_page(FORM, {}) == f"https://{HOST}/"
+    assert _sensor_page(FORM, {"Referer": "https://www.other.gov/x"}) == f"https://{HOST}/entitysearch/"
+    assert _sensor_page(FORM, {}) == f"https://{HOST}/entitysearch/"
     assert _abck_reset(["_abck=X~-1~Y~-1~-1~-1; Domain=.example.gov; Path=/; Secure"])
     assert not _abck_reset(["_abck=X~0~Y~-1~-1~-1; Path=/", "bm_sz=1; Path=/"])
     assert not _abck_reset(["_abck=; Max-Age=0; Path=/"])
@@ -363,3 +363,129 @@ async def test_an_ordinary_solve_sends_no_session_or_policy():
         await client.close()
     assert out.response is None
     assert not {"page_html", "cookies", "allow_paid_solve", "paid_solve_mode", "deadline_ms"} & set(seen)
+
+
+# ---- the form's page, whoever named it (us_il_companies' canary, 2026-10-27) ----------------------------------------
+# The spider's Referer equalled the one Scrapy's RefererMiddleware gives, so the middleware dropped it as Scrapy's
+# (_headers.scrapy_referer) and the sensor solve went to the homepage, which redirects to www.ilsos.gov: a page with no
+# sensor, "solved" with an unaccepted _abck; every replayed POST was then held until the client gave up.
+
+def test_the_sensor_page_is_the_forms_page_whoever_named_it():
+    assert _sensor_page(FORM, {}, referer=PAGE) == PAGE                         # Scrapy's Referer
+    assert _sensor_page(FORM, {"Referer": PAGE}, referer="https://x.gov/") == PAGE
+    assert _sensor_page(FORM, {}) == f"https://{HOST}/entitysearch/"            # the form's directory
+    # the form's own address (Scrapy's Referer for a search yielded from a results page) is no page
+    assert _sensor_page(FORM, {}, referer=FORM + "?akamai-challenge-resubmit=true") == f"https://{HOST}/entitysearch/"
+    assert _sensor_page(f"https://{HOST}/search", {}) == f"https://{HOST}/"     # nothing better: the homepage
+
+
+@pytest.mark.asyncio
+async def test_a_post_without_its_referer_header_solves_on_the_page_it_came_from():
+    fetcher = FakeFetcher(LocalFetchError("context deadline exceeded"), _fetch(200, RESULTS))
+    solve = FakeSolve()
+    headers = {k: v for k, v in HEADERS.items() if k != "Referer"}          # dropped as Scrapy's
+    result = await _router(fetcher, solve).fetch(FORM, domain=HOST, headers=headers, method="POST", body=BODY,
+                                                 referer=PAGE)
+    assert not result.blocked and solve.calls[0]["target_url"] == PAGE
+    assert solve.calls[0]["extra"] == {"abck": "accepted"}                    # a served page is no solve here
+
+
+@pytest.mark.asyncio
+async def test_a_sensor_solve_with_no_accepted_abck_is_not_replayed():
+    fetcher = FakeFetcher(LocalFetchError("context deadline exceeded"))
+    unaccepted = [{"name": "_abck", "value": "A~-1~B~-1~-1~-1", "domain": ".example.gov"},
+                  {"name": "bm_sz", "value": "Z", "domain": ".example.gov"}]
+    solve = FakeSolve()
+    solve.rerun_cookies = None
+
+    async def served_page(**kwargs):
+        solve.calls.append(kwargs)
+        return SolveResult(success=True, cookies=[dict(c) for c in unaccepted], user_agent="UA",
+                           proxy_session_id="s1", engine="native", preset="chrome-155-windows", duration_ms=7000)
+    solve.solve = served_page
+    router = _router(fetcher, solve)
+    result = await _post(router)
+    assert result.blocked and "no accepted _abck" in result.error
+    assert len(fetcher.calls) == 1                                           # the form is not replayed (and held)
+    entry = router.cache.get(HOST)
+    assert (entry is None or entry.live_slots() == []) and HOST not in router._solve_pages
+
+
+@pytest.mark.asyncio
+async def test_the_lapse_rerun_asks_for_an_accepted_sensor_and_refuses_an_unaccepted_one(monkeypatch):
+    fetcher = FakeFetcher(_fetch(404, NOT_FOUND, ["_abck=R~-1~S~-1~-1~-1; Path=/"]))
+    solve = FakeSolve(rerun_cookies=[{"name": "_abck", "value": "X~-1~Y~-1~-1~-1", "domain": ".example.gov"}])
+    router = await _cleared_router(fetcher, solve)
+    result = await _post(router)
+    assert result.fetch.status_code == 404                                   # the lapse stands: nothing replayed
+    rerun = solve.calls[-1]
+    assert rerun["challenge_type"] == "akamai" and rerun["extra"] == {"abck": "accepted"}
+
+
+@pytest.mark.asyncio
+async def test_the_middleware_hands_the_router_the_referer_it_does_not_send():
+    from scrapy.http import Request
+
+    from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
+    from scrapy_calyprium.routing.auto import RouteResult
+
+    seen = {}
+
+    class Router:
+        cache = None
+
+        async def fetch(self, url, **kwargs):
+            seen.update(kwargs)
+            return RouteResult(fetch=_fetch(200, RESULTS), routing_method="httpcloak_light", blocked=False,
+                               domain_level="light")
+
+    mimic = MimicBrowserMiddleware(service_url="http://mimic", api_key="clp_k")
+    mimic._local_enabled, mimic._local_router = True, Router()
+    request = Request(FORM, method="POST", body=BODY, headers={"Referer": PAGE,
+                                                                 "Content-Type": "application/x-www-form-urlencoded"})
+    request.meta["calyprium_scrapy_referer"] = PAGE                          # what Scrapy's RefererMiddleware gave
+    await mimic.process_request(request, None)
+    assert seen["referer"] == PAGE and "Referer" not in seen["headers"]      # used for the solve, not sent
+
+
+@pytest.mark.asyncio
+async def test_the_solve_client_sends_extra():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"success": True, "cookies": []})
+
+    client = SolveClient("http://tessera")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await client.solve(domain=HOST, target_url=PAGE, challenge_type="akamai", extra={"abck": "accepted"})
+    finally:
+        await client.close()
+    assert seen["extra"] == {"abck": "accepted"}
+
+
+@pytest.mark.asyncio
+async def test_the_answer_reaches_the_spider_decoded_whatever_encoding_the_solver_names():
+    """Tessera 1.175.0 handed on the resubmit's "Content-Encoding: gzip" with its decoded body: Scrapy's
+    HttpCompressionMiddleware failed on it (BadGzipFile) and the spider searched again (2026-10-27)."""
+    from scrapy.downloadermiddlewares.httpcompression import HttpCompressionMiddleware
+    from scrapy.http import HtmlResponse, Request
+
+    fetcher = FakeFetcher(LocalFetchError("stream reset"), _fetch(200, CHALLENGE, ["sec_cpt=CPT1; Path=/"]))
+    solve = FakeSolve()
+    real = solve.solve
+
+    async def gzip_named(**kwargs):
+        out = await real(**kwargs)
+        if out.response is not None:
+            out.response.headers.update({"Content-Encoding": "gzip", "Content-Length": "999"})
+        return out
+    solve.solve = gzip_named
+    result = await _post(_router(fetcher, solve))
+    assert result.routing_method == "captcha_solve"
+    assert not {"content-encoding", "content-length"} & {k.lower() for k in result.fetch.headers}
+    request = Request(FORM, method="POST")
+    response = HtmlResponse(FORM, status=200, headers=result.fetch.headers, body=result.fetch.body, request=request)
+    decoded = HttpCompressionMiddleware().process_response(request, response, None)
+    assert decoded.body == RESULTS
