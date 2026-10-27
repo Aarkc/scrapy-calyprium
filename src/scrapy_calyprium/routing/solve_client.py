@@ -5,10 +5,12 @@ a challenge and we need a real browser solve to earn fresh clearance cookies.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -59,6 +61,35 @@ def _describe(exc: BaseException) -> str:
 
 
 @dataclass
+class SolvedResponse:
+    """The response a challenge stood in for, as the solve fetched it (Akamai's challenge action: the
+    wrapped request posted again): handed on as the request's response."""
+
+    status: int
+    url: str
+    headers: Dict[str, str] = field(default_factory=dict)
+    body: bytes = b""
+    set_cookies: List[str] = field(default_factory=list)
+
+
+def _solved_response(data: Any) -> Optional[SolvedResponse]:
+    """A solve response's ``response`` object, or None (absent or unreadable)."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        body = base64.b64decode(data.get("body_b64") or "", validate=True)
+        return SolvedResponse(
+            status=int(data.get("status") or 0),
+            url=str(data.get("url") or ""),
+            headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
+            body=body,
+            set_cookies=[str(line) for line in (data.get("set_cookies") or [])],
+        )
+    except (binascii.Error, TypeError, ValueError):
+        return None
+
+
+@dataclass
 class SolveResult:
     success: bool
     cookies: List[Dict]
@@ -81,6 +112,8 @@ class SolveResult:
     # leave through the same one (gateway ``-country_<cc>``), or the clearance meets
     # another IP. None when the solver does not say (the run's country then holds).
     country: Optional[str] = None
+    # The response the challenge stood in for (``akamai_captcha``), when the solve fetched it.
+    response: Optional[SolvedResponse] = None
 
 
 class SolveError(Exception):
@@ -103,10 +136,14 @@ class SolveClient:
         timeout: float = DEFAULT_SOLVE_DEADLINE_S + SOLVE_DEADLINE_MARGIN_S,
         ip_health_url: Optional[str] = None,
         policy: Optional[RunPolicy] = None,
+        backend: Optional[str] = None,
     ):
         # Profile policy (AAR-62): spider_id / country ride on every solve and
         # engine_hint is clamped to the allow-list.
         self.policy = policy or RunPolicy()
+        # "tessera" or "mimic": which /api/solve this is. Their ``provider`` fields differ (Tessera: the
+        # solver to force; Mimic: the Veil provider of the exit), which a solve on a slot's own exit minds.
+        self.backend = backend
         self.service_url = service_url.rstrip("/")
         # IP-health reputation lives in mimic; when /api/solve is pointed at a
         # separate solver service (Tessera), reports still go to mimic.
@@ -154,14 +191,41 @@ class SolveClient:
         provider: Optional[str] = None,
         solvers: Optional[List[str]] = None,
         challenge_type: Optional[str] = None,
+        page_html: Optional[str] = None,
+        cookies: Optional[List[Dict]] = None,
+        user_agent: Optional[str] = None,
+        country: Optional[str] = None,
+        paid: bool = False,
+        deadline_ms: Optional[int] = None,
     ) -> SolveResult:
         """Call /api/solve and return the cookies (or a structured failure).
 
         ``challenge_type`` names the vendor the block showed (``challenge_family``):
         Tessera then runs that vendor's solvers instead of assuming Cloudflare.
-        Mimic's own /api/solve ignores it (its browser passes any vendor)."""
+        Mimic's own /api/solve ignores it (its browser passes any vendor), except
+        ``akamai_captcha``: a challenge met on the caller's own session, answered on
+        it. Such a solve sends the challenge page (``page_html``), the session's
+        ``cookies`` and ``user_agent``, its exit (``proxy_session_id``, ``provider``,
+        ``country``), the run's paid-solve policy (``paid``) and a ``deadline_ms``;
+        its result carries the request's ``response``."""
         client = await self._get_client()
         body = {"domain": domain, **self.policy.solve_fields()}
+        if country:
+            body["country"] = country
+        if paid:
+            body.update(self.policy.paid_solve_fields())
+        if page_html:
+            body["page_html"] = page_html
+        if cookies:
+            body["cookies"] = [
+                {"name": c["name"], "value": c["value"], "domain": c.get("domain") or f".{domain}",
+                 "path": c.get("path") or "/"}
+                for c in cookies if c.get("name") and c.get("value") is not None
+            ]
+        if user_agent:
+            body["user_agent"] = user_agent
+        if deadline_ms:
+            body["deadline_ms"] = int(deadline_ms)
         if target_url:
             body["target_url"] = target_url
         engine_hint = self.policy.clamp_engine(engine_hint)
@@ -244,6 +308,8 @@ class SolveClient:
             egress_ip=data.get("egress_ip"),
             provider=data.get("provider"),
             country=_country(data.get("country")),
+            response=_solved_response(data.get("response")),
+            error=data.get("error") if not data.get("success", True) else None,
         )
 
     async def report_ip_outcome(
