@@ -120,6 +120,27 @@ class MySpider(scrapy.Spider):
         )
 ```
 
+### Browser-Made Form Submits
+
+Some sites refuse a form POST that their own page did not make (F5 BIG-IP's bot defence adds per-request
+tokens in the page just before its search postback). Mark such a request and a real browser page submits it:
+Mimic loads the page on the run's exit, types the fields, clicks the control that submits, and the spider gets
+the page after the submit as a normal response. The page is kept for the run, so a follow-up postback (the next
+result page) acts on the results the last one left:
+
+```python
+yield scrapy.FormRequest(url, formdata=fields, callback=self.parse_results,
+                         meta={"mimic_browser_submit": {"submit": "ctl00$MainContent$cmdSearch"}})
+yield scrapy.Request(url, callback=self.parse_results, dont_filter=True,
+                     meta={"mimic_browser_submit": {"submit": "ctl00$MainContent$lbtnNextHeader",
+                                                    "navigate": "never"}})
+```
+
+A captcha or challenge page comes back as it is (Mimic closes that browser and never solves it), a submit the
+page did not apply comes back empty, and a browser submit is never re-sent by the middleware.
+`meta["mimic_submit"]` says how it went. Options and the `MIMIC_SUBMIT_*` settings:
+`scrapy_calyprium/_browser_submit.py`.
+
 ## Authentication
 
 All middleware requires a valid API key. Set it via:

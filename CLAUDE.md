@@ -73,6 +73,18 @@ A fresh Cloudflare clearance (cf_clearance, never replayed) that Cloudflare refu
 
 Every local fetch of a request sends the headers the spider set on it (`mimic._local_headers`: not the Spectre fingerprint's, which `meta["spectre_fingerprint_headers"]` names, nor Scrapy's automatic Referer, see `_headers.py`). The fetcher keeps its identity: `local_fetch._OWNED_HEADERS` (User-Agent, client hints, Accept-Encoding, connection and proxy headers) are never taken from the request, and a request's Cookie header joins the slot's cookies. A request other than a GET (a storefront's GraphQL or search POST) sends its method and body on the light fetch and every replay; its solve loads a page (`auto._solve_url`: the URL itself, or the homepage for an API endpoint), since `/api/solve` only opens a URL. A page's script calling another host of its site (an `Origin` header naming that host: never sent on a navigation) solves on the calling page, the `Referer` or the origin's homepage (`auto._calling_page`), and the domain's pool refills solve there too: the API host's own URLs may be no page at all (businesssearchapi.ohiosos.gov blocks whatever does not come from its search page).
 
+### Browser-Made Form Submits (`_browser_submit.py`)
+
+A request with `meta["mimic_browser_submit"]` skips the local route: `MimicBrowserMiddleware._browser_submit` posts it
+to Mimic's `/api/browser/submit` (the page, its fields from the option or the form-encoded body, the control that
+submits, `navigate` auto | always | never, a session key per run: `<spider>:<RUN_ID>`), and builds the response from
+the rendered page after the submit. Mimic drives the page's own controls in a browser session it keeps per key, so a
+follow-up postback runs on the page the last one left. It fails closed (a captcha page comes back as it is, a submit
+the page did not apply comes back empty); the middleware sets `dont_retry`, skips the Calyprium retry and the
+transport retry for these requests (the page may have posted), and releases the run's pages at spider close.
+`meta["mimic_submit"]` carries the outcome, never cookies (`return_cookies` puts them in
+`meta["mimic_submit_cookies"]` only when asked).
+
 ### Cookie Slot Lifecycle
 
 Each `CookieSlot` in the `DomainCache` has:

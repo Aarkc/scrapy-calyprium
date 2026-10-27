@@ -60,6 +60,11 @@ Settings:
 
     MIMIC_SOLVE_DEADLINE_S: how long Mimic's /api/solve may run (Mimic's
         SOLVE_DEADLINE_S, default 240); local-first solves wait that plus 30 s
+    Browser-made form submits: a request with ``meta['mimic_browser_submit']`` is
+    submitted by a real browser page through Mimic's /api/browser/submit (the page's
+    own script makes the POST), and never re-sent by the Calyprium retry. See
+    ``scrapy_calyprium._browser_submit`` for its options and MIMIC_SUBMIT_* settings.
+
     MIMIC_LOCAL_PRESET: TLS preset for local fetches (default: chrome-143)
     MIMIC_LOCAL_PROXY_URL: outbound proxy URL for local fetches (optional). When
         absent, derived from VEIL_GATEWAY_URL with ``calyprium:<CALYPRIUM_API_KEY>``
@@ -70,6 +75,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -79,6 +85,7 @@ from scrapy.downloadermiddlewares.cookies import CookiesMiddleware
 from scrapy.exceptions import NotConfigured
 from scrapy.http import HtmlResponse, Response, TextResponse, XmlResponse
 
+from scrapy_calyprium import _browser_submit as _bsub
 from scrapy_calyprium import _headers, _outcome, _pacing, _trace, _wait
 from scrapy_calyprium._policy import RunPolicy
 from scrapy_calyprium._veil import resolve_local_proxy_url
@@ -316,6 +323,9 @@ class MimicBrowserMiddleware:
         # Per-domain pacing of the responses this middleware returns itself (see _pacing; built
         # lazily from the crawl's downloader; False when MIMIC_PACING is off).
         self._pacer: Any = None
+        # Browser-made submits: the run's default page key, and every key used (released at close).
+        self._submit_token: str = uuid.uuid4().hex[:12]
+        self._submit_keys: set = set()
         self._local_stats = {
             "local_success": 0,
             "local_blocked": 0,
@@ -760,6 +770,8 @@ class MimicBrowserMiddleware:
                 except Exception:
                     pass
 
+        await self._release_submit_pages()
+
         if self.session_id:
             logger.info(f"MimicMiddleware: Closing session {self.session_id}")
             try:
@@ -1013,6 +1025,10 @@ class MimicBrowserMiddleware:
             _trace.ATTEMPT.set(ids)
         _outcome.CURRENT_ATTEMPT.set(_outcome.attempt_number(request))
 
+        # A form the page's own script must submit: a browser page makes the POST.
+        if request.meta.get(_bsub.META):
+            return await self._browser_submit(request, spider)
+
         # AAR-17: local-first fast path
         if self._local_enabled:
             local_response = await self._try_local_route(request, spider)
@@ -1070,6 +1086,76 @@ class MimicBrowserMiddleware:
                 await self._drop_session()
 
             return None
+
+    def _submit_key(self, spider) -> str:
+        name = getattr(spider, "name", None) or "spider"
+        return f"{name}:{self.policy.run_id or self._submit_token}"
+
+    async def _browser_submit(self, request, spider) -> Response:
+        """Submit the request's form from a real browser page (Mimic's /api/browser/submit) and
+        hand back the page after it. A failure comes back as a response with Mimic's status and no
+        body; nothing here re-sends it (the page may have posted)."""
+        opts = _bsub.options(request) or {}
+        settings = self.crawler.settings if self.crawler is not None else None
+        body = _bsub.payload(request, opts, settings, self.policy, self._submit_key(spider))
+        self._submit_keys.add(body["session_key"])
+        request.meta[_outcome.ROUTING_METHOD] = "browser_submit"
+        request.meta["dont_retry"] = True  # Scrapy's RetryMiddleware must not re-send it either
+        try:
+            client = await self._get_client()
+            async with self._paced(request, spider):
+                resp = await client.post(f"{self.service_url}{_bsub.PATH}", json=body, headers=self._get_headers(),
+                                         timeout=body["timeout_ms"] / 1000.0 + 60.0)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001 -- Mimic refused it, or did not answer in time
+            diagnosis, text = self._mimic_failure(e)
+            request.meta[_outcome.DIAGNOSIS] = diagnosis
+            request.meta[_outcome.FETCH_ERROR] = text[:300]
+            status, headers, detail = 502, None, {}
+            if isinstance(e, httpx.HTTPStatusError):
+                status = e.response.status_code
+                ra = e.response.headers.get("retry-after")
+                headers = {"Retry-After": ra} if ra else None
+                try:
+                    detail = e.response.json().get("detail") or {}
+                except Exception:  # noqa: BLE001
+                    detail = {}
+            elif isinstance(e, httpx.TimeoutException):
+                status = 504
+            request.meta[_bsub.INFO] = {"error": (detail.get("error") if isinstance(detail, dict) else None)
+                                        or type(e).__name__, "status": status}
+            logger.warning(f"MimicMiddleware: browser submit to {request.url} failed: {text[:200]}")
+            return Response(url=request.url, status=status, headers=headers, body=b"", request=request)
+
+        html = data.get("html") or ""
+        status = int(data.get("status_code") or 200)
+        env = data.get("headers") or {}
+        ct = _header(env, "content-type") or "text/html; charset=utf-8"
+        final_url = data.get("final_url") or request.url
+        routing = data.get("routing") if isinstance(data.get("routing"), dict) else {}
+        request.meta["calyprium_routing"] = {"routing_method": "browser_submit", "tier": "browser", **routing}
+        request.meta[_bsub.INFO] = _bsub.info(data)
+        if opts.get("return_cookies"):
+            request.meta[_bsub.COOKIES] = list(data.get("cookies") or [])
+        self._keep_mimic_outcome(request, data, status, html, ct, env, final_url)
+        response = _response_from_envelope(request, url=final_url, status=status, headers=_mimic_headers(env),
+                                           body=html, content_type=ct)
+        self._downloaded(request, response, spider, int(data.get("fetch_time_ms") or 0))
+        return response
+
+    async def _release_submit_pages(self) -> None:
+        """Close the browser pages this run's submits kept (Mimic also closes them when idle)."""
+        keys, self._submit_keys = self._submit_keys, set()
+        if not keys:
+            return
+        client = await self._get_client()
+        for key in keys:
+            try:
+                await client.post(f"{self.service_url}{_bsub.RELEASE_PATH}", json={"session_key": key},
+                                  headers=self._get_headers(), timeout=30.0)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"MimicMiddleware: releasing browser page {key} failed: {e}")
 
     @staticmethod
     def _routing_from_fetch(data: dict) -> dict:
@@ -1226,6 +1312,8 @@ class MimicBrowserMiddleware:
         if request.meta.get("_internal"):
             return response
         diagnosis = _outcome.for_response(request, response)
+        if request.meta.get(_bsub.META):
+            return response  # a browser submit is never re-sent here: the page may have posted it
 
         if request.meta.get("mimic_browser") and _outcome.blocked(diagnosis):
             logger.warning(
@@ -1345,7 +1433,7 @@ class MimicBrowserMiddleware:
         """
         if request.meta.get("mimic_browser"):
             logger.error(f"MimicMiddleware: Exception for {request.url}: {exception}")
-        if not isinstance(exception, _TRANSPORT_ERRORS):
+        if not isinstance(exception, _TRANSPORT_ERRORS) or request.meta.get(_bsub.META):
             return None
         diagnosis = _outcome.of_error(exception)
         request.meta[_outcome.DIAGNOSIS] = diagnosis
