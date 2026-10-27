@@ -1,3 +1,10 @@
+## [1.37.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.1...v1.37.2) (2026-10-27)
+
+
+### Bug Fixes
+
+* **routing:** answer akamai's challenge again after the three requests an answer opens ([f669856](https://github.com/Aarkc/scrapy-calyprium/commit/f669856db2c0d32cda9b6c0e86a5d5efabdbfbac))
+
 ## [1.37.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.0...v1.37.1) (2026-10-27)
 
 
