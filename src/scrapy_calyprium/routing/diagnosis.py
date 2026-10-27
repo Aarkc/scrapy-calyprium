@@ -332,6 +332,26 @@ def _visible_text_len(lower: str) -> int:
     return len(" ".join(text.split()))
 
 
+# A single-page app's document: a title of its own, the empty element the app renders into and the app's own
+# script bundle (a first-party .js, not one of Cloudflare's /cdn-cgi/ tags). biz.sosmt.gov's business search is such
+# a 1.4KB React shell behind Cloudflare: served once the clearance is accepted, it read as a stub, so every replay
+# of a good clearance was thrown away and solved again. The vendors' challenge and block pages (classified before
+# the stub check) never carry a mount point and a bundle together, and a challenge's title is not a title of its own.
+_APP_MOUNT_RE = re.compile(
+    r"""<div[^>]*\sid=["'](?:root|app|__next|__nuxt|svelte|main-app)["'][^>]*>\s*</div>|<app-root[\s>]""")
+_APP_BUNDLE_RE = re.compile(
+    r"""<script[^>]*\ssrc=["'](?!/cdn-cgi/)(?![a-z][a-z0-9+.-]*:|//)[^"']+\.m?js(?:\?[^"']*)?["']""")
+
+
+def _app_shell(lower: str) -> bool:
+    """Whether a small page is a single-page app's shell (see _APP_MOUNT_RE): its content is rendered by its
+    script, so it has no text or layout of its own and still is the page."""
+    head = lower[:10000]
+    title = _title(head)
+    return (bool(title) and title not in _CHALLENGE_TITLES and not any(s in head for s in _SOFT_DENY)
+            and bool(_APP_MOUNT_RE.search(head)) and bool(_APP_BUNDLE_RE.search(head)))
+
+
 def _is_markup_fragment(stripped: str) -> bool:
     head = stripped[:2000].lower()
     return (stripped.startswith("<")
@@ -632,6 +652,8 @@ def diagnose_response(
     if len(body) < 10000 and not _real_structure(lower):
         if _is_markup_fragment(stripped):
             return d(OK, "")
+        if _app_shell(lower):
+            return d(OK, "app_shell")
         if any(s in lower for s in _SOFT_DENY) or vendor:
             return d(SOFT_BLOCK, "stub_page")
         if _visible_text_len(lower) < 300:
