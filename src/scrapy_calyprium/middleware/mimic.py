@@ -831,6 +831,13 @@ class MimicBrowserMiddleware:
             name = next((k for k in headers if k.lower() == "cookie"), "Cookie")
             headers[name] = join_cookie_headers(headers.get(name, ""), jar)
         route_kwargs: Dict[str, Any] = {"headers": headers}
+        # The page the request came from, whoever named it: Scrapy's own Referer is not sent (see
+        # _local_headers), but it is the page a solve for this request loads (a form's POST: the
+        # form's page). A spider's Referer equal to Scrapy's reads as Scrapy's and was dropped with
+        # it, so the Akamai sensor solve went to the site's homepage (us_il_companies, 2026-10-27).
+        referer = request.headers.get("Referer")
+        if referer:
+            route_kwargs["referer"] = _header_text(referer) if isinstance(referer, bytes) else str(referer)
         method = (request.method or "GET").upper()
         if method != "GET":
             route_kwargs.update(method=method, body=request.body)

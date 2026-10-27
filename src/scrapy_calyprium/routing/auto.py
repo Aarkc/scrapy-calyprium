@@ -53,11 +53,12 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from scrapy_calyprium import _outcome
 from scrapy_calyprium.routing import diagnosis as dg
 from scrapy_calyprium.routing.block_detect import challenge_family, diagnose
+from scrapy_calyprium.routing import domain_cache as _domain_cache
 from scrapy_calyprium.routing.domain_cache import DomainCache
 from scrapy_calyprium.routing.local_fetch import (
     LocalFetchError,
@@ -316,14 +317,20 @@ def _merge_sensor(slot_cookies: List[Dict], solved: List[Dict]) -> List[Dict]:
     return out
 
 
-def _sensor_page(url: str, headers: Optional[Dict[str, str]] = None) -> str:
-    """The page whose sensor a form's POST needs: the request's Referer on the same host (the form's own
-    page), else the host's homepage."""
+def _sensor_page(url: str, headers: Optional[Dict[str, str]] = None, referer: Optional[str] = None) -> str:
+    """The page whose sensor a form's POST needs: the form's own page. The first of: the request's
+    Referer as the spider set it, the Referer it carries whoever set it (Scrapy's: the page the
+    request came from), the directory of the form's address; each on the same host and not the
+    form's address itself (a GET of the POST's target is no page). Else the host's homepage, which
+    may be no page with the sensor (apps.ilsos.gov/ redirects to www.ilsos.gov: 2026-10-27)."""
     found = {str(k).lower(): str(v) for k, v in (headers or {}).items() if v is not None}
     parsed = urlparse(url)
-    referer = urlparse(found.get("referer", "").strip())
-    if referer.scheme in ("http", "https") and (referer.hostname or "") == (parsed.hostname or ""):
-        return referer.geturl()
+    host = parsed.hostname or ""
+    for candidate in (found.get("referer", ""), referer or "", urljoin(url, "./")):
+        page = urlparse(str(candidate).strip())
+        if (page.scheme in ("http", "https") and (page.hostname or "") == host
+                and (page.path or "/") != (parsed.path or "/")):
+            return page.geturl()
     return f"{parsed.scheme or 'https'}://{parsed.netloc}/"
 
 
@@ -553,6 +560,7 @@ class SpiderAutoRouter:
                     domain=domain, provider=self.provider, solvers=self.solvers,
                     challenge_type=self._challenge_family.get(domain),
                     **({"target_url": page} if page else {}),
+                    **self._solve_extra(domain),
                 )
             except SolveError as exc:
                 logger.info(
@@ -693,9 +701,10 @@ class SpiderAutoRouter:
 
     async def fetch(
         self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
-        method: str = "GET", body: Optional[bytes] = None,
+        method: str = "GET", body: Optional[bytes] = None, referer: Optional[str] = None,
     ) -> RouteResult:
-        """Fetch ``url`` by the local route. ``headers`` are the request's own (the spider's
+        """Fetch ``url`` by the local route. ``referer``: the page the request came from, whoever
+        named it (Scrapy's Referer is not among ``headers``): where a sensor solve for it goes. ``headers`` are the request's own (the spider's
         X-Api-Key, Referer, ...): every local fetch of it sends them, the fetcher keeping its
         browser identity (see local_fetch._OWNED_HEADERS). A ``method`` other than GET (a
         storefront's GraphQL or search POST) sends ``body``: the light fetch and every replay
@@ -704,7 +713,7 @@ class SpiderAutoRouter:
         start_time = time.monotonic()
         trace_id = uuid.uuid4().hex
         result = await self._fetch_inner(url, domain=domain, headers=headers, method=method,
-                                         body=body)
+                                         body=body, referer=referer)
         if result.diagnosis is None:
             if result.fetch is not None:
                 result.diagnosis = _diagnose_fetch(result.fetch, url)
@@ -776,7 +785,7 @@ class SpiderAutoRouter:
 
     async def _fetch_inner(
         self, url: str, *, domain: str, headers: Optional[Dict[str, str]] = None,
-        method: str = "GET", body: Optional[bytes] = None,
+        method: str = "GET", body: Optional[bytes] = None, referer: Optional[str] = None,
     ) -> RouteResult:
         # No "heavy" bail-out.  When every slot is dead the right move is to
         # solve again with a fresh IP, not to fall through to the legacy
@@ -976,7 +985,8 @@ class SpiderAutoRouter:
             # reset stream, or a held request): the site's verdict, which a sensor solve on the
             # form's page lifts. Not a proxy failure to back off from.
             self._light_refused_at[domain] = time.monotonic()
-            return await self._akamai_sensor_route(url, domain, headers, own, transport_error, started)
+            return await self._akamai_sensor_route(url, domain, headers, own, transport_error, started,
+                                                   referer)
 
         if result is None and not light_blocked and transport_error is not None:
             logger.info(
@@ -1067,6 +1077,7 @@ class SpiderAutoRouter:
                 domain=domain, target_url=url, provider=self.provider,
                 solvers=self.solvers,
                 challenge_type=self._challenge_family.get(domain),
+                **self._solve_extra(domain),
             )
         except SolveError as exc:
             logger.debug("AutoRouter: solve attempt failed for %s: %s", domain, exc)
@@ -1205,14 +1216,25 @@ class SpiderAutoRouter:
             return _abck_accepted(own) is False
         return domain in self._akamai_seen
 
+    def _solve_extra(self, domain: str) -> Dict:
+        """A solve's extra fields: a host whose form needs Akamai's sensor accepted says so (a page
+        served without the sensor is no solve for it)."""
+        return {"extra": {"abck": "accepted"}} if domain in self._akamai_forms else {}
+
+    def _drop_slot(self, domain: str, slot) -> None:
+        """Retire a slot whose clearance cannot open the form (no accepted _abck)."""
+        slot.fail_count = max(slot.fail_count, _domain_cache.MAX_SLOT_FAILURES)
+
     def _solve_provider(self, slot) -> Optional[str]:
         """The ``provider`` a solve on a slot's own exit names: Mimic's is the Veil provider of the exit;
         Tessera's would force a solver, so it is left out there."""
         return slot.provider if getattr(self.solve_client, "backend", None) == "mimic" else None
 
-    async def _akamai_sensor_route(self, url, domain, headers, own, transport_error, started) -> RouteResult:
-        """Solve Akamai's sensor on the form's page and replay the request on that solve's exit."""
-        page = self._solve_pages.get(domain) or _sensor_page(url, headers)
+    async def _akamai_sensor_route(self, url, domain, headers, own, transport_error, started,
+                                   referer: Optional[str] = None) -> RouteResult:
+        """Solve Akamai's sensor on the form's page and replay the request on that solve's exit. A
+        solve whose _abck is not accepted is not replayed (the site would hold the request again)."""
+        page = self._solve_pages.get(domain) or _sensor_page(url, headers, referer)
         self._solve_pages[domain] = page
         self._challenge_family[domain] = "akamai"
         self._akamai_forms.add(domain)
@@ -1224,12 +1246,26 @@ class SpiderAutoRouter:
         async with self._solve_lock(domain):
             entry = self.cache.get(domain)
             if entry and entry.level == "cookies":
-                pristine = [s for s in entry.live_slots() if s.fail_count == 0]
+                pristine = [s for s in entry.live_slots() if s.fail_count == 0
+                            and _abck_accepted(_cookie_of(s.cookies, "_abck"))]
                 if pristine:
                     slot = min(pristine, key=lambda s: s.requests_per_minute())
             if slot is None:
                 slot = await self._try_one_solve(domain, page)
+            if slot is not None and not _abck_accepted(_cookie_of(slot.cookies, "_abck")):
+                # a page served without the sensor (or sensors not accepted): replaying the form with
+                # it is held until the client gives up. The next request chooses its page again.
+                logger.warning("AutoRouter: the sensor solve of %s on %s earned no accepted _abck; not "
+                               "replaying the form with it", domain, page)
+                self._drop_slot(domain, slot)
+                self._solve_pages.pop(domain, None)
+                return RouteResult(
+                    fetch=None, routing_method="solve_then_replay", blocked=True, domain_level="cookies",
+                    error=f"akamai sensor solve on {page} earned no accepted _abck",
+                    diagnosis=dg.diagnose_error(transport_error),
+                )
         if slot is None:
+            self._solve_pages.pop(domain, None)
             return RouteResult(
                 fetch=None, routing_method="solve_then_replay", blocked=True, domain_level="cookies",
                 error=f"akamai sensor solve failed after: {transport_error}",
@@ -1321,7 +1357,11 @@ class SpiderAutoRouter:
             slot.cookies = [{"name": c["name"], "value": c["value"], "domain": c.get("domain") or host,
                              "path": c.get("path") or "/"} for c in solve.cookies]
         r = solve.response
-        answered = LocalFetchResult(url=url, final_url=r.url or url, status_code=r.status, headers=dict(r.headers),
+        # the body is the solver's decoded one: an encoding or length header would describe other bytes (Scrapy's
+        # HttpCompressionMiddleware failed on "Content-Encoding: gzip" from Tessera 1.175.0, 2026-10-27)
+        headers = {k: v for k, v in (r.headers or {}).items()
+                   if str(k).lower() not in ("content-encoding", "content-length", "transfer-encoding", "set-cookie")}
+        answered = LocalFetchResult(url=url, final_url=r.url or url, status_code=r.status, headers=headers,
                                     body=r.body, backend=f"solve:{solve.engine or 'tessera'}",
                                     set_cookies=list(r.set_cookies))
         diag = _diagnose_fetch(answered, url)
@@ -1346,13 +1386,16 @@ class SpiderAutoRouter:
                     solve = await self.solve_client.solve(
                         domain=domain, target_url=page, challenge_type="akamai",
                         proxy_session_id=slot.proxy_session_id, provider=self._solve_provider(slot),
-                        country=slot.country,
+                        country=slot.country, extra={"abck": "accepted"},
                     )
                 except SolveError as exc:
                     logger.info("AutoRouter: the sensor run on %s failed: %s", domain, exc)
                     return None
                 if not solve.success or not solve.cookies:
                     logger.info("AutoRouter: the sensor run on %s earned no cookies (%s)", domain, solve.error)
+                    return None
+                if not _abck_accepted(_cookie_of(solve.cookies, "_abck")):
+                    logger.info("AutoRouter: the sensor run on %s earned no accepted _abck", domain)
                     return None
                 slot.cookies = _merge_sensor(slot.cookies, solve.cookies)
                 self._resensor_due.discard(slot.slot_id)
