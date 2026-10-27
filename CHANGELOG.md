@@ -1,3 +1,16 @@
+# [1.37.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.4...v1.37.0) (2026-10-27)
+
+
+### Bug Fixes
+
+* **diagnosis:** re-copy Mimic's classifier (a single-page app's shell is the page) ([d734599](https://github.com/Aarkc/scrapy-calyprium/commit/d734599ff2b0a4371232e5e7b6a827493cfd5594))
+
+
+### Features
+
+* **mimic:** browser-made form submits through meta["mimic_browser_submit"] ([0f58bb7](https://github.com/Aarkc/scrapy-calyprium/commit/0f58bb790fd2d41ddce51dff2e08416061722db2))
+* **routing:** answer akamai's challenge action and its sensor lapse on the slot's exit ([7293881](https://github.com/Aarkc/scrapy-calyprium/commit/7293881d981903553e156ca9728c21858487e903))
+
 ## [1.36.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.36.3...v1.36.4) (2026-10-26)
 
 
