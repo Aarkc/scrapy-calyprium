@@ -48,8 +48,10 @@ class VeilProxyMiddleware:
 
     PROXY_TYPE_MAP = {
         "datacenter": "dc",
+        "isp": "isp",
         "residential": "res",
         "residential_rotating": "res",
+        "mobile": "mobile",
     }
 
     def __init__(
