@@ -26,6 +26,10 @@ Each final response is also counted by how it was served (``routing_method_count
 and by its diagnosis class (``failure_class_counts``, and the Scrapy stat
 ``calyprium/class/<class>``; see ``scrapy_calyprium._outcome``). Responses the Mimic
 middleware retries are not final; they are counted as ``calyprium/retry/<class>``.
+
+The proxy gateway's pool_busy refusals (see ``scrapy_calyprium._pool_busy``) are no site's
+answer and no failure: PoolBusyMiddleware requeues them, which is not counted as a new
+request, and their number goes as ``pool_busy_count`` (the stat ``calyprium/pool_busy``).
 """
 from __future__ import annotations
 
@@ -41,7 +45,7 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
-from scrapy_calyprium import _outcome
+from scrapy_calyprium import _outcome, _pool_busy
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
@@ -151,6 +155,9 @@ class CalypriumRunStats:
     # -- signal handlers -------------------------------------------------
 
     def request_scheduled(self, request, spider):
+        meta = getattr(request, "meta", None)
+        if isinstance(meta, dict) and meta.pop(_pool_busy.REQUEUED, False):
+            return  # a pool_busy requeue: the same request again, not a new one
         with self._lock:
             self._request_count += 1
 
@@ -225,6 +232,12 @@ class CalypriumRunStats:
             except Exception as exc:
                 logger.debug("CalypriumRunStats flush error: %s", exc)
 
+    def _pool_busy_count(self) -> int:
+        try:
+            return int((self.stats.get_value("calyprium/pool_busy") if self.stats is not None else 0) or 0)
+        except Exception:  # noqa: BLE001 -- stats never break a crawl
+            return 0
+
     def _flush(self):
         # Snapshot under lock, then POST outside it so HTTP latency doesn't
         # block signal handlers.
@@ -238,6 +251,8 @@ class CalypriumRunStats:
                 "routing_method_counts": dict(self._routing_counts),
                 # Not read by Forge yet (an older Forge ignores it).
                 "failure_class_counts": dict(self._class_counts),
+                # The gateway's pool_busy refusals (requeued, never failures). Not read by Forge yet.
+                "pool_busy_count": self._pool_busy_count(),
                 "window_start": self._started_at.isoformat(),
                 "window_end": datetime.now(timezone.utc).isoformat(),
             }

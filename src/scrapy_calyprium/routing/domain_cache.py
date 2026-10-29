@@ -146,6 +146,11 @@ class CookieSlot:
         if len(self._request_times) > 10 and self._request_times[0] < cutoff:
             self._request_times = [t for t in self._request_times if t > cutoff]
 
+    def forget_request(self) -> None:
+        """Take back the last recorded request: it never reached the site (the proxy pool was busy)."""
+        if self._request_times:
+            self._request_times.pop()
+
     def requests_per_minute(self) -> int:
         cutoff = _now() - 60
         return sum(1 for t in self._request_times if t > cutoff)
@@ -436,6 +441,14 @@ class DomainCache:
             return
         slot.record_request()
         entry.maybe_raise_cap()
+
+    def forget_request(self, domain: str, slot_id: str) -> None:
+        """Take back a replay record_request() counted that the proxy gateway refused before it reached
+        the site (pool_busy): it is no request at the slot's rate, and no failure of it."""
+        entry = self._entries.get(domain)
+        slot = next((s for s in entry.slots if s.slot_id == slot_id), None) if entry else None
+        if slot is not None:
+            slot.forget_request()
 
     def record_slot_failure(
         self,

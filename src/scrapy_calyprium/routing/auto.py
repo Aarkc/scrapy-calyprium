@@ -23,6 +23,10 @@ Flow per request:
      and surface a 403 to the caller. Caller decides whether to fall through
      to the legacy browser path or fail the Scrapy request.
 
+A fetch the proxy gateway refuses for a busy pool (``pool_busy``, see _pool_busy) ends the route
+at once with ``pool_busy`` set: the site never saw it, so nothing solves, no slot, exit or domain
+is blamed and no span is recorded; the caller requeues the request.
+
 "Blocked" is the shared classifier's verdict (block_detect.diagnose), and every
 `RouteResult` carries the diagnosis of how it ended. Returns `RouteResult`. The
 caller (MimicMiddleware) wraps it in a Scrapy Response.
@@ -59,7 +63,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-from scrapy_calyprium import _outcome
+from scrapy_calyprium import _outcome, _pool_busy
 from scrapy_calyprium.routing import diagnosis as dg
 from scrapy_calyprium.routing.block_detect import challenge_family, diagnose
 from scrapy_calyprium.routing import domain_cache as _domain_cache
@@ -100,6 +104,8 @@ class RouteResult:
     # Why the fetch ended as it did (the shared classifier's verdict on `fetch`, or on the
     # transport error when there is no response). Filled by fetch() when left None.
     diagnosis: Optional[dg.Diagnosis] = None
+    # The proxy gateway refused the fetch for a busy pool (see _pool_busy): not the site's answer.
+    pool_busy: bool = False
 
 
 #: A fresh Cloudflare clearance is often refused on its first replay before Cloudflare accepts it
@@ -201,6 +207,23 @@ def _solve_url(url: str, method: str = "GET", headers: Optional[Dict[str, str]] 
     if not api or not parsed.netloc:
         return url
     return f"{parsed.scheme or 'https'}://{parsed.netloc}/"
+
+
+def _pool_busy_result(domain: str, level: Optional[str], why) -> RouteResult:
+    """The route's end when the proxy gateway refused a fetch for a busy pool: no response from the
+    site (``why`` is the refusal, an error or the gateway's 503)."""
+    if isinstance(why, LocalFetchResult):
+        why = f"HTTP {why.status_code} {_pool_busy.PROXY_ERROR_HEADER}: {_pool_busy.POOL_BUSY}"
+    logger.debug("AutoRouter: %s: the proxy pool is busy (%s); not a site failure", domain, why)
+    return RouteResult(
+        fetch=None,
+        routing_method="pool_busy",
+        blocked=False,
+        domain_level=level or "light",
+        error=str(why)[:300],
+        diagnosis=dg.Diagnosis(dg.PROXY_FAILURE, "", 503, _pool_busy.POOL_BUSY),
+        pool_busy=True,
+    )
 
 
 def _diagnose_fetch(fetch: LocalFetchResult, url: Optional[str] = None) -> dg.Diagnosis:
@@ -705,6 +728,10 @@ class SpiderAutoRouter:
         trace_id = uuid.uuid4().hex
         result = await self._fetch_inner(url, domain=domain, headers=headers, method=method,
                                          body=body, referer=referer)
+        if result.pool_busy:
+            # No span: the gateway refused it before the site saw it (no priced attempt, no
+            # failure); the request is requeued (PoolBusyMiddleware) and that attempt is traced.
+            return result
         if result.diagnosis is None:
             if result.fetch is not None:
                 result.diagnosis = _diagnose_fetch(result.fetch, url)
@@ -811,11 +838,16 @@ class SpiderAutoRouter:
                     url=url, proxy_url=self.proxy_url, **light_own,
                 )
             except LocalFetchError as exc:
+                if _pool_busy.is_pool_busy_error(exc):
+                    # Our proxy pool, not the exit or the site: keep the session, solve nothing.
+                    return _pool_busy_result(domain, level, exc)
                 self._renew_light_session(light_at, light_session)
                 # A transport error (timeout / connection reset) is NOT a block — a
                 # solve can't fix a dead connection. Remember it so the solve step
                 # can back off instead of escalating.
                 transport_error = exc
+            if light_result is not None and _pool_busy.is_pool_busy_headers(light_result.headers):
+                return _pool_busy_result(domain, level, light_result)  # a plain-HTTP refusal
             if light_result is not None and light_result.status_code in (429, 999):
                 self._renew_light_session(light_at, light_session)
             light_diag = _diagnose_fetch(light_result, url) if light_result else None
@@ -900,6 +932,10 @@ class SpiderAutoRouter:
                         **own,
                     )
                 except LocalFetchError as exc:
+                    if _pool_busy.is_pool_busy_error(exc):
+                        # Never reached the site: no failure (nor request) of the slot or its IP.
+                        self.cache.forget_request(domain, slot.slot_id)
+                        return _pool_busy_result(domain, level, exc)
                     logger.info(
                         "AutoRouter: cookie replay infra error for %s: %s",
                         domain, exc,
@@ -917,6 +953,9 @@ class SpiderAutoRouter:
                                     slot.slot_id)
                         self._drop_slot(domain, slot)
                 else:
+                    if _pool_busy.is_pool_busy_headers(result.headers):
+                        self.cache.forget_request(domain, slot.slot_id)
+                        return _pool_busy_result(domain, level, result)
                     handled = await self._akamai_answer(url, domain, slot, result, own, started)
                     if handled is not None:
                         return handled
@@ -1135,6 +1174,9 @@ class SpiderAutoRouter:
         started = time.monotonic()
         try:
             replay = await self._replay_slot_once(url, domain, slot, own)
+            if _pool_busy.is_pool_busy_headers(replay.headers):
+                self.cache.forget_request(domain, slot.slot_id)
+                return _pool_busy_result(domain, "cookies", replay)
             delay = float(self.warmup_replay_delay_s or 0)
             if (fresh and delay > 0 and _diagnose_fetch(replay, url).blocked
                     and _warmup_refusal(replay)):
@@ -1148,7 +1190,14 @@ class SpiderAutoRouter:
                 )
                 await asyncio.sleep(delay)
                 replay = await self._replay_slot_once(url, domain, slot, own)
+                if _pool_busy.is_pool_busy_headers(replay.headers):
+                    self.cache.forget_request(domain, slot.slot_id)
+                    return _pool_busy_result(domain, "cookies", replay)
         except LocalFetchError as exc:
+            if _pool_busy.is_pool_busy_error(exc):
+                # The fresh slot keeps its clearance unblamed for the requeued request.
+                self.cache.forget_request(domain, slot.slot_id)
+                return _pool_busy_result(domain, "cookies", exc)
             logger.warning(
                 "AutoRouter: replay error for %s: %s", domain, exc,
             )

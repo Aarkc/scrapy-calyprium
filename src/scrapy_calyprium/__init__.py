@@ -14,8 +14,10 @@ Quick start::
     # Or manual setup:
     DOWNLOADER_MIDDLEWARES = {
         "scrapy_calyprium.VeilProxyMiddleware": 100,
+        "scrapy_calyprium.PaceMiddleware": 120,  # with CALYPRIUM_PACE_PPM
         "scrapy_calyprium.SpectreMiddleware": 150,
         "scrapy_calyprium.MimicBrowserMiddleware": 200,
+        "scrapy_calyprium.PoolBusyMiddleware": 950,
     }
     ITEM_PIPELINES = {
         "scrapy_calyprium.S3BatchPipeline": 100,
@@ -28,6 +30,7 @@ from scrapy_calyprium.middleware.veil import VeilProxyMiddleware
 from scrapy_calyprium.middleware.spectre import SpectreMiddleware
 from scrapy_calyprium.middleware.mimic import MimicBrowserMiddleware
 from scrapy_calyprium.middleware.tracing import CalypriumTraceMiddleware
+from scrapy_calyprium.middleware.portfolio import PaceMiddleware, PoolBusyMiddleware
 from scrapy_calyprium.pipelines.s3_batch import S3BatchPipeline
 
 # AAR-15/17: optional local-first routing surfaces. Importable only if
@@ -53,6 +56,8 @@ __all__ = [
     "SpectreMiddleware",
     "MimicBrowserMiddleware",
     "CalypriumTraceMiddleware",
+    "PaceMiddleware",
+    "PoolBusyMiddleware",
     "S3BatchPipeline",
 ]
 if _HAS_LOCAL_ROUTING:

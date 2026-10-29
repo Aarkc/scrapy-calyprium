@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -122,7 +123,42 @@ class LocalFetchResult:
 
 
 class LocalFetchError(Exception):
-    """Raised when the local fetch backend cannot be used at all."""
+    """Raised when the local fetch backend cannot be used at all. ``proxy_error`` is the gateway's
+    X-Calyprium-Proxy-Error when it refused the CONNECT and the backend kept its reply (``pool_busy``,
+    ``refused_domain``, ...)."""
+
+    def __init__(self, *args, proxy_error: Optional[str] = None):
+        super().__init__(*args)
+        self.proxy_error = proxy_error
+
+
+#: httpcloak's error for a CONNECT the proxy refused, with the gateway's reason in the status phrase
+_HTTPCLOAK_REFUSAL_RE = re.compile(r"proxy CONNECT failed: \d{3}[^()]*\(([A-Za-z0-9_]+)\)")
+
+
+def _fetch_failed(url: str, exc: Exception) -> "LocalFetchError":
+    """The error for a fetch that failed. A refused CONNECT names the gateway's reason, which the
+    error text lacks (the shared classifier reads "X-Calyprium-Proxy-Error: <reason>" from it)."""
+    reason, phrase = _proxy_refusal(exc)
+    detail = f" (X-Calyprium-Proxy-Error: {reason}; {phrase or 'no status phrase'})" if reason else ""
+    return LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}{detail}", proxy_error=reason or None)
+
+
+def _proxy_refusal(exc: BaseException) -> Tuple[str, str]:
+    """The gateway's X-Calyprium-Proxy-Error and status phrase from a refused CONNECT, when the backend
+    kept the reply: curl_cffi's error says only "CONNECT tunnel failed, response 503" and carries the
+    proxy's reply as ``exc.response``. httpcloak puts the status line in its error text instead."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return "", ""
+    reason = ""
+    headers = getattr(response, "headers", None)
+    try:
+        reason = str((headers.get("x-calyprium-proxy-error") if headers is not None else "") or "")
+    except Exception:  # noqa: BLE001 -- odd header containers: no reason
+        reason = ""
+    phrase = str(getattr(response, "reason", "") or "")
+    return reason.strip().lower(), phrase.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +582,11 @@ class LocalFetcher:
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(self._executor, _do_sync_fetch)
         except Exception as exc:  # noqa: BLE001
-            raise LocalFetchError(f"httpcloak fetch failed for {url}: {exc}") from exc
+            # A refused CONNECT reads "proxy CONNECT failed: 503 Service Unavailable (pool_busy)":
+            # the gateway puts its reason in the status phrase.
+            refused = _HTTPCLOAK_REFUSAL_RE.search(str(exc))
+            raise LocalFetchError(f"httpcloak fetch failed for {url}: {exc}",
+                                  proxy_error=refused.group(1).lower() if refused else None) from exc
 
         elapsed_ms = int((time.time() - start) * 1000)
 
@@ -716,11 +756,11 @@ class LocalFetcher:
             response = await _send(no_ffdhe if host in self.no_ffdhe_hosts else None)
         except Exception as exc:  # noqa: BLE001
             if not no_ffdhe or host in self.no_ffdhe_hosts or not _tls_handshake_failed(exc):
-                raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
+                raise _fetch_failed(url, exc) from exc
             try:
                 response = await _send(no_ffdhe)
             except Exception:  # noqa: BLE001 -- the first error is the one to report
-                raise LocalFetchError(f"curl_cffi fetch failed for {url}: {exc}") from exc
+                raise _fetch_failed(url, exc) from exc
             self.no_ffdhe_hosts.add(host)
             logger.info(
                 "curl_cffi: %s ended the %s handshake listing the finite-field groups; its "
