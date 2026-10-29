@@ -1,3 +1,11 @@
+# [1.38.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.2...v1.38.0) (2026-10-29)
+
+
+### Features
+
+* **portfolio:** pace the spider and requeue the gateway's pool_busy refusals ([a6de749](https://github.com/Aarkc/scrapy-calyprium/commit/a6de749c34cadbff16cbec187bd10b3434d9360f))
+* **veil:** proxy types isp and mobile reach the gateway as their class ([a214820](https://github.com/Aarkc/scrapy-calyprium/commit/a214820f3582d61f2f77b98262e66b41fa759d39))
+
 ## [1.37.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.1...v1.37.2) (2026-10-27)
 
 
