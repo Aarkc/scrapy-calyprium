@@ -1,3 +1,10 @@
+## [1.39.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.0...v1.39.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **progress:** a prism spider's progress moves url by url, not page by page ([6672c05](https://github.com/Aarkc/scrapy-calyprium/commit/6672c05eabff937d33ebe88cd4be73cbfe2f9dc8))
+
 # [1.39.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.38.0...v1.39.0) (2026-10-30)
 
 
