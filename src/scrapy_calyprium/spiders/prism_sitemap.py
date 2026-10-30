@@ -218,6 +218,9 @@ class PrismSitemapSpider(scrapy.Spider):
         self._prism_cycle_start = 0
         self._prism_stop_at: Optional[int] = None
         self._prism_wrapped = False
+        # Prism list positions this run has finished: each crawled, failed or dropped URL, and each one skipped as
+        # fresh or offsite when its page came (the run's progress; the checkpoint moves only per whole page).
+        self._prism_positions_done = 0
         self._prism_page_limit = min(self.batch_size, 100000)
         self._prism_total: Optional[int] = None  # Prism's URL count for the source, once a page said it
         # Refill failures (prism://): consecutive failures drive the backoff; a domain Prism
@@ -683,24 +686,25 @@ class PrismSitemapSpider(scrapy.Spider):
         self._report_prism_progress()
 
     def _report_prism_progress(self) -> None:
-        """This run's place in Prism's URL list as its progress (scrapy_calyprium.progress), in list positions:
-        those finished since the run began, and those left until its pass ends. A pass ends at the end of the
-        list, or, for a run that began past 0 and wraps, back where it began."""
-        total, at = self._prism_total, self._prism_checkpoint_offset
-        if not total or at is None:
+        """This run's progress through Prism's URL list (scrapy_calyprium.progress), in list positions: those
+        finished since the run began (URL by URL, not page by page: one page can hold the whole list), and those
+        left until its pass ends. A pass ends at the end of the list, or, for a run that began past 0 and wraps,
+        back where it began; with max_urls, no later than that many URLs."""
+        total = self._prism_total
+        if not total or self._prism_checkpoint_offset is None:
             return
         start = self._prism_cycle_start
-        if self._prism_wrapped:
-            done, left = (max(total, start) - start) + at, (self._prism_stop_at or start) - at
-        elif start and self._wrap_enabled():
-            done, left = at - start, (max(total, at) - at) + start
-        else:
-            done, left = at - start, max(total, at) - at
+        length = max(total, start) if start and self._wrap_enabled() else max(total - start, 0)
+        done = self._prism_positions_done
+        left = max(0, length - done)
+        if self.max_urls:
+            left = min(left, max(0, self.max_urls - self._urls_yielded) + sum(self._prism_open_pages.values()))
         progress.report(self, done=done, left=left, unit="urls")
 
     def _prism_request_done(self, request) -> None:
         page = (getattr(request, "meta", None) or {}).get("_prism_page")
         if page is not None:
+            self._prism_positions_done += 1
             self._prism_track(page, -1)
 
     def _on_request_dropped(self, request, spider=None, **kwargs) -> None:
@@ -804,6 +808,7 @@ class PrismSitemapSpider(scrapy.Spider):
 
         at_end = end_of_cycle or raw_count < limit
         self._prism_next_offset = page_end
+        self._prism_positions_done += (page_end - page_start) - len(urls)  # skipped as fresh or offsite
         if urls:
             self._prism_open_pages[page_start] = (
                 self._prism_open_pages.get(page_start, 0) + len(urls)
