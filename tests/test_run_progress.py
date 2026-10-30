@@ -81,6 +81,34 @@ def test_prism_progress_is_the_completed_place_in_the_list():
     assert _progress(sp)["progress_done"] == 5 and _progress(sp)["progress_left"] == 15
 
 
+def test_progress_moves_url_by_url_within_a_page():
+    """One page can hold a spider's whole list: the checkpoint waits for all of it, progress does not."""
+    sp, refill = _spider()
+    reqs, _ = _handle(sp, refill, URLS)
+    _complete(sp, reqs[:2])
+    assert sp._prism_checkpoint_offset == 0
+    assert _progress(sp)["progress_done"] == 2 and _progress(sp)["progress_left"] == 18
+
+
+def test_fresh_urls_count_as_done_when_their_page_comes():
+    from unittest.mock import patch
+
+    sp, refill = _spider()
+    with patch.object(sp, "_filter_fresh_urls", return_value=URLS[3:]):
+        reqs, _ = _handle(sp, refill, URLS)
+    assert len(reqs) == 2
+    assert _progress(sp)["progress_done"] == 3 and _progress(sp)["progress_left"] == 17
+
+
+def test_max_urls_bounds_the_work_left():
+    sp = make_spider(S, {}, batch_size=5, max_urls=4)
+    (refill,) = list(sp.start_requests())
+    reqs, _ = _handle(sp, refill, URLS)
+    assert len(reqs) == 4
+    _complete(sp, reqs[:1])
+    assert _progress(sp)["progress_left"] == 3  # three yielded URLs still in flight, none more to come
+
+
 def test_a_resumed_run_counts_from_where_it_began_and_wraps_back_to_it():
     sp, refill = _spider(start_offset=15)
     reqs, _ = _handle(sp, refill, URLS)  # 15..20: the end of the list
