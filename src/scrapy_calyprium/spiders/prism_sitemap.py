@@ -76,7 +76,7 @@ from scrapy.exceptions import CloseSpider, DontCloseSpider
 from scrapy.http import TextResponse
 from scrapy.linkextractors import LinkExtractor
 
-from scrapy_calyprium import _wait
+from scrapy_calyprium import _wait, progress
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
@@ -219,6 +219,7 @@ class PrismSitemapSpider(scrapy.Spider):
         self._prism_stop_at: Optional[int] = None
         self._prism_wrapped = False
         self._prism_page_limit = min(self.batch_size, 100000)
+        self._prism_total: Optional[int] = None  # Prism's URL count for the source, once a page said it
         # Refill failures (prism://): consecutive failures drive the backoff; a domain Prism
         # does not know gets its other www form tried once and one scan request per run,
         # then is polled until the wait deadline (monotonic).
@@ -679,6 +680,23 @@ class PrismSitemapSpider(scrapy.Spider):
             self._prism_checkpoint_offset = min(self._prism_open_pages)
         else:
             self._prism_checkpoint_offset = self._prism_next_offset
+        self._report_prism_progress()
+
+    def _report_prism_progress(self) -> None:
+        """This run's place in Prism's URL list as its progress (scrapy_calyprium.progress), in list positions:
+        those finished since the run began, and those left until its pass ends. A pass ends at the end of the
+        list, or, for a run that began past 0 and wraps, back where it began."""
+        total, at = self._prism_total, self._prism_checkpoint_offset
+        if not total or at is None:
+            return
+        start = self._prism_cycle_start
+        if self._prism_wrapped:
+            done, left = (max(total, start) - start) + at, (self._prism_stop_at or start) - at
+        elif start and self._wrap_enabled():
+            done, left = at - start, (max(total, at) - at) + start
+        else:
+            done, left = at - start, max(total, at) - at
+        progress.report(self, done=done, left=left, unit="urls")
 
     def _prism_request_done(self, request) -> None:
         page = (getattr(request, "meta", None) or {}).get("_prism_page")
@@ -732,6 +750,8 @@ class PrismSitemapSpider(scrapy.Spider):
             self._stat_inc("prism/domain_switched")
         # Prism answered: the failure run (and any wait for a scan) is over.
         self._prism_refill_failures = 0
+        if isinstance(data.get("total"), int) and data["total"] > 0:  # the list's length (total_stale is not)
+            self._prism_total = data["total"]
         self._prism_wait_deadline = None
         page_start = response.meta.get("_prism_offset", self._prism_next_offset)
         limit = response.meta.get("_prism_limit") or min(self.batch_size, 100000)
