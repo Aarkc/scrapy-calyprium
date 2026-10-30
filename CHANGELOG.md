@@ -1,3 +1,10 @@
+# [1.39.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.38.0...v1.39.0) (2026-10-30)
+
+
+### Features
+
+* **progress:** a spider reports its progress, for the time its run has left ([e810347](https://github.com/Aarkc/scrapy-calyprium/commit/e81034724a785f729b59250e531443e0c800a8ee))
+
 # [1.38.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.37.2...v1.38.0) (2026-10-29)
 
 
