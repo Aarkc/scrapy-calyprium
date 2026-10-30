@@ -111,6 +111,21 @@ DOWNLOADER_MIDDLEWARES = {
 CALYPRIUM_PACE_PPM = 30  # optional: one page every 2 s
 ```
 
+### Reporting Progress
+
+A spider that knows how much work it has can say so, and Calyprium shows how long its run has left (the work
+left divided by the recent pace of the work done). Call `progress.report` whenever the counts change; both are
+in one unit:
+
+```python
+from scrapy_calyprium import progress
+
+progress.report(self, done=pages_done, left=pages_left, unit="companies")
+```
+
+`PrismSitemapSpider` reports its place in Prism's URL list by itself. A spider that reports nothing gets an
+estimate from its earlier runs instead.
+
 ### Saving Output to Calyprium Storage
 
 Spider output is saved to Calyprium's S3-compatible storage using Scrapy's built-in feed export:

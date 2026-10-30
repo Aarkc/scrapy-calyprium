@@ -30,6 +30,9 @@ middleware retries are not final; they are counted as ``calyprium/retry/<class>`
 The proxy gateway's pool_busy refusals (see ``scrapy_calyprium._pool_busy``) are no site's
 answer and no failure: PoolBusyMiddleware requeues them, which is not counted as a new
 request, and their number goes as ``pool_busy_count`` (the stat ``calyprium/pool_busy``).
+
+A spider's progress (``scrapy_calyprium.progress``: work done and left) goes as ``progress_done``,
+``progress_left`` and ``progress_unit``, for Forge's estimate of the time the run has left.
 """
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ import httpx
 from scrapy import signals
 from scrapy.crawler import Crawler
 
-from scrapy_calyprium import _outcome, _pool_busy
+from scrapy_calyprium import _outcome, _pool_busy, progress
 from scrapy_calyprium._forge import ForgeAuth
 
 logger = logging.getLogger(__name__)
@@ -255,6 +258,9 @@ class CalypriumRunStats:
                 "pool_busy_count": self._pool_busy_count(),
                 "window_start": self._started_at.isoformat(),
                 "window_end": datetime.now(timezone.utc).isoformat(),
+                # The spider's progress (scrapy_calyprium.progress), null when it reports none: Forge's
+                # time-left estimate. An older Forge ignores it.
+                **progress.read(self.stats),
             }
 
         if not self.run_number:
