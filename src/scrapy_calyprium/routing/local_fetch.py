@@ -569,12 +569,16 @@ class LocalFetcher:
                 preset=preset, proxy=effective_proxy, timeout=timeout
             )
             try:
+                # The timeout goes on the request too: httpcloak (1.7.2) gives a request without one
+                # 30 s whatever the Session's, so a spider's DOWNLOAD_TIMEOUT never reached a replay
+                # (cjponyparts' 10 MB sitemaps died at 30.0 s with DOWNLOAD_TIMEOUT 240, 2026-11-01).
                 if method != "GET":
                     # the preset's headers as for a fetch(): known names in place, body as made
-                    return session.request(method, url, data=body, headers=headers or None)
+                    return session.request(method, url, data=body, headers=headers or None,
+                                           timeout=timeout)
                 if headers:
-                    return session.get(url, headers=headers)
-                return session.get(url)
+                    return session.get(url, headers=headers, timeout=timeout)
+                return session.get(url, timeout=timeout)
             finally:
                 session.close()
 
