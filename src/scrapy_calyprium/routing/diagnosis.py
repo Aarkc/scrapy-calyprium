@@ -117,6 +117,7 @@ AMAZON = "amazon"
 GOOGLE = "google"
 DDOS_GUARD = "ddos_guard"
 SUCURI = "sucuri"
+SITEGROUND = "siteground"
 VERCEL = "vercel"
 FASTLY = "fastly"
 F5 = "f5"
@@ -515,6 +516,11 @@ def diagnose_response(
                 "ips.js" in lower[:6000] or "kpsdk" in lower[:6000] or "149e9513-01fa" in lower[:6000]
                 or "x-kpsdk" in _header_names(headers)):
             return d(CHALLENGE, "kasada_challenge", KASADA)
+        # SiteGround's bot check ("One moment, please..."), served 200: its script fills a hidden form (wsidchk, the
+        # answer) and posts it after a second, else the page reloads itself; a browser that waits gets the page. Read
+        # as a page, its title was saved as an item (songchuanusa.com, 2026-11-01).
+        if "wsidchk" in lower[:20000] or "/.well-known/sgcaptcha" in lower[:20000]:
+            return d(CHALLENGE, "siteground_challenge", SITEGROUND)
         # Akamai's interstitial: a proof of work in the page, posted to /_sec/verify with its bm-verify token.
         if "bm-verify" in lower[:20000] and "/_sec/verify" in lower[:20000]:
             return d(CHALLENGE, "akamai_interstitial", AKAMAI)
