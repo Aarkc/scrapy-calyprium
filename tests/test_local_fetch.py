@@ -57,8 +57,8 @@ def fake_httpcloak(monkeypatch):
                 "preset": preset, "proxy": proxy, "timeout": timeout,
             }
 
-        def get(self, url, headers=None):
-            FakeSession.last_get = {"url": url, "headers": headers}
+        def get(self, url, headers=None, timeout=None):
+            FakeSession.last_get = {"url": url, "headers": headers, "timeout": timeout}
             if isinstance(FakeSession.next_response, Exception):
                 raise FakeSession.next_response
             return FakeSession.next_response or FakeResponse()
@@ -309,3 +309,18 @@ class TestErrorHandling:
         result = await fetcher.fetch("https://example.com/")
         assert result.status_code == 403
         assert result.body == b"forbidden"
+
+
+def test_httpcloak_requests_carry_the_fetch_timeout(fake_httpcloak):
+    """httpcloak (1.7.2) gives a request without its own timeout 30 s, whatever the Session's: a
+    spider's DOWNLOAD_TIMEOUT has to go on the request (cjponyparts' 10 MB sitemaps, 2026-11-01)."""
+    import asyncio
+
+    from scrapy_calyprium.routing.local_fetch import LocalFetcher
+
+    fetcher = LocalFetcher(default_preset="chrome-143", timeout=240, backend="httpcloak")
+    asyncio.run(fetcher.fetch("https://example.com/sitemap.xml"))
+    assert fake_httpcloak.Session.last_init["timeout"] == 240
+    assert fake_httpcloak.Session.last_get["timeout"] == 240
+    asyncio.run(fetcher.fetch("https://example.com/p", cookies=[{"name": "a", "value": "1"}], timeout=90))
+    assert fake_httpcloak.Session.last_get["timeout"] == 90

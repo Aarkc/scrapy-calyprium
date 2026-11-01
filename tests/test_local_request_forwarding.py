@@ -73,13 +73,13 @@ def httpcloak(monkeypatch):
             Session.calls.append({**self.init, **call})
             return Session.responses.pop(0) if Session.responses else FakeResponse()
 
-        def get(self, url, headers=None):
+        def get(self, url, headers=None, timeout=None):
             return self._answer({"method": "GET", "url": url, "headers": headers, "body": None,
-                                 "via": "get"})
+                                 "via": "get", "request_timeout": timeout})
 
-        def request(self, method, url, data=None, headers=None):
+        def request(self, method, url, data=None, headers=None, timeout=None):
             return self._answer({"method": method, "url": url, "headers": headers, "body": data,
-                                 "via": "request"})
+                                 "via": "request", "request_timeout": timeout})
 
         def close(self):
             pass
