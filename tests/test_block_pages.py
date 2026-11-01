@@ -353,3 +353,19 @@ NOT_BLOCKED = [
 def test_real_pages_stay_unblocked(name, status, body):
     assert is_blocked(status, body, content_type=HTML) is False
     assert diagnose(status, body, HTML).ok
+
+
+SITEGROUND_CHECK = (
+    '<!DOCTYPE html><html lang="en"><head><meta charset="utf8"><title>One moment, please...</title></head><body>'
+    '<div id="text">Please wait while your request is being verified...</div><script>var i="wsidchk",w="pdata",'
+    'o="/z0f00000000000000000000000000000000000000";setTimeout(function(){document.createElement("form")'
+    '.submit();},0x3e8);</script></body></html>'
+)
+
+
+def test_siteground_bot_check_is_blocked():
+    """SiteGround's "One moment, please..." page (served 200) is a challenge, not a page: songchuan_parts saved its
+    title as items while the run was judged healthy (2026-11-01). Mimic's browser waits it out."""
+    d = diagnose(200, SITEGROUND_CHECK.encode(), HTML)
+    assert (d.cls, d.vendor) == (dg.CHALLENGE, dg.SITEGROUND)
+    assert is_blocked(200, SITEGROUND_CHECK, HTML)
