@@ -231,8 +231,9 @@ class TestHeaderInjection:
 
         sent = fake_httpcloak.Session.last_get["headers"]
         assert sent["Cookie"] == "cf_clearance=abc; __cf_bm=xyz"
-        # Compression must be disabled when injecting cookies
-        assert sent["Accept-Encoding"] == "identity"
+        # The preset's Accept-Encoding goes out with the cookies: a replay asking for
+        # `identity` is refused by sites (ugg/hoka's edge 406, 2026-11-01)
+        assert "Accept-Encoding" not in sent
 
     @pytest.mark.asyncio
     async def test_user_agent_passed_through(self, fake_httpcloak, fetcher):

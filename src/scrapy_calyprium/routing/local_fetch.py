@@ -545,9 +545,12 @@ class LocalFetcher:
             headers["User-Agent"] = user_agent
         if cookies:
             headers["Cookie"] = _build_cookie_header(_merge_cookies(cookies, own_cookie))
-            # Disable compression to avoid httpcloak decompression errors
-            # (the server-side fetcher does the same — see AAR-12 sibling).
-            headers["Accept-Encoding"] = "identity"
+            # The preset's own Accept-Encoding goes out (Chrome's gzip, deflate, br, zstd):
+            # httpcloak decodes the body itself (.content, below). A replay that asked for
+            # `identity` was the one request no browser makes, and sites refuse it with the
+            # cookies it carries: ugg.com and hoka.com answer it with their edge's 406
+            # "BLOCKED_EDGE" page (every product page of their runs on 2026-11-01), heb.com
+            # refused it on 2026-10-23.
             logger.info(
                 "httpcloak fetch %s: preset=%s, cookies=%s, "
                 "ua=%s, proxy_session=%s",

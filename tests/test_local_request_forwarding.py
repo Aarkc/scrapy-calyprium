@@ -222,8 +222,9 @@ async def test_spider_headers_cannot_replace_the_fetchers_identity(httpcloak):
             "Proxy-Authorization": "Basic eA==", "X-Veil-Profile": "p",
             "Cookie": "cf_clearance=stale; lang=de", "X-Api-Key": "k1"})
     sent = _sent(httpcloak.calls[0])
+    # the spider's Accept-Encoding is dropped and none is set: the preset's own goes out
     assert sent == {
-        "user-agent": "Slot-UA", "accept-encoding": "identity", "x-api-key": "k1",
+        "user-agent": "Slot-UA", "x-api-key": "k1",
         "cookie": "cf_clearance=clear; lang=de",  # the slot's clearance wins its name
     }
 
