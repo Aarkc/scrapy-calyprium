@@ -1,3 +1,10 @@
+## [1.39.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.4...v1.39.5) (2026-11-01)
+
+
+### Bug Fixes
+
+* a linux or mac chrome clearance replays as that chrome ([2384d9e](https://github.com/Aarkc/scrapy-calyprium/commit/2384d9e14939db7dbdbca320101eb98d167a0384))
+
 ## [1.39.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.3...v1.39.4) (2026-11-01)
 
 
