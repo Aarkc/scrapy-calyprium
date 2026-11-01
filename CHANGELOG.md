@@ -1,3 +1,10 @@
+## [1.39.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.1...v1.39.2) (2026-11-01)
+
+
+### Bug Fixes
+
+* a cookie replay sends the preset's accept-encoding, not identity ([734c8df](https://github.com/Aarkc/scrapy-calyprium/commit/734c8df6c2e35cf7f906bf045e957dceaa7e57cd))
+
 ## [1.39.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.0...v1.39.1) (2026-10-30)
 
 
