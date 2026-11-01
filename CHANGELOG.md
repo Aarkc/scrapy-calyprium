@@ -1,3 +1,10 @@
+## [1.39.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.5...v1.39.6) (2026-11-01)
+
+
+### Bug Fixes
+
+* no solve starts once the crawl is closing ([64fb104](https://github.com/Aarkc/scrapy-calyprium/commit/64fb104c8ece13d179d9d29f2976c65652debd07))
+
 ## [1.39.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.4...v1.39.5) (2026-11-01)
 
 
