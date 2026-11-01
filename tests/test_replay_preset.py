@@ -157,3 +157,65 @@ def test_real_httpcloak_presents_the_user_agents_chrome():
     assert values["sec-ch-ua"] == sec_ch_ua(155)
     assert values["accept"] == accept_document(155)
     assert "Chrome/155." in spec["headers"]["user_agent"]
+
+
+UA156_LINUX = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/156.0.0.0 Safari/537.36")
+
+
+@pytest.fixture
+def derive_platform(monkeypatch, derive):
+    """httpcloak as shipped (its newest bundled Linux and macOS presets are Chrome 152), deriving
+    chrome-<N>-linux / -macos."""
+    derived = []
+
+    def ensure(major, platform):
+        derived.append((major, platform))
+        return f"chrome-{major}-{platform}"
+
+    monkeypatch.setattr(chrome_preset, "ensure_platform_preset", ensure)
+    monkeypatch.setattr(chrome_preset, "_base_platform_preset", lambda httpcloak, platform: f"chrome-152-{platform}")
+    return derived
+
+
+def test_a_linux_or_mac_chrome_clearance_replays_as_that_chrome(derive_platform):
+    """Mimic's browsers solve as a Linux Chrome; replayed on httpcloak's newest Linux preset a Chrome/156
+    clearance went out with Chrome 152's client hints (lowes.com, 2026-11-01)."""
+    mac156 = UA156_LINUX.replace("X11; Linux x86_64", "Macintosh; Intel Mac OS X 10_15_7")
+    phone = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/156.0.0.0 Mobile Safari/537.36")
+    assert replay_preset("chrome-152-linux", UA156_LINUX) == "chrome-156-linux"
+    assert replay_preset("chrome-latest", UA156_LINUX) == "chrome-156-linux"     # httpcloak's alias is Linux's
+    assert replay_preset("chrome-latest", mac156) == "chrome-156-macos"
+    assert replay_preset("chrome-152-windows", UA156_LINUX) == "chrome-152-windows"  # another platform: unchanged
+    assert replay_preset("chrome-latest", phone) == "chrome-latest"               # no desktop preset presents it
+    assert replay_preset("chrome-156-linux") == "chrome-156-linux"                # a solver's derived name
+    # chrome-152-windows is looked up as a name a solver may have derived (bundled: it comes back as is)
+    assert derive_platform == [(156, "linux"), (156, "linux"), (156, "macos"), (152, "windows"), (156, "linux")]
+
+
+def test_a_derived_linux_preset_presents_its_chrome(monkeypatch):
+    module = types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "httpcloak", module)
+    registered = {}
+    base = {"version": 1, "preset": {
+        "name": "chrome-152-linux", "tls": {"client_hello": "x"},
+        "headers": {"user_agent": UA156_LINUX.replace("156.", "152."),
+                    "values": {"sec-ch-ua": sec_ch_ua(152), "sec-ch-ua-platform": '"Linux"', "Accept": ACCEPT_152},
+                    "order": [{"key": "sec-ch-ua", "value": sec_ch_ua(152)}, {"key": "Accept", "value": ACCEPT_152}]}}}
+
+    def load_preset_from_json(blob):
+        name = json.loads(blob)["preset"]["name"]
+        registered[name] = json.loads(blob)["preset"]
+        return name
+
+    monkeypatch.setattr(chrome_preset, "_DERIVED", set())
+    module.available_presets = lambda: {"chrome-latest": {}, "chrome-152-linux": {}, "chrome-152-windows": {}}
+    module.describe_preset = lambda name: json.dumps(base)
+    module.load_preset_from_json = load_preset_from_json
+    assert chrome_preset.ensure_platform_preset(156, "linux") == "chrome-156-linux"
+    assert chrome_preset.ensure_platform_preset(152, "linux") == "chrome-152-linux"   # bundled: not derived
+    p = registered["chrome-156-linux"]["headers"]
+    assert p["values"]["sec-ch-ua"] == sec_ch_ua(156) and p["values"]["sec-ch-ua-platform"] == '"Linux"'
+    assert "Chrome/156.0.0.0" in p["user_agent"] and "X11; Linux" in p["user_agent"]
+    assert list(registered) == ["chrome-156-linux"]
