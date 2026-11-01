@@ -1,3 +1,10 @@
+## [1.39.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.3...v1.39.4) (2026-11-01)
+
+
+### Bug Fixes
+
+* an httpcloak fetch's timeout goes on the request, not only the session ([b19d789](https://github.com/Aarkc/scrapy-calyprium/commit/b19d789e123d8e1fecb20b774624b85038572ce0))
+
 ## [1.39.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.2...v1.39.3) (2026-11-01)
 
 
