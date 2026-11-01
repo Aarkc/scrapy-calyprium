@@ -1,3 +1,10 @@
+## [1.39.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.2...v1.39.3) (2026-11-01)
+
+
+### Bug Fixes
+
+* siteground's bot check is a challenge (classifier re-copied from mimic) ([0aa7555](https://github.com/Aarkc/scrapy-calyprium/commit/0aa7555661710838c073ce152beebb0866efbdfb)), closes [#330](https://github.com/Aarkc/scrapy-calyprium/issues/330)
+
 ## [1.39.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.1...v1.39.2) (2026-11-01)
 
 
