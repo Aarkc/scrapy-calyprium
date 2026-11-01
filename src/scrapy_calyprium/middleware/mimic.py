@@ -600,6 +600,8 @@ class MimicBrowserMiddleware:
                 light_probe_interval=self.crawler.settings.getfloat(
                     "MIMIC_LOCAL_LIGHT_PROBE_INTERVAL", LIGHT_PROBE_INTERVAL_S),
             )
+            # No solve starts once the crawl is closing (a time limit, an idle close): see SpiderAutoRouter.closing.
+            self._local_router.closing = self._crawl_closing
 
             # Slot-stats reporter — periodically batch the local DomainCache's
             # per-slot stats and POST them to Mimic so cross-spider visibility
@@ -752,6 +754,14 @@ class MimicBrowserMiddleware:
                 return "maximum"
             self._escalated.pop(domain, None)
         return self.stealth_level
+
+    def _crawl_closing(self) -> bool:
+        """Whether the engine has begun closing the spider (CloseSpider's time limits, an idle close, the
+        runner's stop): its slot holds the closing Deferred from then on. Scrapy sends spider_closed only
+        once the requests in flight end, too late for a request that would solve again."""
+        engine = getattr(self.crawler, "engine", None)
+        slot = getattr(engine, "slot", None) or getattr(engine, "_slot", None)
+        return bool(getattr(slot, "closing", None))
 
     async def spider_closed(self, spider):
         """Close browser session when spider closes."""

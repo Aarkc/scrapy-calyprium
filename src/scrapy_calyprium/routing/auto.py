@@ -60,7 +60,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from scrapy_calyprium import _outcome, _pool_busy
@@ -433,6 +433,10 @@ class SpiderAutoRouter:
         self.solve_parallel_solves = solve_parallel_solves
         self._refill_tasks: Dict[str, asyncio.Task] = {}
         self._refill_stop = False
+        # Whether the crawl is closing (set by MimicMiddleware from the engine): no solve starts then. A close waits
+        # for the requests in flight, and a request kept solving (up to solve_max_retries x 270 s) held a run that had
+        # reached its time limit open for another half hour and more (partselect, 2026-11-01).
+        self.closing: Callable[[], bool] = lambda: False
         # Refill solves in flight (cancelled by stop_refill when the crawl ends).
         self._refill_running: set = set()
         # Last hot-path refill check per domain. The original design used a
@@ -496,7 +500,7 @@ class SpiderAutoRouter:
         when there's an active await chain from a Scrapy callback.
         """
         import time as _t
-        if self._refill_stop:
+        if self._refill_stop or self._is_closing():
             return
         entry = self.cache.get(domain)
         if entry is None or entry.level != "cookies":
@@ -570,7 +574,7 @@ class SpiderAutoRouter:
             try:
                 # the page the domain's requests solve on, when it is not the domain's own
                 page = self._solve_pages.get(domain)
-                solve = await self.solve_client.solve(
+                solve = await self._solve(
                     domain=domain, provider=self.provider, solvers=self.solvers,
                     challenge_type=self._challenge_family.get(domain),
                     **({"target_url": page} if page else {}),
@@ -613,6 +617,17 @@ class SpiderAutoRouter:
             self._refill_in_flight[domain] = max(
                 0, self._refill_in_flight.get(domain, 0) - 1,
             )
+
+    def _is_closing(self) -> bool:
+        closing = getattr(self, "closing", None)
+        return bool(closing and closing())
+
+    async def _solve(self, **kwargs):
+        """solve_client.solve, unless the crawl is closing: then SolveError, which every caller already treats as a
+        failed solve (the request ends on what it met)."""
+        if self._is_closing():
+            raise SolveError("the crawl is closing: no new solve")
+        return await self.solve_client.solve(**kwargs)
 
     def stop_refill(self) -> None:
         """End pool refills (the crawl is over): no refill solve starts after this, and the ones
@@ -1110,7 +1125,7 @@ class SpiderAutoRouter:
     async def _try_one_solve(self, domain: str, url: str):
         """Attempt a single solve. Returns a CookieSlot on success, None on failure."""
         try:
-            solve = await self.solve_client.solve(
+            solve = await self._solve(
                 domain=domain, target_url=url, provider=self.provider,
                 solvers=self.solvers,
                 challenge_type=self._challenge_family.get(domain),
@@ -1396,7 +1411,7 @@ class SpiderAutoRouter:
             logger.info("AutoRouter: %s answered with Akamai's challenge action; asking the solve service to "
                         "answer it on slot %s's session", domain, slot.slot_id)
             try:
-                solve = await self.solve_client.solve(
+                solve = await self._solve(
                     domain=domain, target_url=fetch.final_url or url, challenge_type="akamai_captcha",
                     proxy_session_id=slot.proxy_session_id, provider=self._solve_provider(slot),
                     country=slot.country, page_html=(fetch.body or b"").decode("utf-8", "replace"),
