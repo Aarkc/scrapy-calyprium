@@ -1,3 +1,10 @@
+# [1.42.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.41.1...v1.42.0) (2026-11-02)
+
+
+### Features
+
+* **prism:** under the frontier scheduler, prism's list only feeds discovery ([9997be2](https://github.com/Aarkc/scrapy-calyprium/commit/9997be26904f173ac3ca0ed59efb12983b1a412a))
+
 ## [1.41.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.41.0...v1.41.1) (2026-11-02)
 
 
