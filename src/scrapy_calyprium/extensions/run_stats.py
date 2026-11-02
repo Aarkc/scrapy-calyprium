@@ -33,6 +33,12 @@ request, and their number goes as ``pool_busy_count`` (the stat ``calyprium/pool
 
 A spider's progress (``scrapy_calyprium.progress``: work done and left) goes as ``progress_done``,
 ``progress_left`` and ``progress_unit``, for Forge's estimate of the time the run has left.
+
+How much the crawl has going at once (``scrapy_calyprium.concurrency``), sampled every second: the requests in
+flight now with their average and peak over the report's window (``in_flight``, ``in_flight_avg``,
+``in_flight_max``, against ``concurrency_limit``), the requests queued, and the Mimic solves in progress
+(``solves_in_flight``, ``solves_in_flight_max``). The same goes to the log every
+CALYPRIUM_CONCURRENCY_LOG_INTERVAL seconds (default 60; 0 = never).
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ from scrapy.crawler import Crawler
 
 from scrapy_calyprium import _outcome, _pool_busy, progress
 from scrapy_calyprium._forge import ForgeAuth
+from scrapy_calyprium.concurrency import ConcurrencySampler, describe
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +108,9 @@ class CalypriumRunStats:
         self._class_counts: Counter = Counter()
         # Scrapy's stats collector (set in from_crawler), for calyprium/class/<class>.
         self.stats = None
+        # Requests in flight, queued, solves (set in from_crawler): sampled every second by the reporter thread.
+        self.sampler: Optional[ConcurrencySampler] = None
+        self.log_interval = 60.0
         self._started_at = datetime.now(timezone.utc)
 
         self._stop = threading.Event()
@@ -148,6 +158,8 @@ class CalypriumRunStats:
         ext = cls(forge_url, secret, user_id, slug, job_id, run_number, interval,
                   api_key=api_key)
         ext.stats = getattr(crawler, "stats", None)
+        ext.sampler = ConcurrencySampler(crawler)
+        ext.log_interval = settings.getfloat("CALYPRIUM_CONCURRENCY_LOG_INTERVAL", 60.0)
         crawler.signals.connect(ext.spider_opened, signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signals.spider_closed)
         crawler.signals.connect(ext.response_received, signals.response_received)
@@ -218,6 +230,8 @@ class CalypriumRunStats:
         self._stop.set()
         # Final flush so the UI sees the last counts even if the reporter
         # thread was mid-sleep at shutdown.
+        if self.sampler is not None:
+            self.sampler.sample()
         self._flush()
         if self._thread:
             self._thread.join(timeout=5)
@@ -229,11 +243,30 @@ class CalypriumRunStats:
         )
 
     def _report_loop(self):
-        while not self._stop.wait(self.interval):
-            try:
-                self._flush()
-            except Exception as exc:
-                logger.debug("CalypriumRunStats flush error: %s", exc)
+        # Wakes every second to sample what the crawl has going at once; reports every `interval` seconds and logs
+        # the concurrency every `log_interval` seconds.
+        if self.sampler is not None:
+            self.sampler.watch("report")
+            self.sampler.watch("log")
+        last_flush = last_log = time.monotonic()
+        while not self._stop.wait(min(1.0, self.interval)):
+            now = time.monotonic()
+            if self.sampler is not None:
+                try:
+                    self.sampler.sample()
+                except Exception as exc:  # noqa: BLE001 -- a sample never stops the reporter
+                    logger.debug("CalypriumRunStats sample error: %s", exc)
+                if self.log_interval > 0 and now - last_log >= self.log_interval:
+                    window = self.sampler.window("log")
+                    if window:
+                        logger.info(describe(window, now - last_log))
+                    last_log = now
+            if now - last_flush >= self.interval:
+                last_flush = now
+                try:
+                    self._flush()
+                except Exception as exc:
+                    logger.debug("CalypriumRunStats flush error: %s", exc)
 
     def _pool_busy_count(self) -> int:
         try:
@@ -261,6 +294,9 @@ class CalypriumRunStats:
                 # The spider's progress (scrapy_calyprium.progress), null when it reports none: Forge's
                 # time-left estimate. An older Forge ignores it.
                 **progress.read(self.stats),
+                # Requests in flight (now, average, peak), queued, and solves in progress over this window
+                # (scrapy_calyprium.concurrency); none before the first sample. An older Forge ignores them.
+                **(self.sampler.window("report") if self.sampler is not None else {}),
             }
 
         if not self.run_number:

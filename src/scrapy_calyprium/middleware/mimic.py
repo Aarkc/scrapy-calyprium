@@ -602,6 +602,8 @@ class MimicBrowserMiddleware:
             )
             # No solve starts once the crawl is closing (a time limit, an idle close): see SpiderAutoRouter.closing.
             self._local_router.closing = self._crawl_closing
+            # The solves in progress, for the run's concurrency report (scrapy_calyprium.concurrency).
+            self._local_router.stats = getattr(self.crawler, "stats", None)
 
             # Slot-stats reporter — periodically batch the local DomainCache's
             # per-slot stats and POST them to Mimic so cross-spider visibility

@@ -64,6 +64,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from scrapy_calyprium import _outcome, _pool_busy
+from scrapy_calyprium.concurrency import SOLVES_IN_FLIGHT
 from scrapy_calyprium.routing import diagnosis as dg
 from scrapy_calyprium.routing.block_detect import challenge_family, diagnose
 from scrapy_calyprium.routing import domain_cache as _domain_cache
@@ -437,6 +438,9 @@ class SpiderAutoRouter:
         # for the requests in flight, and a request kept solving (up to solve_max_retries x 270 s) held a run that had
         # reached its time limit open for another half hour and more (partselect, 2026-11-01).
         self.closing: Callable[[], bool] = lambda: False
+        # Scrapy's stats (set by MimicMiddleware): the solves in progress go in SOLVES_IN_FLIGHT, which the run's
+        # concurrency report reads.
+        self.stats = None
         # Refill solves in flight (cancelled by stop_refill when the crawl ends).
         self._refill_running: set = set()
         # Last hot-path refill check per domain. The original design used a
@@ -627,7 +631,14 @@ class SpiderAutoRouter:
         failed solve (the request ends on what it met)."""
         if self._is_closing():
             raise SolveError("the crawl is closing: no new solve")
-        return await self.solve_client.solve(**kwargs)
+        stats = self.stats
+        if stats is not None:
+            stats.inc_value(SOLVES_IN_FLIGHT, 1)
+        try:
+            return await self.solve_client.solve(**kwargs)
+        finally:
+            if stats is not None:
+                stats.inc_value(SOLVES_IN_FLIGHT, -1)
 
     def stop_refill(self) -> None:
         """End pool refills (the crawl is over): no refill solve starts after this, and the ones
