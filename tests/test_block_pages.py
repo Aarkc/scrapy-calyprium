@@ -369,3 +369,27 @@ def test_siteground_bot_check_is_blocked():
     d = diagnose(200, SITEGROUND_CHECK.encode(), HTML)
     assert (d.cls, d.vendor) == (dg.CHALLENGE, dg.SITEGROUND)
     assert is_blocked(200, SITEGROUND_CHECK, HTML)
+
+
+TURNSTILE_GATE = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>One moment</title></head><body>"
+    "<div class='cf-turnstile' data-sitekey='0x4AAAAAAA0000000000000' data-callback='ok'></div>"
+    "<script src='https://challenges.cloudflare.com/turnstile/v0/api.js' async defer></script>"
+    "<script>function ok(t){document.cookie='ls-ok='+t.slice(0,40)+'; path=/; max-age=900; secure';"
+    "location.reload();}</script></body></html>"
+)
+SITE_CHALLENGE = (
+    '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title></title></head><body>'
+    '<div id="challenge-container"></div><script>window["_drqddsa"]="' + "A" * 30000 + '";</script></body></html>'
+)
+
+
+def test_a_sites_own_gates_are_blocked():
+    """lovelyskin.com's Turnstile gate (200, 9 KB) and speedwaymotors.com's robot check (203, ~38 KB) were read as
+    pages: every product page came back "no product" and the spiders stopped (2026-11-01). Mimic's browser passes them."""
+    d = diagnose(200, TURNSTILE_GATE.encode(), HTML)
+    assert (d.cls, d.vendor, d.evidence) == (dg.CHALLENGE, dg.CLOUDFLARE, "turnstile_gate")
+    assert is_blocked(200, TURNSTILE_GATE, HTML)
+    d = diagnose(203, SITE_CHALLENGE.encode(), HTML)
+    assert (d.cls, d.evidence) == (dg.CHALLENGE, "site_challenge")
+    assert is_blocked(203, SITE_CHALLENGE, HTML)

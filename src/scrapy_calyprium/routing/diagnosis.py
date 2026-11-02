@@ -240,9 +240,13 @@ _CHALLENGE_TITLES = ("just a moment", "attention required", "access denied", "pl
                      "one moment, please", "403 forbidden", "forbidden", "security check",
                      "pardon our interruption", "access to this page has been denied",
                      "vercel security checkpoint", "verifying your browser", "checking your browser",
-                     "client challenge", "robot or human")
+                     "client challenge", "robot or human", "one moment")
 # A JS interstitial of the site's own (a proof of work posted back, neobits.com) or a vendor's.
 _JS_INTERSTITIAL = ("verifying your browser", "checking your browser", "you will be redirected shortly")
+# A site's own gates in front of its pages: Cloudflare's Turnstile widget loaded on a page with nothing else, and an
+# empty container a challenge script fills.
+_TURNSTILE = "challenges.cloudflare.com/turnstile/"
+_CHALLENGE_CONTAINER_RE = re.compile(r"""<div[^>]*\sid=["']challenge-container["']""")
 # PerimeterX's block page: its captcha container, its press-and-hold; and what names PerimeterX on a
 # page titled as its block page (the container can sit past a large inline stylesheet).
 _PX_BLOCK = ("px-captcha", "press & hold", "human-challenge")
@@ -557,6 +561,16 @@ def diagnose_response(
         if status in (403, 429, 503) and ("bmak" in lower or "_abck" in lower) \
                 and not _AKAMAI_REFERENCE_RE.search(lower[:20000]):
             return d(CHALLENGE, "akamai_sensor", AKAMAI)
+        # A site's own gates, read after every vendor's page (AWS WAF's has a challenge container too).
+        # Its Turnstile gate, served 200: a small page that loads the widget, whose callback sets the site's cookie
+        # and reloads (lovelyskin.com's "One moment", 9 KB, 2026-11-01: every product page read as a page and the
+        # spider stopped on no product data). A browser that waits passes a managed Turnstile and gets the page.
+        if len(body) < 30000 and _TURNSTILE in lower and not _real_structure(lower):
+            return d(CHALLENGE, "turnstile_gate", CLOUDFLARE)
+        # Its own JavaScript challenge: nothing but an empty container and the script that fills it
+        # (speedwaymotors.com, served 203 with ~38 KB of script, 2026-11-01). A browser runs it.
+        if len(body) < 100000 and _CHALLENGE_CONTAINER_RE.search(lower[:20000]) and not _real_structure(lower):
+            return d(CHALLENGE, "site_challenge")
         widget = _interactive(lower)
         if widget and (block_status or not _real_structure(lower)):
             return d(CAPTCHA, f"{widget}_gate")
