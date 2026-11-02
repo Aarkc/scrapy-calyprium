@@ -196,3 +196,25 @@ def test_a_failing_frontier_is_asked_again_and_keeps_what_it_could_not_send(sche
     sched._send()
     assert len(sched.client.entries) == 1 and not sched.found
     assert sched.next_request().url == "https://shop.example/p/1"
+
+
+def test_a_catalogues_worth_found_at_once_goes_out_in_batches(sched, monkeypatch):
+    """A sitemap index's worth found faster than it is sent: the backlog is taken from the front (a list sliced
+    each send copied all of it and kept a real run's CPU busy), more sends go out while it is large, and it all
+    reaches the frontier."""
+    import time
+
+    sent_sizes = []
+    real = sched.client.discovered
+    monkeypatch.setattr(sched.client, "discovered", lambda items: sent_sizes.append(len(items)) or real(items))
+    sched.sending = 99  # sends held back while the spider finds its pages
+    t = time.monotonic()
+    for i in range(120_000):
+        sched.enqueue_request(Request(f"https://shop.example/p/{i}"))
+    assert len(sched.found) == 120_000 and sched._max_sending() == frontier.MAX_SENDING_BACKLOG
+    sched.sending = 0
+    sched._tick()
+    while sched.found:
+        sched._send()
+    assert len(sched.client.entries) == 120_000 and max(sent_sizes) == frontier.MAX_SEND
+    assert time.monotonic() - t < 60

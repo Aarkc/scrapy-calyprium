@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 FP_KEY = "_frontier_fp"
 MAX_SEND = 5000  # discovered URLs in one send (the service takes 10,000)
 MAX_SENDING = 2  # sends in flight: they share the reactor's thread pool with DNS
+MAX_SENDING_BACKLOG = 4  # ... unless what was found piles up (a sitemap of tens of thousands at a time)
+BACKLOG = 20_000
+SENT_MAX = 2_000_000  # fingerprints remembered in a run (~80 MB); past it the frontier alone drops repeats
 _DEFAULTS = (("method", "GET"), ("headers", {}), ("body", b""), ("cookies", {}), ("encoding", "utf-8"),
              ("priority", 0), ("dont_filter", False), ("flags", []), ("cb_kwargs", {}), ("meta", {}),
              ("errback", None), ("callback", None))
@@ -91,7 +94,7 @@ class FrontierScheduler:
         self.local: Deque[Request] = deque()        # fetched in this run, not through the frontier
         self.leased: Deque[Tuple[str, Request]] = deque()  # leased, not handed to the downloader yet
         self.sent: set = set()                      # fingerprints sent or leased this run (8 bytes each)
-        self.found: List[dict] = []                 # discovered, not sent yet
+        self.found: Deque[dict] = deque()           # discovered, not sent yet (taken from the front)
         self.acks: Dict[str, Tuple[int, int]] = {}  # fp -> (status, refetch_s), not sent yet
         self.releases: List[str] = []
         self.remote_more = True                     # the frontier may have something due
@@ -102,6 +105,7 @@ class FrontierScheduler:
         self.lease_failures = 0
         self.lease_not_before = 0.0
         self.loop: Optional[task.LoopingCall] = None
+        self._names: Dict[Any, str] = {}  # a callback's function -> the spider attribute it is under
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -150,10 +154,11 @@ class FrontierScheduler:
             self.local.append(request)
             self.stats.inc_value("frontier/unserializable")
             return True
-        self.sent.add(key)
+        if len(self.sent) < SENT_MAX:
+            self.sent.add(key)
         self.found.append({"fp": fp[:16].hex(), "url": request.url, "req": req, "priority": request.priority})
         self.stats.inc_value("frontier/discovered")
-        if len(self.found) >= self.flush_at and self.sending < MAX_SENDING:
+        if len(self.found) >= self.flush_at and self.sending < self._max_sending():
             self._send()  # else the next tick sends it, with what is found meanwhile
         return True
 
@@ -174,10 +179,12 @@ class FrontierScheduler:
             self.loop.stop()
         self.releases.extend(fp for fp, _ in self.leased)
         self.leased.clear()
-        found, acks, releases = self._take()
+        found, acks, releases = list(self.found), [], []
+        self.found.clear()
+        _, acks, releases = self._take()
         logger.info("FrontierScheduler: closing (%s): %d fetched; sending %d found, %d done, %d released",
                     reason, self.fetched, len(found), len(acks), len(releases))
-        d = deferToThread(self._send_blocking, found, acks, releases)
+        d = deferToThread(self._close_blocking, found, acks, releases)
 
         def _done(_):
             self.client.close()
@@ -189,15 +196,59 @@ class FrontierScheduler:
 
     # ── the frontier ────────────────────────────────────────────────────────────────────────────────────
 
-    def _serialize(self, request: Request) -> Optional[str]:
-        try:
-            d = request.to_dict(spider=self.spider)
-        except ValueError:  # a callback that isn't a method of the spider
+    def _method_name(self, fn) -> Optional[str]:
+        """The name a bound method of the spider is found under, or None (then Scrapy's own lookup decides)."""
+        func = getattr(fn, "__func__", None)
+        if func is None or getattr(fn, "__self__", None) is not self.spider:
             return None
-        d.pop("url", None)
-        for key, default in _DEFAULTS:
-            if key in d and d[key] == default:
-                del d[key]
+        name = self._names.get(func)
+        if name is None:
+            name = func.__name__
+            if getattr(self.spider, name, None) != fn:
+                return None
+            self._names[func] = name
+        return name
+
+    def _fields(self, request: Request) -> Optional[dict]:
+        """A plain Request's fields that differ from the defaults, without Request.to_dict: its search of the
+        spider's members for each callback's name cost ~100 us a request, minutes of a run's CPU for a
+        catalogue's millions. None when only to_dict can say (a subclass, a callback found another way)."""
+        if type(request) is not Request:
+            return None
+        d: Dict[str, Any] = {}
+        for key, fn in (("callback", request.callback), ("errback", request.errback)):
+            if fn is not None:
+                name = self._method_name(fn)
+                if name is None:
+                    return None
+                d[key] = name
+        if request.method != "GET":
+            d["method"] = request.method
+        if request.headers:
+            d["headers"] = dict(request.headers)
+        if request.body:
+            d["body"] = request.body
+        for key in ("cookies", "meta", "flags", "cb_kwargs"):
+            value = getattr(request, key)
+            if value:
+                d[key] = value
+        if request.encoding != "utf-8":
+            d["encoding"] = request.encoding
+        if request.priority:
+            d["priority"] = request.priority
+        return d
+
+    def _serialize(self, request: Request) -> Optional[str]:
+        d = self._fields(request)
+        if d is None:
+            try:
+                d = request.to_dict(spider=self.spider)
+            except ValueError:  # a callback that isn't a method of the spider
+                return None
+            d.pop("url", None)
+            for key, default in _DEFAULTS:
+                if key in d and d[key] == default:
+                    del d[key]
         if "headers" in d:
             d["headers"] = {k.decode("latin-1"): [v.decode("latin-1") for v in vs] for k, vs in d["headers"].items()}
         if "body" in d:
@@ -236,8 +287,8 @@ class FrontierScheduler:
             items = out.get("items") or []
             self.due_now = int(out.get("due_now") or 0)
             for item in items:
-                key = bytes.fromhex(item["fp"])[:8]
-                self.sent.add(key)
+                if len(self.sent) < SENT_MAX:
+                    self.sent.add(bytes.fromhex(item["fp"])[:8])
                 request = self._request(item)
                 if request is not None:
                     self.leased.append((item["fp"], request))
@@ -260,12 +311,21 @@ class FrontierScheduler:
                 self.remote_more = False
         d.addCallbacks(_got, _failed)
 
+    def _max_sending(self) -> int:
+        return MAX_SENDING_BACKLOG if len(self.found) > BACKLOG else MAX_SENDING
+
     def _take(self):
-        found, self.found = self.found[:MAX_SEND], self.found[MAX_SEND:]
+        # From the front of a deque: a list sliced each send copied the whole backlog every time, and with
+        # millions found (a catalogue's sitemaps) that kept the run's CPU busy and its downloads waiting.
+        found = [self.found.popleft() for _ in range(min(MAX_SEND, len(self.found)))]
         acks = [{"fp": fp, "status": st, "refetch_s": rs} for fp, (st, rs) in self.acks.items()]
         self.acks = {}
         releases, self.releases = self.releases, []
         return found, acks, releases
+
+    def _close_blocking(self, found, acks, releases) -> None:
+        for k in range(0, max(1, len(found)), MAX_SEND):
+            self._send_blocking(found[k:k + MAX_SEND], acks if k == 0 else [], releases if k == 0 else [])
 
     def _send_blocking(self, found, acks, releases) -> dict:
         out = {"added": 0}
@@ -295,15 +355,18 @@ class FrontierScheduler:
             self.stats.inc_value("frontier/errors/send")
             logger.warning("FrontierScheduler: sending to the frontier failed (%s); kept for the next send",
                            failure.value)
-            self.found = found + self.found
+            self.found.extendleft(reversed(found))
             for a in acks:
                 self.acks.setdefault(a["fp"], (a["status"], a["refetch_s"]))
             self.releases = releases + self.releases
         d.addCallbacks(_sent, _failed)
 
     def _tick(self) -> None:
-        if self.sending < MAX_SENDING:
+        while self.sending < self._max_sending():
+            before = self.sending
             self._send()
+            if self.sending == before:  # nothing to send
+                break
         if not self.leased and self.remote_more:
             self._lease()
 
