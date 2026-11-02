@@ -1,3 +1,10 @@
+# [1.40.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.7...v1.40.0) (2026-11-02)
+
+
+### Features
+
+* report a run's concurrency over time (requests in flight, queued, solves) ([bd3a5f1](https://github.com/Aarkc/scrapy-calyprium/commit/bd3a5f1b0dd358271a5e52052988e4f6a4de53ac))
+
 ## [1.39.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.6...v1.39.7) (2026-11-02)
 
 
