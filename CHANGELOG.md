@@ -1,3 +1,10 @@
+## [1.39.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.6...v1.39.7) (2026-11-02)
+
+
+### Bug Fixes
+
+* a site's own turnstile gate and script challenge are blocks (classifier re-copied from mimic) ([f57ef05](https://github.com/Aarkc/scrapy-calyprium/commit/f57ef0587d25c59f83a21b92768b1526a6587156)), closes [#336](https://github.com/Aarkc/scrapy-calyprium/issues/336)
+
 ## [1.39.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.39.5...v1.39.6) (2026-11-01)
 
 
