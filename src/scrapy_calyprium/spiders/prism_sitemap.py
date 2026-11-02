@@ -160,6 +160,9 @@ def _with_domain(parsed, domain: str):
 
 # Only fetch the next batch when pending requests drop below this
 _REFILL_THRESHOLD = 1000
+# Under the frontier scheduler (scrapy_calyprium.frontier), Prism pages walked per run: the walk only discovers (the
+# frontier keeps every URL and when it is due), carried on run after run from the checkpoint.
+_FRONTIER_WALK_PAGES = 40
 
 # A transient targets-fetch error (Forge restart, network blip, timeout) must
 # not permanently end the source — that would kill a multi-day catch-up after a
@@ -221,6 +224,7 @@ class PrismSitemapSpider(scrapy.Spider):
         # Prism list positions this run has finished: each crawled, failed or dropped URL, and each one skipped as
         # fresh or offsite when its page came (the run's progress; the checkpoint moves only per whole page).
         self._prism_positions_done = 0
+        self._prism_walked_pages = 0  # under the frontier scheduler
         self._prism_page_limit = min(self.batch_size, 100000)
         self._prism_total: Optional[int] = None  # Prism's URL count for the source, once a page said it
         # Refill failures (prism://): consecutive failures drive the backoff; a domain Prism
@@ -685,13 +689,22 @@ class PrismSitemapSpider(scrapy.Spider):
             self._prism_checkpoint_offset = self._prism_next_offset
         self._report_prism_progress()
 
+    def _frontier_mode(self) -> bool:
+        """The run's queue is the spider's frontier (scrapy_calyprium.frontier): a Prism page is done once its URLs
+        are handed to it, what was fetched lately is the frontier's to know, and progress is the frontier's."""
+        try:
+            return (str(self.settings.get("SCHEDULER") or "").endswith("FrontierScheduler")
+                    and bool(self.settings.get("CALYPRIUM_FRONTIER_URL")))
+        except AttributeError:
+            return False
+
     def _report_prism_progress(self) -> None:
         """This run's progress through Prism's URL list (scrapy_calyprium.progress), in list positions: those
         finished since the run began (URL by URL, not page by page: one page can hold the whole list), and those
         left until its pass ends. A pass ends at the end of the list, or, for a run that began past 0 and wraps,
         back where it began; with max_urls, no later than that many URLs."""
         total = self._prism_total
-        if not total or self._prism_checkpoint_offset is None:
+        if not total or self._prism_checkpoint_offset is None or self._frontier_mode():
             return
         start = self._prism_cycle_start
         length = max(total, start) if start and self._wrap_enabled() else max(total - start, 0)
@@ -782,9 +795,10 @@ class PrismSitemapSpider(scrapy.Spider):
             self._close_if_all_offsite()
             return
 
-        # Filter out fresh URLs if recrawl tracking is enabled.
+        # Filter out fresh URLs if recrawl tracking is enabled (the frontier knows by itself).
         # Track raw_count separately so offset advances correctly.
-        urls = self._drop_offsite(self._filter_fresh_urls(raw_urls))
+        frontier = self._frontier_mode()
+        urls = self._drop_offsite(raw_urls if frontier else self._filter_fresh_urls(raw_urls))
 
         logger.info(
             f"Prism: got {len(urls):,} stale / {raw_count:,} total URLs "
@@ -808,14 +822,28 @@ class PrismSitemapSpider(scrapy.Spider):
 
         at_end = end_of_cycle or raw_count < limit
         self._prism_next_offset = page_end
-        self._prism_positions_done += (page_end - page_start) - len(urls)  # skipped as fresh or offsite
-        if urls:
+        if frontier:
+            # Handed to the frontier is done: the checkpoint moves past the page now, and the walk stops for this
+            # run after its share of pages (the next run carries on from the checkpoint).
+            self._prism_positions_done += page_end - page_start
+            self._urls_yielded += len(urls)
+            self._prism_walked_pages += 1
+            if not at_end and self._prism_walked_pages >= self._setting("PRISM_FRONTIER_WALK_PAGES",
+                                                                        _FRONTIER_WALK_PAGES):
+                logger.info(f"Prism: {self._prism_walked_pages} pages handed to the frontier this run; "
+                            f"the next run carries on at offset {page_end:,}")
+                self._prism_exhausted = True
+            urls_for_pages = []
+        else:
+            self._prism_positions_done += (page_end - page_start) - len(urls)  # skipped as fresh or offsite
+            urls_for_pages = urls
+        if urls_for_pages:
             self._prism_open_pages[page_start] = (
                 self._prism_open_pages.get(page_start, 0) + len(urls)
             )
             self._urls_yielded += len(urls)
             self._prism_page_limit = min(self.batch_size, 100000)
-        elif not at_end and not self._prism_exhausted:
+        elif not frontier and not at_end and not self._prism_exhausted:
             # Fully fresh: widen the next page instead of skipping ahead.
             self._prism_page_limit = min(max(limit, 1) * 2, max(limit, _FRESH_PAGE_MAX))
 
