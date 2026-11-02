@@ -1,3 +1,10 @@
+## [1.41.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.41.0...v1.41.1) (2026-11-02)
+
+
+### Bug Fixes
+
+* **frontier:** keep a run's CPU for fetching while a catalogue is found ([d589ce1](https://github.com/Aarkc/scrapy-calyprium/commit/d589ce1b581abe1e1d9d23d8536cf6f0ee36e7c4))
+
 # [1.41.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.40.0...v1.41.0) (2026-11-02)
 
 
