@@ -126,6 +126,27 @@ progress.report(self, done=pages_done, left=pages_left, unit="companies")
 `PrismSitemapSpider` reports its place in Prism's URL list by itself. A spider that reports nothing gets an
 estimate from its earlier runs instead.
 
+### A Frontier Kept Between Runs
+
+With `FrontierScheduler` a spider's queue is its frontier in Calyprium: every request it yields is added there as
+it is found (once per page), the run fetches what the frontier leases it, and each fetched page is marked with when
+it is due again. A run that stops early loses nothing, the next run carries on with what is due, and a new pass
+fetches a page again only once it is due. Calyprium sets these for a spider that uses its frontier; no spider code
+changes:
+
+```python
+SCHEDULER = "scrapy_calyprium.frontier.FrontierScheduler"
+CALYPRIUM_FRONTIER_URL = "http://calyprium-frontier:8000"
+CALYPRIUM_FRONTIER_CRAWL = "<user id>:<spider id>"
+CALYPRIUM_FRONTIER_TOKEN = "<the run's token>"
+CALYPRIUM_FRONTIER_REFETCH_S = 604800         # a page with items is due again after this (default 7 days)
+CALYPRIUM_FRONTIER_LISTING_REFETCH_S = 86400  # a page without (a listing, a sitemap) after this (default 1 day)
+```
+
+Requests marked `dont_filter` (start URLs, retries) and ones that can't be kept (a callback that isn't a method of
+the spider, meta that isn't JSON) are fetched in the run without the frontier. Without the settings it is Scrapy's
+own scheduler.
+
 ### Saving Output to Calyprium Storage
 
 Spider output is saved to Calyprium's S3-compatible storage using Scrapy's built-in feed export:
