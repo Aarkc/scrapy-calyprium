@@ -1,3 +1,10 @@
+# [1.43.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.42.0...v1.43.0) (2026-11-03)
+
+
+### Features
+
+* **frontier:** a request can say when it is due again ([eabc247](https://github.com/Aarkc/scrapy-calyprium/commit/eabc2477e9cb60d5ce8aaf5cdd78969ff7977773))
+
 # [1.42.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.41.1...v1.42.0) (2026-11-02)
 
 
