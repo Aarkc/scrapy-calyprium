@@ -209,6 +209,50 @@ def test_a_refused_page_is_tried_again_soon_not_when_it_would_be_due(sched):
     assert sched.stats.get_value("frontier/refused") == 3
 
 
+def test_a_page_that_redirects_is_followed_and_acknowledged_with_where_it_led(sched):
+    sched.enqueue_request(Request("https://shop.example/company/old", callback=sched.spider.parse_item))
+    sched._send()
+    leased = sched.next_request()
+    # RedirectMiddleware keeps the 301 from the engine: the request for its Location comes back to the scheduler
+    moved = leased.replace(url="https://shop.example/company/new", meta={**leased.meta, "redirect_urls": [leased.url]})
+    assert sched.enqueue_request(moved) is True
+    assert sched.next_request() is moved
+    sched._response_received(_response(moved), moved, sched.spider)
+    sched._item_scraped({"x": 1}, _response(moved), sched.spider)
+    sched._send()
+    fp = leased.meta[FP_KEY]
+    assert sched.client.done == {fp: {"fp": fp, "status": 200, "refetch_s": 7 * 86400}}
+    assert sched.stats.get_value("frontier/followed") == 1 and sched.fetched == 1
+    # what the page's callback yields with the page's meta is a page of its own: the page was answered
+    child = Request("https://shop.example/company/other", callback=sched.spider.parse_item, meta=dict(moved.meta))
+    sched.enqueue_request(child)
+    assert sched.found[-1]["url"] == child.url and sched.stats.get_value("frontier/followed") == 1
+
+
+def test_a_page_a_middleware_asks_for_again_is_fetched_not_dropped_as_a_repeat(sched):
+    sched.enqueue_request(Request("https://shop.example/p/1", callback=sched.spider.parse_item))
+    sched._send()
+    leased = sched.next_request()
+    again = leased.replace(priority=-20)  # not dont_filter: through the frontier, a repeat in this run
+    assert sched.enqueue_request(again) is True and sched.next_request() is again
+    assert not sched.stats.get_value("frontier/dupes_in_run")
+
+
+def test_a_refusal_gives_way_to_what_a_later_try_got(sched):
+    sched.enqueue_request(Request("https://shop.example/c/1", callback=sched.spider.parse))
+    sched._send()
+    leased = sched.next_request()
+    sched._response_received(_response(leased, status=429), leased, sched.spider)
+    retry = leased.replace(dont_filter=True)  # the spider's own try again (a listing: no items)
+    sched.enqueue_request(retry)
+    assert sched.next_request() is retry
+    sched._response_received(_response(retry), retry, sched.spider)
+    sched._send()
+    fp = leased.meta[FP_KEY]
+    assert sched.client.done == {fp: {"fp": fp, "status": 200, "refetch_s": 86400}} and not sched.client.failed
+    assert sched.fetched == 1 and sched.stats.get_value("frontier/refused") == 1
+
+
 def test_the_client_sends_failures_apart():
     sent = {}
     client = frontier.FrontierClient("http://frontier.test", "alice:7", "tok")
