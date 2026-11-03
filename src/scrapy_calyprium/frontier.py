@@ -17,6 +17,11 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   none (a listing, a sitemap: where new pages are found) CALYPRIUM_FRONTIER_LISTING_REFETCH_S later (1 day). A
   request's ``meta["frontier_refetch_s"]`` is its own wait instead: a catalogue's sitemaps, a thousand files of
   50,000 pages each that change slowly, are not read again every day.
+- The frontier hands out the highest priority first, then the oldest due. The priority it orders by is the
+  request's own raised by its depth, so what a page yields (its detail page, its JSON) is fetched before the pages
+  found alongside that page, as Scrapy's last-in-first-out queue did: otherwise a page's follow-up waits behind the
+  whole sitemap the page came from. A spider that set DEPTH_PRIORITY for breadth-first order already has its depth
+  taken off its priority, so it keeps that order. The stored request keeps its own priority.
 - A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again, up to
   its attempts limit. Requests leased but never handed to the downloader are released when the run closes.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
@@ -159,7 +164,7 @@ class FrontierScheduler:
             return True
         if len(self.sent) < SENT_MAX:
             self.sent.add(key)
-        self.found.append({"fp": fp[:16].hex(), "url": request.url, "req": req, "priority": request.priority})
+        self.found.append({"fp": fp[:16].hex(), "url": request.url, "req": req, "priority": self._order(request)})
         self.stats.inc_value("frontier/discovered")
         if len(self.found) >= self.flush_at and self.sending < self._max_sending():
             self._send()  # else the next tick sends it, with what is found meanwhile
@@ -384,6 +389,14 @@ class FrontierScheduler:
 
     def _report(self) -> None:
         progress.report(self.stats, done=self.fetched, left=self.due_now + len(self.leased), unit="pages")
+
+    @staticmethod
+    def _order(request) -> int:
+        try:
+            depth = int(request.meta.get("depth") or 0)  # set by Scrapy's DepthMiddleware
+        except (TypeError, ValueError):
+            depth = 0
+        return request.priority + max(0, depth)
 
     # ── what was fetched ────────────────────────────────────────────────────────────────────────────────
 

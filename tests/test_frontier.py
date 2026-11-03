@@ -56,6 +56,7 @@ class FakeFrontier:
             self.fail_lease -= 1
             raise RuntimeError("frontier down")
         due = [i for fp, i in self.entries.items() if fp not in self.leased and fp not in self.done]
+        due.sort(key=lambda i: -(i.get("priority") or 0))  # highest priority first, then oldest (the service's bands)
         out = due[:max_items]
         self.leased.update(i["fp"] for i in out)
         return {"items": [dict(i) for i in out], "more": len(due) > max_items, "due_now": len(due) - len(out)}
@@ -116,7 +117,7 @@ def test_requests_go_to_the_frontier_and_come_back_rebuilt(sched):
     assert sched.enqueue_request(get) and sched.enqueue_request(post)
     sched._send()
     sent = list(sched.client.entries.values())
-    assert [i["url"] for i in sent] == [get.url, post.url] and sent[0]["priority"] == 3
+    assert [i["url"] for i in sent] == [get.url, post.url] and sent[0]["priority"] == 3 + 2  # raised by its depth
     assert len(sent[0]["fp"]) == 32 and json.loads(sent[0]["req"])["callback"] == "parse_item"
 
     got = [sched.next_request(), sched.next_request()]
@@ -137,6 +138,27 @@ def test_what_is_meant_to_be_fetched_anyway_or_cannot_be_kept_stays_in_the_run(s
     assert sched.client.entries == {} and not sched.found
     assert [sched.next_request() for _ in range(3)] == [start, lam, odd]
     assert sched.stats.get_value("frontier/local") == 1 and sched.stats.get_value("frontier/unserializable") == 2
+
+
+def test_what_a_page_yields_comes_before_the_pages_found_alongside_it(sched):
+    spider = sched.spider
+    for i in range(1, 4):  # a sitemap's pages, found at once
+        sched.enqueue_request(Request(f"https://shop.example/p/{i}", callback=spider.parse, meta={"depth": 1}))
+    sched._send()
+    page = sched.next_request()
+    # the page's JSON, then a spider ordering breadth-first (DEPTH_PRIORITY=1 took the depth off its priority)
+    sched.enqueue_request(Request("https://shop.example/api/1", callback=spider.parse_item, meta={"depth": 2}))
+    sched.enqueue_request(Request("https://shop.example/q/9", callback=spider.parse, priority=-2,
+                                  meta={"depth": 2}))
+    sched._send()
+    sched.leased.clear()  # what is left of the first lease goes back (a later lease)
+    sched.client.leased.clear()
+    sched.client.done[page.meta[FP_KEY]] = {}
+    order = [sched.next_request().url for _ in range(4)]
+    assert order == ["https://shop.example/api/1", "https://shop.example/p/2", "https://shop.example/p/3",
+                     "https://shop.example/q/9"]
+    api = sched.client.entries[next(fp for fp, i in sched.client.entries.items() if i["url"].endswith("/api/1"))]
+    assert json.loads(api["req"]).get("priority") is None  # the stored request keeps its own priority
 
 
 def test_a_page_found_twice_in_a_run_goes_once(sched):
