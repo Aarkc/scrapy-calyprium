@@ -14,7 +14,9 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   this run without going through the frontier: it is meant to be fetched whatever was fetched before. So is one that
   can't be kept (its callback isn't a method of the spider, its meta isn't JSON).
 - A page that produced items is due again CALYPRIUM_FRONTIER_REFETCH_S later (default 7 days); one that produced
-  none (a listing, a sitemap: where new pages are found) CALYPRIUM_FRONTIER_LISTING_REFETCH_S later (1 day).
+  none (a listing, a sitemap: where new pages are found) CALYPRIUM_FRONTIER_LISTING_REFETCH_S later (1 day). A
+  request's ``meta["frontier_refetch_s"]`` is its own wait instead: a catalogue's sitemaps, a thousand files of
+  50,000 pages each that change slowly, are not read again every day.
 - A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again, up to
   its attempts limit. Requests leased but never handed to the downloader are released when the run closes.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
@@ -43,6 +45,7 @@ from . import progress
 logger = logging.getLogger(__name__)
 
 FP_KEY = "_frontier_fp"
+REFETCH_KEY = "frontier_refetch_s"  # a request's own wait until it is due again, in seconds
 MAX_SEND = 5000  # discovered URLs in one send (the service takes 10,000)
 MAX_SENDING = 2  # sends in flight: they share the reactor's thread pool with DNS
 MAX_SENDING_BACKLOG = 4  # ... unless what was found piles up (a sitemap of tens of thousands at a time)
@@ -384,10 +387,18 @@ class FrontierScheduler:
 
     # ── what was fetched ────────────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _own_wait(request) -> Optional[int]:
+        try:
+            wait = int(request.meta.get(REFETCH_KEY) or 0)
+        except (TypeError, ValueError):
+            return None
+        return wait if wait > 0 else None
+
     def _response_received(self, response, request, spider):
         fp = request.meta.get(FP_KEY)
         if fp and fp not in self.acks:
-            self.acks[fp] = (response.status, self.listing_refetch_s)
+            self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s)
             self.fetched += 1
             self._report()
             if len(self.acks) >= self.flush_at and self.sending < MAX_SENDING:
@@ -397,4 +408,4 @@ class FrontierScheduler:
         request = getattr(response, "request", None)
         fp = request.meta.get(FP_KEY) if request is not None else None
         if fp:  # a page with items: due again after the longer wait (again, if its first ack has gone)
-            self.acks[fp] = (response.status, self.refetch_s)
+            self.acks[fp] = (response.status, self._own_wait(request) or self.refetch_s)
