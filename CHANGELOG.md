@@ -1,3 +1,10 @@
+## [1.43.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.6...v1.43.7) (2026-11-03)
+
+
+### Bug Fixes
+
+* **routing:** amazon's wall is aws_waf, and the first time another exit ([dc5e3c9](https://github.com/Aarkc/scrapy-calyprium/commit/dc5e3c9f12dd51876c0dddb942e6f6106293541c))
+
 ## [1.43.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.5...v1.43.6) (2026-11-03)
 
 
