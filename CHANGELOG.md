@@ -1,3 +1,10 @@
+## [1.43.6](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.5...v1.43.6) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** a page that isn't there waits the long refetch ([092c612](https://github.com/Aarkc/scrapy-calyprium/commit/092c612f83bdb94709e11d11e5d556ce0c04dc4b))
+
 ## [1.43.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.4...v1.43.5) (2026-11-03)
 
 
