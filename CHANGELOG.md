@@ -1,3 +1,10 @@
+## [1.43.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.1...v1.43.2) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** a refused page is tried again soon, not when it would be due ([933030f](https://github.com/Aarkc/scrapy-calyprium/commit/933030fd3bb407638a119d3d23ebd857ae974194))
+
 ## [1.43.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.0...v1.43.1) (2026-11-03)
 
 
