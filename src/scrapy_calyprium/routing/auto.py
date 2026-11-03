@@ -66,7 +66,7 @@ from urllib.parse import urljoin, urlparse
 from scrapy_calyprium import _outcome, _pool_busy
 from scrapy_calyprium.concurrency import SOLVES_IN_FLIGHT
 from scrapy_calyprium.routing import diagnosis as dg
-from scrapy_calyprium.routing.block_detect import challenge_family, diagnose
+from scrapy_calyprium.routing.block_detect import amazon_wall, challenge_family, diagnose
 from scrapy_calyprium.routing import domain_cache as _domain_cache
 from scrapy_calyprium.routing.domain_cache import DomainCache
 from scrapy_calyprium.routing.local_fetch import (
@@ -855,6 +855,7 @@ class SpiderAutoRouter:
         if method != "GET":
             own.update(method=method, body=body)
         light_result = None
+        light_at, light_session = -1, None
         light_diag = None
         if not self._light_refused(domain, entry):
             light_at, light_session = self._light_session()
@@ -1086,6 +1087,21 @@ class SpiderAutoRouter:
             family = challenge_family(seen.status_code, seen.body, headers=seen.headers)
             if family:
                 self._challenge_family[domain] = family
+        if seen is not None and amazon_wall(seen.status_code, seen.body) and _outcome.CURRENT_ATTEMPT.get() == 0:
+            # Amazon's wall is a verdict on the exit, not the client (2026-11-03: two in three fresh exits are served;
+            # a solve on a flagged one buys a page or two). The first time a request meets it: another exit, not a
+            # solve (the middleware sends it again at once). Met again, it is solved (naming aws_waf).
+            self._renew_light_session(light_at, light_session)
+            logger.info("AutoRouter: %s answered Amazon's wall (status=%d); another exit before a solve",
+                        domain, seen.status_code)
+            return RouteResult(
+                fetch=seen,
+                routing_method="httpcloak_cookies" if seen is result else "httpcloak_light",
+                blocked=True,
+                domain_level=level or "light",
+                diagnosis=dg.Diagnosis(cls=dg.EDGE_DENY, vendor=dg.AWS_WAF, status=seen.status_code,
+                                       evidence="amazon_wall"),
+            )
         logger.info(
             "AutoRouter: %s blocked at httpcloak (status=%d, %s), solving",
             domain, block_status, self._challenge_family.get(domain) or "vendor unknown",

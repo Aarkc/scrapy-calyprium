@@ -167,6 +167,20 @@ _FASTLY_SCRIPT_RE = re.compile(r"""["']/_fs-ch-[A-Za-z0-9_-]+/script\.js""")
 _AWS_WAF_MARKERS = ("awswaf", "gokuprops")
 
 
+# Amazon's own wall ("Continue shopping" / Robot Check: a 200 whose form posts to /errors/validateCaptcha or
+# /errors_page/validateCaptcha), what its storefront answers without an aws-waf-token, and a verdict on the exit
+# (2026-11-03: two in three fresh residential exits are served; a solve on a flagged one buys a page or two).
+_AMAZON_WALL_RE = re.compile(r"<form\b[^>]*\baction=[\"']/errors(?:_page)?/validatecaptcha[\"']", re.I)
+
+
+def amazon_wall(status_code: int, body: Union[bytes, str]) -> bool:
+    """Whether a response is Amazon's own wall (Tessera's native AWS WAF solver takes it)."""
+    if status_code != 200 or not body or len(body) >= 20_000:
+        return False
+    text = body.decode("latin-1") if isinstance(body, bytes) else body
+    return _AMAZON_WALL_RE.search(text) is not None
+
+
 def challenge_family(
     status_code: int,
     body: Union[bytes, str],
@@ -184,7 +198,7 @@ def challenge_family(
       (most are served with 200): DataDome; PerimeterX; Akamai's SBSD page; Fastly's client
       challenge (``fastly``); Imperva's legacy ___utmvc page (``incapsula``: its 403 block page, or
       a stub of a page served below 400, as bizfileonline.sos.ca.gov serves it); AWS WAF's challenge
-      or captcha on 202 / 405 (``aws_waf``); Akamai's 200 page that is only its sensor script, and
+      or captcha on 202 / 405, and Amazon's own wall (``aws_waf``); Akamai's 200 page that is only its sensor script, and
       its 200 edge deny ("Something went wrong" with a reference id). Two vendor pages stop here
       with no family: Akamai's bm-verify interstitial (its proof of work runs in a browser and no
       API solver posts it) and Imperva's "Pardon Our Interruption" (the reese84 sensor has no
@@ -229,6 +243,8 @@ def challenge_family(
         return None
     if status_code in (202, 405) and (any(m in low for m in _AWS_WAF_MARKERS)
                                       or "x-amzn-waf-action" in norm):
+        return "aws_waf"
+    if size < 20_000 and amazon_wall(status_code, window):
         return "aws_waf"
     if status_code < 400 and size < 20_000 and diagnose(status_code, body, headers=headers).evidence in (
             "akamai_sensor_shell", "akamai_deny"):
