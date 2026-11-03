@@ -26,6 +26,10 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   failed: due again CALYPRIUM_FRONTIER_RETRY_S later (1 hour), not after the refetch wait as if it had been read.
   A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again. Either
   way each try counts towards the frontier's attempts limit, after which it waits a week. Requests leased but never handed to the downloader are released when the run closes.
+- A leased page whose answer a downloader middleware turns into another request (a redirect, a retry or requeue of its
+  own) is followed in this run, as Scrapy does, and acknowledged with the answer it finally gets. Through the frontier
+  that request would be dropped as a page it knows, and the page, never acknowledged, handed out again run after run
+  (linkedin_companies: 856 of a run's 1,024 pages redirected). A later try's answer replaces a refusal.
 - When what was found piles up faster than the frontier takes it (a catalogue's sitemaps read in parallel, by a run
   with one CPU), no new download starts until it has gone out: otherwise it grows until the run is out of memory.
 - New pages found count as progress for CLOSESPIDER_TIMEOUT_NO_ITEM (a group's idle_minutes): a run reading a
@@ -112,6 +116,7 @@ class FrontierScheduler:
         self.spider = None
         self.local: Deque[Request] = deque()        # fetched in this run, not through the frontier
         self.leased: Deque[Tuple[str, Request]] = deque()  # leased, not handed to the downloader yet
+        self.handed: set = set()                    # leased, handed to the downloader, not answered yet
         self.sent: set = set()                      # fingerprints sent or leased this run (8 bytes each)
         self.found: Deque[dict] = deque()           # discovered, not sent yet (taken from the front)
         self.acks: Dict[str, Tuple[int, int, bool]] = {}  # fp -> (status, wait, refused), not sent yet
@@ -162,6 +167,13 @@ class FrontierScheduler:
                     or self.sending or self.remote_more)
 
     def enqueue_request(self, request: Request) -> bool:
+        if request.meta.get(FP_KEY) in self.handed:
+            # A leased page not answered yet, back as another request: a downloader middleware turned its answer
+            # into a redirect or a retry, or its errback asked again. Followed in this run, as Scrapy does, and the
+            # page is acknowledged with what it finally gets; through the frontier it would be dropped as known.
+            self.local.append(request)
+            self.stats.inc_value("frontier/followed")
+            return True
         if request.dont_filter:
             self.local.append(request)
             self.stats.inc_value("frontier/local")
@@ -202,7 +214,8 @@ class FrontierScheduler:
                 self._send()  # nothing else to fetch: what was found may be all there is
             self._lease()
         if self.leased:
-            _, request = self.leased.popleft()
+            fp, request = self.leased.popleft()
+            self.handed.add(fp)
             return request
         return None
 
@@ -446,19 +459,27 @@ class FrontierScheduler:
 
     def _response_received(self, response, request, spider):
         fp = request.meta.get(FP_KEY)
-        if fp and fp not in self.acks:
-            if response.status >= 500 or response.status in REFUSED:
-                self.acks[fp] = (response.status, self.retry_s, True)
-                self.stats.inc_value("frontier/refused")
-            else:
-                self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s, False)
+        if not fp:
+            return
+        self.handed.discard(fp)
+        refused = response.status >= 500 or response.status in REFUSED
+        before = self.acks.get(fp)
+        if before is not None and not (before[2] and not refused):
+            return  # answered already; a refusal gives way to what a later try got
+        if refused:
+            self.acks[fp] = (response.status, self.retry_s, True)
+            self.stats.inc_value("frontier/refused")
+        else:
+            self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s, False)
+        if before is None:
             self.fetched += 1
             self._report()
-            if len(self.acks) >= self.flush_at and self.sending < MAX_SENDING:
-                self._send()
+        if len(self.acks) >= self.flush_at and self.sending < MAX_SENDING:
+            self._send()
 
     def _item_scraped(self, item, response, spider):
         request = getattr(response, "request", None)
         fp = request.meta.get(FP_KEY) if request is not None else None
         if fp:  # a page with items: due again after the longer wait (again, if its first ack has gone)
+            self.handed.discard(fp)
             self.acks[fp] = (response.status, self._own_wait(request) or self.refetch_s, False)
