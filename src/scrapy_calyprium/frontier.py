@@ -14,7 +14,8 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   this run without going through the frontier: it is meant to be fetched whatever was fetched before. So is one that
   can't be kept (its callback isn't a method of the spider, its meta isn't JSON).
 - A page that produced items is due again CALYPRIUM_FRONTIER_REFETCH_S later (default 7 days); one that produced
-  none (a listing, a sitemap: where new pages are found) CALYPRIUM_FRONTIER_LISTING_REFETCH_S later (1 day). A
+  none (a listing, a sitemap: where new pages are found) CALYPRIUM_FRONTIER_LISTING_REFETCH_S later (1 day); a page
+  that isn't there (404, 410) after the longer wait, not every day (a quarter of linkedin_companies' seeds). A
   request's ``meta["frontier_refetch_s"]`` is its own wait instead: a catalogue's sitemaps, a thousand files of
   50,000 pages each that change slowly, are not read again every day.
 - The frontier hands out the highest priority first, then the oldest due. The priority it orders by is the
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 FP_KEY = "_frontier_fp"
 REFETCH_KEY = "frontier_refetch_s"  # a request's own wait until it is due again, in seconds
 REFUSED = frozenset((403, 407, 408, 429))  # with every 5xx: not read, so tried again soon
+GONE = frozenset((404, 410))  # not there: looked at again only after the long wait
 MAX_SEND = 5000  # discovered URLs in one send (the service takes 10,000)
 MAX_SENDING = 2  # sends in flight: they share the reactor's thread pool with DNS
 MAX_SENDING_BACKLOG = 4  # ... unless what was found piles up (a sitemap of tens of thousands at a time)
@@ -470,7 +472,8 @@ class FrontierScheduler:
             self.acks[fp] = (response.status, self.retry_s, True)
             self.stats.inc_value("frontier/refused")
         else:
-            self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s, False)
+            wait = self.refetch_s if response.status in GONE else self.listing_refetch_s
+            self.acks[fp] = (response.status, self._own_wait(request) or wait, False)
         if before is None:
             self.fetched += 1
             self._report()

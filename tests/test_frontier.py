@@ -169,19 +169,22 @@ def test_a_page_found_twice_in_a_run_goes_once(sched):
 
 
 def test_fetched_pages_are_due_again_sooner_without_items(sched):
-    for i in (1, 2):
+    for i in (1, 2, 3):
         sched.enqueue_request(Request(f"https://shop.example/p/{i}", callback=sched.spider.parse_item))
     sched._send()
-    a, b = sched.next_request(), sched.next_request()
+    a, b, c = sched.next_request(), sched.next_request(), sched.next_request()
     sched._response_received(_response(a), a, sched.spider)
-    sched._response_received(_response(b, status=404), b, sched.spider)
+    sched._response_received(_response(b), b, sched.spider)
+    sched._response_received(_response(c, status=404), c, sched.spider)
     sched._item_scraped({"x": 1}, _response(a), sched.spider)
     sched._send()
     done = sched.client.done
     assert done[a.meta[FP_KEY]] == {"fp": a.meta[FP_KEY], "status": 200, "refetch_s": 7 * 86400}
-    assert done[b.meta[FP_KEY]] == {"fp": b.meta[FP_KEY], "status": 404, "refetch_s": 86400}
-    assert sched.fetched == 2
-    assert sched.stats.get_value("calyprium/progress/done") == 2
+    assert done[b.meta[FP_KEY]] == {"fp": b.meta[FP_KEY], "status": 200, "refetch_s": 86400}  # no items: a listing
+    # not there: after the long wait, not every day
+    assert done[c.meta[FP_KEY]] == {"fp": c.meta[FP_KEY], "status": 404, "refetch_s": 7 * 86400}
+    assert sched.fetched == 3
+    assert sched.stats.get_value("calyprium/progress/done") == 3
 
 
 def test_a_refused_page_is_tried_again_soon_not_when_it_would_be_due(sched):
@@ -205,7 +208,7 @@ def test_a_refused_page_is_tried_again_soon_not_when_it_would_be_due(sched):
     assert client.failed == {sm.meta[FP_KEY]: {"fp": sm.meta[FP_KEY], "status": 502, "retry_s": 3600},
                              p1.meta[FP_KEY]: {"fp": p1.meta[FP_KEY], "status": 403, "retry_s": 3600}}
     assert client.done[p2.meta[FP_KEY]]["refetch_s"] == week
-    assert client.done[p3.meta[FP_KEY]] == {"fp": p3.meta[FP_KEY], "status": 404, "refetch_s": 86400}  # gone
+    assert client.done[p3.meta[FP_KEY]] == {"fp": p3.meta[FP_KEY], "status": 404, "refetch_s": 7 * 86400}  # gone
     assert sched.stats.get_value("frontier/refused") == 3
 
 
