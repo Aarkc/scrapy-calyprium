@@ -1,3 +1,10 @@
+## [1.43.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.3...v1.43.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** pages found count as progress for the idle close ([e7bc5ab](https://github.com/Aarkc/scrapy-calyprium/commit/e7bc5ab58610899d943f3a2d2e653e5934586472))
+
 ## [1.43.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.2...v1.43.3) (2026-11-03)
 
 
