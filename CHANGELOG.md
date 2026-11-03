@@ -1,3 +1,10 @@
+## [1.43.3](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.2...v1.43.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** no new downloads while what was found piles up ([1a4992f](https://github.com/Aarkc/scrapy-calyprium/commit/1a4992f6457d2ad4b7f8ae9ca76de53c0a9c0dd7))
+
 ## [1.43.2](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.1...v1.43.2) (2026-11-03)
 
 
