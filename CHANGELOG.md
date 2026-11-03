@@ -1,3 +1,10 @@
+## [1.43.1](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.0...v1.43.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** fetch what a page yields before the pages found beside it ([173ac1e](https://github.com/Aarkc/scrapy-calyprium/commit/173ac1e366d1da325933db7ffbfb47d4517732fe))
+
 # [1.43.0](https://github.com/Aarkc/scrapy-calyprium/compare/v1.42.0...v1.43.0) (2026-11-03)
 
 
