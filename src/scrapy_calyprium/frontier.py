@@ -26,6 +26,8 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   failed: due again CALYPRIUM_FRONTIER_RETRY_S later (1 hour), not after the refetch wait as if it had been read.
   A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again. Either
   way each try counts towards the frontier's attempts limit, after which it waits a week. Requests leased but never handed to the downloader are released when the run closes.
+- When what was found piles up faster than the frontier takes it (a catalogue's sitemaps read in parallel, by a run
+  with one CPU), no new download starts until it has gone out: otherwise it grows until the run is out of memory.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
   discovered and acknowledged is sent every 2 s or CALYPRIUM_FRONTIER_FLUSH entries (200).
 - The run's progress (scrapy_calyprium.progress) is the pages it fetched and those the frontier says are due.
@@ -58,6 +60,7 @@ MAX_SEND = 5000  # discovered URLs in one send (the service takes 10,000)
 MAX_SENDING = 2  # sends in flight: they share the reactor's thread pool with DNS
 MAX_SENDING_BACKLOG = 4  # ... unless what was found piles up (a sitemap of tens of thousands at a time)
 BACKLOG = 20_000
+PAUSE_AT = 100_000  # found, not sent: past it no download starts until it has gone out (~1 KB each in memory)
 SENT_MAX = 2_000_000  # fingerprints remembered in a run (~80 MB); past it the frontier alone drops repeats
 _DEFAULTS = (("method", "GET"), ("headers", {}), ("body", b""), ("cookies", {}), ("encoding", "utf-8"),
              ("priority", 0), ("dont_filter", False), ("flags", []), ("cb_kwargs", {}), ("meta", {}),
@@ -118,6 +121,7 @@ class FrontierScheduler:
         self.lease_failures = 0
         self.lease_not_before = 0.0
         self.loop: Optional[task.LoopingCall] = None
+        self.paused = False                         # no new downloads until what was found has gone out
         self._names: Dict[Any, str] = {}  # a callback's function -> the spider attribute it is under
 
     @classmethod
@@ -177,6 +181,16 @@ class FrontierScheduler:
         return True
 
     def next_request(self) -> Optional[Request]:
+        if len(self.found) > PAUSE_AT:
+            self._tick()
+            if len(self.found) > PAUSE_AT:  # a download would only find more; each send that ends wakes the engine
+                if not self.paused:
+                    self.paused = True
+                    self.stats.inc_value("frontier/paused")
+                    logger.info("FrontierScheduler: %d found not sent yet; no new downloads until they have gone out",
+                                len(self.found))
+                return None
+        self.paused = False
         if self.local:
             return self.local.popleft()
         if len(self.leased) < max(1, self.lease_size // 2):
