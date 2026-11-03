@@ -1,3 +1,10 @@
+## [1.43.5](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.4...v1.43.5) (2026-11-03)
+
+
+### Bug Fixes
+
+* **frontier:** follow a leased page's redirect and acknowledge the page ([db8b4bd](https://github.com/Aarkc/scrapy-calyprium/commit/db8b4bd87cb46aeec53d5cc176d61a7439cd322e))
+
 ## [1.43.4](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.3...v1.43.4) (2026-11-03)
 
 
