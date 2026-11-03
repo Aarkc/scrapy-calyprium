@@ -279,6 +279,21 @@ def test_a_failing_frontier_is_asked_again_and_keeps_what_it_could_not_send(sche
     assert sched.client.failed[page.meta[FP_KEY]]["retry_s"] == 3600 and not sched.acks
 
 
+def test_no_download_starts_while_what_was_found_piles_up(sched, monkeypatch):
+    monkeypatch.setattr(frontier, "PAUSE_AT", 3)
+    start = Request("https://shop.example/", dont_filter=True)
+    sched.enqueue_request(start)
+    sched.client.fail_send = 1  # the frontier falls behind: the first send fails
+    sched.flush_at = 100
+    for i in range(5):
+        sched.enqueue_request(Request(f"https://shop.example/p/{i}"))
+    assert sched.next_request() is None and len(sched.found) == 5
+    assert sched.paused and sched.stats.get_value("frontier/paused") == 1
+    assert sched.has_pending_requests()
+    assert sched.next_request() is start  # the next send went out: downloads start again
+    assert not sched.found and not sched.paused and len(sched.client.entries) == 5
+
+
 def test_a_catalogues_worth_found_at_once_goes_out_in_batches(sched, monkeypatch):
     """A sitemap index's worth found faster than it is sent: the backlog is taken from the front (a list sliced
     each send copied all of it and kept a real run's CPU busy), more sends go out while it is large, and it all
