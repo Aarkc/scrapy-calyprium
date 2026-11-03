@@ -36,7 +36,7 @@ class FakeFrontier:
 
     def __init__(self):
         self.entries = {}  # fp -> item, in discovery order
-        self.leased, self.done, self.released = set(), {}, []
+        self.leased, self.done, self.failed, self.released = set(), {}, {}, []
         self.fail_lease = 0
         self.fail_send = 0
 
@@ -61,12 +61,12 @@ class FakeFrontier:
         self.leased.update(i["fp"] for i in out)
         return {"items": [dict(i) for i in out], "more": len(due) > max_items, "due_now": len(due) - len(out)}
 
-    def ack(self, done, release):
+    def ack(self, acks, release):
         if self.fail_send:
             self.fail_send -= 1
             raise RuntimeError("frontier down")
-        for d in done:
-            self.done[d["fp"]] = d
+        for d in acks:
+            (self.failed if "retry_s" in d else self.done)[d["fp"]] = d
         self.released += release
         for fp in release:
             self.leased.discard(fp)
@@ -183,6 +183,41 @@ def test_fetched_pages_are_due_again_sooner_without_items(sched):
     assert sched.stats.get_value("calyprium/progress/done") == 2
 
 
+def test_a_refused_page_is_tried_again_soon_not_when_it_would_be_due(sched):
+    week = 7 * 86400
+    reqs = [Request("https://shop.example/sitemap_1.xml.gz", callback=sched.spider.parse,
+                    meta={"frontier_refetch_s": week}),
+            Request("https://shop.example/p/1", callback=sched.spider.parse_item),
+            Request("https://shop.example/p/2", callback=sched.spider.parse_item),
+            Request("https://shop.example/p/3", callback=sched.spider.parse_item)]
+    for r in reqs:
+        sched.enqueue_request(r)
+    sched._send()
+    sm, p1, p2, p3 = (sched.next_request() for _ in range(4))
+    sched._response_received(_response(sm, status=502), sm, sched.spider)
+    sched._response_received(_response(p1, status=403), p1, sched.spider)
+    sched._response_received(_response(p2, status=429), p2, sched.spider)
+    sched._item_scraped({"x": 1}, _response(p2, status=429), sched.spider)  # it produced items all the same
+    sched._response_received(_response(p3, status=404), p3, sched.spider)
+    sched._send()
+    client = sched.client
+    assert client.failed == {sm.meta[FP_KEY]: {"fp": sm.meta[FP_KEY], "status": 502, "retry_s": 3600},
+                             p1.meta[FP_KEY]: {"fp": p1.meta[FP_KEY], "status": 403, "retry_s": 3600}}
+    assert client.done[p2.meta[FP_KEY]]["refetch_s"] == week
+    assert client.done[p3.meta[FP_KEY]] == {"fp": p3.meta[FP_KEY], "status": 404, "refetch_s": 86400}  # gone
+    assert sched.stats.get_value("frontier/refused") == 3
+
+
+def test_the_client_sends_failures_apart():
+    sent = {}
+    client = frontier.FrontierClient("http://frontier.test", "alice:7", "tok")
+    client._post = lambda op, body: sent.update({op: body}) or {}
+    client.ack([{"fp": "a", "status": 200, "refetch_s": 60}, {"fp": "b", "status": 503, "retry_s": 3600}], ["c"])
+    assert sent["ack"] == {"done": [{"fp": "a", "status": 200, "refetch_s": 60}],
+                           "failed": [{"fp": "b", "retry_s": 3600}], "release": ["c"]}
+    client.close()
+
+
 def test_a_request_can_say_when_it_is_due_again(sched):
     week = 7 * 86400
     sched.enqueue_request(Request("https://shop.example/sitemap_1.xml.gz", callback=sched.spider.parse,
@@ -234,7 +269,14 @@ def test_a_failing_frontier_is_asked_again_and_keeps_what_it_could_not_send(sche
     assert sched.stats.get_value("frontier/errors/send") == 1 and len(sched.found) == 1
     sched._send()
     assert len(sched.client.entries) == 1 and not sched.found
-    assert sched.next_request().url == "https://shop.example/p/1"
+    page = sched.next_request()
+    assert page.url == "https://shop.example/p/1"
+    sched._response_received(_response(page, status=503), page, sched.spider)
+    sched.client.fail_send = 1
+    sched._send()
+    assert sched.acks == {page.meta[FP_KEY]: (503, 3600, True)}  # kept as a failure for the next send
+    sched._send()
+    assert sched.client.failed[page.meta[FP_KEY]]["retry_s"] == 3600 and not sched.acks
 
 
 def test_a_catalogues_worth_found_at_once_goes_out_in_batches(sched, monkeypatch):
