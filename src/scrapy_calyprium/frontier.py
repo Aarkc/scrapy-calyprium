@@ -28,6 +28,9 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   way each try counts towards the frontier's attempts limit, after which it waits a week. Requests leased but never handed to the downloader are released when the run closes.
 - When what was found piles up faster than the frontier takes it (a catalogue's sitemaps read in parallel, by a run
   with one CPU), no new download starts until it has gone out: otherwise it grows until the run is out of memory.
+- New pages found count as progress for CLOSESPIDER_TIMEOUT_NO_ITEM (a group's idle_minutes): a run reading a
+  catalogue's sitemaps scrapes nothing for as long as that takes, and was closed as idle half an hour in. A run that
+  neither scrapes nor finds anything new is still closed.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
   discovered and acknowledged is sent every 2 s or CALYPRIUM_FRONTIER_FLUSH entries (200).
 - The run's progress (scrapy_calyprium.progress) is the pages it fetched and those the frontier says are due.
@@ -122,6 +125,7 @@ class FrontierScheduler:
         self.lease_not_before = 0.0
         self.loop: Optional[task.LoopingCall] = None
         self.paused = False                         # no new downloads until what was found has gone out
+        self._idle_check: Any = None                # Scrapy's CloseSpider when it closes runs without items
         self._names: Dict[Any, str] = {}  # a callback's function -> the spider attribute it is under
 
     @classmethod
@@ -373,7 +377,10 @@ class FrontierScheduler:
 
         def _sent(out):
             self.sending -= 1
-            self.stats.inc_value("frontier/added", int(out.get("added") or 0))
+            added = int(out.get("added") or 0)
+            self.stats.inc_value("frontier/added", added)
+            if added:
+                self._progress()
             self.stats.inc_value("frontier/acked", len(acks))
             if found:
                 self.remote_more = True  # what was found is due now
@@ -398,6 +405,14 @@ class FrontierScheduler:
                 break
         if not self.leased and self.remote_more:
             self._lease()
+
+    def _progress(self) -> None:
+        """New pages found: not idle, for CLOSESPIDER_TIMEOUT_NO_ITEM (it counts items in each period)."""
+        if self._idle_check is None:
+            exts = getattr(getattr(self.crawler, "extensions", None), "middlewares", None) or ()
+            self._idle_check = next((e for e in exts if hasattr(e, "items_in_period")), False)
+        if self._idle_check:
+            self._idle_check.items_in_period += 1
 
     def _wake(self) -> None:
         """Tell the engine there may be requests (it would otherwise wait for its next heartbeat)."""

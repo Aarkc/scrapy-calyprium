@@ -10,6 +10,7 @@ import pytest
 import scrapy
 from scrapy import FormRequest, Request
 from scrapy.http import HtmlResponse
+from scrapy.settings import Settings
 from twisted.internet import defer
 
 from scrapy_calyprium import frontier
@@ -292,6 +293,23 @@ def test_no_download_starts_while_what_was_found_piles_up(sched, monkeypatch):
     assert sched.has_pending_requests()
     assert sched.next_request() is start  # the next send went out: downloads start again
     assert not sched.found and not sched.paused and len(sched.client.entries) == 5
+
+
+def test_pages_found_are_progress_for_the_idle_close(sched):
+    from types import SimpleNamespace
+
+    from scrapy.extensions.closespider import CloseSpider
+
+    sched.crawler.settings = Settings({**SETTINGS, "CLOSESPIDER_TIMEOUT_NO_ITEM": 1800})
+    idle = CloseSpider(sched.crawler)
+    sched.crawler.extensions = SimpleNamespace(middlewares=[object(), idle])
+    sched.enqueue_request(Request("https://shop.example/p/1"))
+    sched._send()  # new to the frontier
+    assert idle.items_in_period == 1
+    sched.sent.clear()  # a later run finds it again
+    sched.enqueue_request(Request("https://shop.example/p/1"))
+    sched._send()  # known already: nothing added, not progress
+    assert idle.items_in_period == 1
 
 
 def test_a_catalogues_worth_found_at_once_goes_out_in_batches(sched, monkeypatch):
