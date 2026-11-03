@@ -161,6 +161,23 @@ def test_fetched_pages_are_due_again_sooner_without_items(sched):
     assert sched.stats.get_value("calyprium/progress/done") == 2
 
 
+def test_a_request_can_say_when_it_is_due_again(sched):
+    week = 7 * 86400
+    sched.enqueue_request(Request("https://shop.example/sitemap_1.xml.gz", callback=sched.spider.parse,
+                                  meta={"frontier_refetch_s": week}))
+    sched.enqueue_request(Request("https://shop.example/p/1", callback=sched.spider.parse_item,
+                                  meta={"frontier_refetch_s": "soon"}))
+    sched._send()
+    a, b = sched.next_request(), sched.next_request()
+    assert a.meta["frontier_refetch_s"] == week  # kept through the frontier
+    sched._response_received(_response(a), a, sched.spider)
+    sched._response_received(_response(b), b, sched.spider)
+    sched._item_scraped({"x": 1}, _response(b), sched.spider)
+    sched._send()
+    assert sched.client.done[a.meta[FP_KEY]]["refetch_s"] == week
+    assert sched.client.done[b.meta[FP_KEY]]["refetch_s"] == 7 * 86400  # not a number: the default
+
+
 def test_a_closing_run_releases_what_it_never_started_and_sends_what_is_left(sched):
     for i in range(5):
         sched.enqueue_request(Request(f"https://shop.example/p/{i}"))
