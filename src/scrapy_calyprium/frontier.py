@@ -22,8 +22,10 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   found alongside that page, as Scrapy's last-in-first-out queue did: otherwise a page's follow-up waits behind the
   whole sitemap the page came from. A spider that set DEPTH_PRIORITY for breadth-first order already has its depth
   taken off its priority, so it keeps that order. The stored request keeps its own priority.
-- A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again, up to
-  its attempts limit. Requests leased but never handed to the downloader are released when the run closes.
+- A page that was refused or not answered (a 5xx, 403, 407, 408 or 429, unless it produced items) is acknowledged as
+  failed: due again CALYPRIUM_FRONTIER_RETRY_S later (1 hour), not after the refetch wait as if it had been read.
+  A request that fails for good is not acknowledged: its lease runs out and the frontier hands it out again. Either
+  way each try counts towards the frontier's attempts limit, after which it waits a week. Requests leased but never handed to the downloader are released when the run closes.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
   discovered and acknowledged is sent every 2 s or CALYPRIUM_FRONTIER_FLUSH entries (200).
 - The run's progress (scrapy_calyprium.progress) is the pages it fetched and those the frontier says are due.
@@ -51,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 FP_KEY = "_frontier_fp"
 REFETCH_KEY = "frontier_refetch_s"  # a request's own wait until it is due again, in seconds
+REFUSED = frozenset((403, 407, 408, 429))  # with every 5xx: not read, so tried again soon
 MAX_SEND = 5000  # discovered URLs in one send (the service takes 10,000)
 MAX_SENDING = 2  # sends in flight: they share the reactor's thread pool with DNS
 MAX_SENDING_BACKLOG = 4  # ... unless what was found piles up (a sitemap of tens of thousands at a time)
@@ -81,8 +84,10 @@ class FrontierClient:
     def lease(self, max_items: int, lease_s: int) -> dict:
         return self._post("lease", {"max": max_items, "lease_s": lease_s})
 
-    def ack(self, done: List[dict], release: List[str]) -> dict:
-        return self._post("ack", {"done": done, "release": release})
+    def ack(self, acks: List[dict], release: List[str]) -> dict:
+        done = [a for a in acks if "retry_s" not in a]
+        failed = [{"fp": a["fp"], "retry_s": a["retry_s"]} for a in acks if "retry_s" in a]
+        return self._post("ack", {"done": done, "failed": failed, "release": release})
 
     def close(self) -> None:
         self.http.close()
@@ -92,18 +97,18 @@ class FrontierScheduler:
     """See the module docstring."""
 
     def __init__(self, crawler, client: FrontierClient, *, refetch_s: int, listing_refetch_s: int,
-                 lease_size: int, lease_s: int, flush_at: int):
+                 lease_size: int, lease_s: int, flush_at: int, retry_s: int = 3600):
         self.crawler = crawler
         self.stats = crawler.stats
         self.client = client
-        self.refetch_s, self.listing_refetch_s = refetch_s, listing_refetch_s
+        self.refetch_s, self.listing_refetch_s, self.retry_s = refetch_s, listing_refetch_s, retry_s
         self.lease_size, self.lease_s, self.flush_at = lease_size, lease_s, flush_at
         self.spider = None
         self.local: Deque[Request] = deque()        # fetched in this run, not through the frontier
         self.leased: Deque[Tuple[str, Request]] = deque()  # leased, not handed to the downloader yet
         self.sent: set = set()                      # fingerprints sent or leased this run (8 bytes each)
         self.found: Deque[dict] = deque()           # discovered, not sent yet (taken from the front)
-        self.acks: Dict[str, Tuple[int, int]] = {}  # fp -> (status, refetch_s), not sent yet
+        self.acks: Dict[str, Tuple[int, int, bool]] = {}  # fp -> (status, wait, refused), not sent yet
         self.releases: List[str] = []
         self.remote_more = True                     # the frontier may have something due
         self.leasing = False
@@ -130,7 +135,8 @@ class FrontierScheduler:
                     listing_refetch_s=s.getint("CALYPRIUM_FRONTIER_LISTING_REFETCH_S", 86400),
                     lease_size=s.getint("CALYPRIUM_FRONTIER_LEASE", 200),
                     lease_s=s.getint("CALYPRIUM_FRONTIER_LEASE_S", 1800),
-                    flush_at=s.getint("CALYPRIUM_FRONTIER_FLUSH", 200))
+                    flush_at=s.getint("CALYPRIUM_FRONTIER_FLUSH", 200),
+                    retry_s=s.getint("CALYPRIUM_FRONTIER_RETRY_S", 3600))
         crawler.signals.connect(sched._response_received, signal=signals.response_received)
         crawler.signals.connect(sched._item_scraped, signal=signals.item_scraped)
         return sched
@@ -326,7 +332,8 @@ class FrontierScheduler:
         # From the front of a deque: a list sliced each send copied the whole backlog every time, and with
         # millions found (a catalogue's sitemaps) that kept the run's CPU busy and its downloads waiting.
         found = [self.found.popleft() for _ in range(min(MAX_SEND, len(self.found)))]
-        acks = [{"fp": fp, "status": st, "refetch_s": rs} for fp, (st, rs) in self.acks.items()]
+        acks = [{"fp": fp, "status": st, "retry_s" if refused else "refetch_s": wait}
+                for fp, (st, wait, refused) in self.acks.items()]
         self.acks = {}
         releases, self.releases = self.releases, []
         return found, acks, releases
@@ -365,7 +372,7 @@ class FrontierScheduler:
                            failure.value)
             self.found.extendleft(reversed(found))
             for a in acks:
-                self.acks.setdefault(a["fp"], (a["status"], a["refetch_s"]))
+                self.acks.setdefault(a["fp"], (a["status"], a.get("refetch_s", a.get("retry_s")), "retry_s" in a))
             self.releases = releases + self.releases
         d.addCallbacks(_sent, _failed)
 
@@ -411,7 +418,11 @@ class FrontierScheduler:
     def _response_received(self, response, request, spider):
         fp = request.meta.get(FP_KEY)
         if fp and fp not in self.acks:
-            self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s)
+            if response.status >= 500 or response.status in REFUSED:
+                self.acks[fp] = (response.status, self.retry_s, True)
+                self.stats.inc_value("frontier/refused")
+            else:
+                self.acks[fp] = (response.status, self._own_wait(request) or self.listing_refetch_s, False)
             self.fetched += 1
             self._report()
             if len(self.acks) >= self.flush_at and self.sending < MAX_SENDING:
@@ -421,4 +432,4 @@ class FrontierScheduler:
         request = getattr(response, "request", None)
         fp = request.meta.get(FP_KEY) if request is not None else None
         if fp:  # a page with items: due again after the longer wait (again, if its first ack has gone)
-            self.acks[fp] = (response.status, self._own_wait(request) or self.refetch_s)
+            self.acks[fp] = (response.status, self._own_wait(request) or self.refetch_s, False)
