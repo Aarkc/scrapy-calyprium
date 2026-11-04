@@ -1,3 +1,10 @@
+## [1.43.8](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.7...v1.43.8) (2026-11-04)
+
+
+### Bug Fixes
+
+* **frontier:** a run waits 20 minutes for a frontier that does not answer ([#54](https://github.com/Aarkc/scrapy-calyprium/issues/54)) ([532d971](https://github.com/Aarkc/scrapy-calyprium/commit/532d9714f4de729300e44bae2c3808530a6676d8))
+
 ## [1.43.7](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.6...v1.43.7) (2026-11-03)
 
 
