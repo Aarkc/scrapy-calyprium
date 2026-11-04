@@ -38,6 +38,9 @@ is due, and a new pass re-fetches pages only once they are due again. No spider 
   neither scrapes nor finds anything new is still closed.
 - Leases come CALYPRIUM_FRONTIER_LEASE at a time (default 200), lasting CALYPRIUM_FRONTIER_LEASE_S (1800); what is
   discovered and acknowledged is sent every 2 s or CALYPRIUM_FRONTIER_FLUSH entries (200).
+- A frontier that does not answer is asked again (backing off to a minute) for CALYPRIUM_FRONTIER_PATIENCE_S (1200)
+  before the run stops asking it: ten failures in a row gave up after ~6 minutes, about as long as the frontier takes
+  to open after a hard restart, and a restart closed every run waiting on it (11-04).
 - The run's progress (scrapy_calyprium.progress) is the pages it fetched and those the frontier says are due.
 - Without the three settings it is Scrapy's own scheduler.
 
@@ -109,12 +112,13 @@ class FrontierScheduler:
     """See the module docstring."""
 
     def __init__(self, crawler, client: FrontierClient, *, refetch_s: int, listing_refetch_s: int,
-                 lease_size: int, lease_s: int, flush_at: int, retry_s: int = 3600):
+                 lease_size: int, lease_s: int, flush_at: int, retry_s: int = 3600, patience_s: int = 1200):
         self.crawler = crawler
         self.stats = crawler.stats
         self.client = client
         self.refetch_s, self.listing_refetch_s, self.retry_s = refetch_s, listing_refetch_s, retry_s
         self.lease_size, self.lease_s, self.flush_at = lease_size, lease_s, flush_at
+        self.patience_s = patience_s
         self.spider = None
         self.local: Deque[Request] = deque()        # fetched in this run, not through the frontier
         self.leased: Deque[Tuple[str, Request]] = deque()  # leased, not handed to the downloader yet
@@ -130,6 +134,7 @@ class FrontierScheduler:
         self.due_now = 0
         self.lease_failures = 0
         self.lease_not_before = 0.0
+        self.unanswered_since = 0.0                 # when leases started failing (monotonic; 0: they don't)
         self.loop: Optional[task.LoopingCall] = None
         self.paused = False                         # no new downloads until what was found has gone out
         self._idle_check: Any = None                # Scrapy's CloseSpider when it closes runs without items
@@ -151,7 +156,8 @@ class FrontierScheduler:
                     lease_size=s.getint("CALYPRIUM_FRONTIER_LEASE", 200),
                     lease_s=s.getint("CALYPRIUM_FRONTIER_LEASE_S", 1800),
                     flush_at=s.getint("CALYPRIUM_FRONTIER_FLUSH", 200),
-                    retry_s=s.getint("CALYPRIUM_FRONTIER_RETRY_S", 3600))
+                    retry_s=s.getint("CALYPRIUM_FRONTIER_RETRY_S", 3600),
+                    patience_s=s.getint("CALYPRIUM_FRONTIER_PATIENCE_S", 1200))
         crawler.signals.connect(sched._response_received, signal=signals.response_received)
         crawler.signals.connect(sched._item_scraped, signal=signals.item_scraped)
         return sched
@@ -331,6 +337,7 @@ class FrontierScheduler:
         def _got(out):
             self.leasing = False
             self.lease_failures = 0
+            self.unanswered_since = 0.0
             items = out.get("items") or []
             self.due_now = int(out.get("due_now") or 0)
             for item in items:
@@ -350,11 +357,15 @@ class FrontierScheduler:
         def _failed(failure):
             self.leasing = False
             self.lease_failures += 1
-            self.lease_not_before = time.monotonic() + min(60.0, 2.0 ** self.lease_failures)
+            now = time.monotonic()
+            self.unanswered_since = self.unanswered_since or now
+            self.lease_not_before = now + min(60.0, 2.0 ** self.lease_failures)
             self.stats.inc_value("frontier/errors/lease")
             logger.warning("FrontierScheduler: lease failed (%s); trying again", failure.value)
-            if self.lease_failures >= 10 and not self.local and not self.leased:
-                logger.error("FrontierScheduler: the frontier is unreachable; the run stops asking it")
+            if now - self.unanswered_since >= self.patience_s and not self.local and not self.leased:
+                logger.error("FrontierScheduler: the frontier has not answered for %d minutes; the run stops asking it",
+                             (now - self.unanswered_since) // 60)
+                self.stats.set_value("frontier/unreachable", 1)
                 self.remote_more = False
         d.addCallbacks(_got, _failed)
 
