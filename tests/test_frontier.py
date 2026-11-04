@@ -327,6 +327,29 @@ def test_a_failing_frontier_is_asked_again_and_keeps_what_it_could_not_send(sche
     assert sched.client.failed[page.meta[FP_KEY]]["retry_s"] == 3600 and not sched.acks
 
 
+def test_a_frontier_restarting_is_waited_for_and_one_gone_for_good_is_not(sched, monkeypatch):
+    """Ten failures in a row gave up after ~6 minutes, about as long as the frontier takes to open after a hard
+    restart: a restart closed every run waiting on it (11-04)."""
+    clock = [1000.0]
+    monkeypatch.setattr(frontier.time, "monotonic", lambda: clock[0])
+    sched.client.fail_lease = 10**6
+    for _ in range(15):  # 15 failures, a minute apart: still asking
+        sched.lease_not_before = 0
+        sched._lease()
+        clock[0] += 60
+    assert sched.remote_more and sched.has_pending_requests()
+    sched.client.fail_lease = 0
+    sched.client.entries["a"] = {"fp": "a" * 32, "url": "https://shop.example/p/1", "req": None}
+    sched.lease_not_before = 0
+    assert sched.next_request().url == "https://shop.example/p/1"  # it came back: the clock starts over
+    sched.client.fail_lease = 10**6
+    for _ in range(21):
+        sched.lease_not_before = 0
+        sched._lease()
+        clock[0] += 60
+    assert not sched.remote_more and sched.stats.get_value("frontier/unreachable") == 1
+
+
 def test_no_download_starts_while_what_was_found_piles_up(sched, monkeypatch):
     monkeypatch.setattr(frontier, "PAUSE_AT", 3)
     start = Request("https://shop.example/", dont_filter=True)
