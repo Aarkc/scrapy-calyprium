@@ -1,3 +1,10 @@
+## [1.43.9](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.8...v1.43.9) (2026-11-05)
+
+
+### Bug Fixes
+
+* **mimic:** fetches through Mimic go round the run's sticky sessions ([#55](https://github.com/Aarkc/scrapy-calyprium/issues/55)) ([a820503](https://github.com/Aarkc/scrapy-calyprium/commit/a820503968f8304fcb295b98e7f722876bab5766))
+
 ## [1.43.8](https://github.com/Aarkc/scrapy-calyprium/compare/v1.43.7...v1.43.8) (2026-11-04)
 
 
