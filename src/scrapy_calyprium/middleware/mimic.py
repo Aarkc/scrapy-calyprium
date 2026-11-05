@@ -296,6 +296,9 @@ class MimicBrowserMiddleware:
         # Profile policy (AAR-62) — spider_id, paid-solve, engine allow-list.
         self.policy: RunPolicy = RunPolicy()
         self.render_all: bool = False
+        # Sticky gateway sessions for fetches through Mimic, round robin (MIMIC_LOCAL_LIGHT_SESSIONS; none: Mimic's own).
+        self._fetch_sessions: list = []
+        self._fetch_session_at: int = 0
         # AAR-64: per-domain stealth escalation (domain -> expiry, monotonic)
         # instead of a permanent run-wide switch to "maximum".
         self.escalation_ttl: float = 600.0
@@ -374,6 +377,12 @@ class MimicBrowserMiddleware:
             target_domain=crawler.settings.get("MIMIC_TARGET_DOMAIN"),
         )
         middleware.render_all = crawler.settings.getbool("MIMIC_ALL_REQUESTS", False)
+        # Fetches through Mimic leave through as many sticky gateway sessions as the local route's plain fetches
+        # (MIMIC_LOCAL_LIGHT_SESSIONS), round robin: without one Mimic's fast path sent a domain's every fetch through
+        # the gateway's top-ranked upstream, one exit at a time, and linkedin_companies' ~600 pages a minute went out
+        # through a handful of exits until LinkedIn rate-limited them (2026-11-05).
+        middleware._fetch_sessions = [uuid.uuid4().hex[:12] for _ in range(
+            max(0, crawler.settings.getint("MIMIC_LOCAL_LIGHT_SESSIONS", 0)))]
         middleware.policy = policy
         middleware.escalation_ttl = crawler.settings.getfloat("MIMIC_ESCALATION_TTL", 600.0)
         builtin_retry = _builtin_retry_active(crawler.settings)
@@ -1221,6 +1230,14 @@ class MimicBrowserMiddleware:
             "engine": engine,
         }
 
+    def _next_fetch_session(self) -> Optional[str]:
+        """The next of the run's sticky gateway sessions for a fetch through Mimic (round robin), else None."""
+        if not self._fetch_sessions:
+            return None
+        session = self._fetch_sessions[self._fetch_session_at % len(self._fetch_sessions)]
+        self._fetch_session_at += 1
+        return session
+
     async def _fetch_auto(self, client, request):
         """Fetch via /api/fetch with auto-routing (httpcloak → browser)."""
         fetch_payload = {
@@ -1229,6 +1246,10 @@ class MimicBrowserMiddleware:
             **self._fetch_policy_fields(),
             **self._attempt_fields(request),
         }
+        session = self._next_fetch_session()
+        if session:
+            # Mimic's fast path leaves through it (FetchRequest.proxy_session_id; an older Mimic ignores it)
+            fetch_payload["proxy_session_id"] = session
 
         resp = await client.post(
             f"{self.service_url}/api/fetch",
