@@ -185,6 +185,22 @@ async def test_attempt_and_prior_class_go_to_mimic_only_on_a_retry():
 
 
 @pytest.mark.asyncio
+async def test_fetches_through_mimic_go_round_the_runs_sessions():
+    """Without a session Mimic's fast path sent a domain's every fetch through one exit (linkedin_companies,
+    2026-11-05): a run with MIMIC_LOCAL_LIGHT_SESSIONS spreads its fetches over that many."""
+    mw = _mw({"MIMIC_LOCAL_LIGHT_SESSIONS": 3})
+    client = _client({"html": PAGE, "status_code": 200})
+    sent = []
+    for _ in range(4):
+        await mw._fetch_auto(client, Request(URL))
+        sent.append(client.post.call_args.kwargs["json"]["proxy_session_id"])
+    assert len(set(sent[:3])) == 3 and sent[3] == sent[0]
+    plain = _mw()
+    await plain._fetch_auto(client, Request(URL))
+    assert "proxy_session_id" not in client.post.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
 async def test_a_browser_session_keeps_the_cause():
     mw = _mw()
     mw.session_id = "sess-1"
