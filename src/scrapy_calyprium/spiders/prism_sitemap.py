@@ -938,9 +938,11 @@ class PrismSitemapSpider(scrapy.Spider):
         yield from self._maybe_prism_refill()
 
     def _maybe_prism_refill(self):
-        # Check if we should fetch the next batch
+        # Check if we should fetch the next batch. A run whose source is not prism:// has no Prism list to
+        # refill from, yet under the frontier it can lease requests a prism:// run left with this callback.
         if (
-            not self._prism_exhausted
+            self._prism_parsed is not None
+            and not self._prism_exhausted
             and not self._refill_in_flight
             and self._pending_count < _REFILL_THRESHOLD
         ):

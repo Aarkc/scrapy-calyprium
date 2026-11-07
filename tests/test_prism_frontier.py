@@ -48,3 +48,16 @@ def test_without_the_frontier_nothing_changes():
     sp, refill = _spider(settings={"PRISM_FRONTIER_WALK_PAGES": 2})
     reqs, _ = _handle(sp, refill, URLS)
     assert sp._prism_checkpoint_offset == 0 and sp._prism_open_pages == {0: 5}
+
+
+def test_a_run_from_another_source_does_not_refill_for_a_leased_prism_request():
+    """Found in a fleet check (maxbotix_parts, 11-07): a run started from its sitemap:// source leased a request a
+    prism:// run had left with _parse_and_maybe_refill, and the refill raised AttributeError on the unset source."""
+    from scrapy.http import HtmlResponse, Request
+
+    sp = make_spider(S, FRONTIER, batch_size=5, url_source="http://example.com/sitemap.xml")
+    list(sp.start_requests())
+    sp._prism_next_offset = 145  # the checkpoint resumes the offset whatever the source
+    request = Request("http://example.com/p/2", callback=sp._parse_and_maybe_refill)
+    out = list(sp._parse_and_maybe_refill(HtmlResponse(request.url, body=b"<html></html>", request=request)))
+    assert out == [] and not sp._refill_in_flight
