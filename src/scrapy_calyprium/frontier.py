@@ -57,6 +57,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import httpx
 from scrapy import Request, signals
+from scrapy.http import Response
 from twisted.internet import defer, task
 from twisted.internet.threads import deferToThread
 
@@ -492,6 +493,10 @@ class FrontierScheduler:
             self._send()
 
     def _item_scraped(self, item, response, spider):
+        if not isinstance(response, Response):
+            # An item from an errback: Scrapy passes the Failure. The page was not fetched, so it is left as a
+            # failed download is, and its lease brings it back.
+            return
         request = getattr(response, "request", None)
         fp = request.meta.get(FP_KEY) if request is not None else None
         if fp:  # a page with items: due again after the longer wait (again, if its first ack has gone)
