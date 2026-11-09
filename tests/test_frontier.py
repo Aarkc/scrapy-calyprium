@@ -187,6 +187,21 @@ def test_fetched_pages_are_due_again_sooner_without_items(sched):
     assert sched.stats.get_value("calyprium/progress/done") == 3
 
 
+def test_an_item_from_an_errback_leaves_the_page_unanswered(sched):
+    from twisted.python.failure import Failure
+
+    sched.enqueue_request(Request("https://shop.example/p/1", callback=sched.spider.parse_item))
+    sched._send()
+    leased = sched.next_request()
+    # the download failed and the errback yielded an item: item_scraped gets the Failure in place of a response
+    failure = Failure(RuntimeError("Could not open CONNECT tunnel"))
+    failure.request = leased
+    sched._item_scraped({"url": leased.url, "error": "tunnel"}, failure, sched.spider)
+    sched._send()
+    assert sched.client.done == {} and sched.client.failed == {}  # as for a failed download: its lease brings it back
+    assert sched.fetched == 0
+
+
 def test_a_refused_page_is_tried_again_soon_not_when_it_would_be_due(sched):
     week = 7 * 86400
     reqs = [Request("https://shop.example/sitemap_1.xml.gz", callback=sched.spider.parse,
